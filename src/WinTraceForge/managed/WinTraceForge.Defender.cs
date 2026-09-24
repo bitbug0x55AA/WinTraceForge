@@ -29,7 +29,7 @@ internal static class DefenderModule
         internal readonly Dictionary<string, List<string>> Exclusions =
             new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
         internal Options() { Kind = ControlKind.DefenderExclusion; }
-        internal override TelemetryProfile Telemetry { get { return TelemetryProfiles.DefenderExclusion; } }
+        internal override TelemetryProfile Telemetry { get { return DefenderTelemetry.Profile; } }
         internal override IEnumerable<string> EvidenceValues
         {
             get
@@ -279,6 +279,9 @@ internal static class DefenderModule
         internal bool AddAttempted;
         internal bool AddReturned;
         internal bool? AllPresentBefore;
+        internal ControlLifecycleResult<DefenderBaseline> Lifecycle;
+        internal override void RecordObservation(ObservationStatus status)
+        { if (Lifecycle != null) { Lifecycle.SetObservation(status); } }
     }
 
     private static int Run(Options options, RunEvidence evidence)
@@ -337,60 +340,113 @@ internal static class DefenderModule
 
     internal static int RunWithBackend(Options options, RunEvidence evidence, IPreferenceBackend backend)
     {
-        evidence.Stage = "Connect";
-        backend.Connect();
-        evidence.Stage = "Prepare";
-        backend.Prepare(options.Exclusions);
-        if (options.CheckOnly && options.Exclusions.Count == 0) { ConsoleUi.Section("Capabilities"); }
-        foreach (string type in ExclusionTypes)
+        var gate = new ControlMutationGate();
+        ControlLifecycleResult<DefenderBaseline> result = ControlLifecycle.Run(
+            new DefenderOperation(options, evidence, new GuardedPreferenceBackend(backend, gate), gate),
+            delegate(ControlLifecycleResult<DefenderBaseline> current) { return evidence.ObserveNow(); });
+        evidence.Lifecycle = result;
+        foreach (string error in result.Errors) { ConsoleUi.Status("FAIL", error, true); }
+        if (result.Restoration == RestorationStatus.ManualRequired)
+        { ConsoleUi.Row("Restoration", "MANUAL_REQUIRED - " + result.ManualRestoration); }
+        return result.ExitCode;
+    }
+
+    internal sealed class DefenderBaseline
+    {
+        internal readonly Dictionary<string, List<string>> Values;
+        internal DefenderBaseline(Dictionary<string, List<string>> values) { Values = values; }
+    }
+
+    private sealed class DefenderOperation : IControlOperation<DefenderBaseline>
+    {
+        private readonly Options options;
+        private readonly RunEvidence evidence;
+        private readonly IPreferenceBackend backend;
+        private readonly ControlMutationGate gate;
+        internal DefenderOperation(Options options, RunEvidence evidence, IPreferenceBackend backend,
+            ControlMutationGate gate)
+        { this.options = options; this.evidence = evidence; this.backend = backend; this.gate = gate; }
+        public string Transport { get { return options.Transport; } }
+        public ControlMutationGate WriteGate { get { return gate; } }
+        public bool VerifyAfterApiFailure { get { return false; } }
+        public string ManualRestoration { get { return "Remove only test-created exclusions; preserve the captured baseline."; } }
+
+        public ProbeResult<DefenderBaseline> Probe()
         {
-            if (options.CheckOnly && (options.Exclusions.Count == 0 || options.Exclusions.ContainsKey(type)))
+            evidence.Stage = "Connect";
+            backend.Connect();
+            evidence.Stage = "Prepare";
+            backend.Prepare(options.Exclusions);
+            if (options.CheckOnly && options.Exclusions.Count == 0) { ConsoleUi.Section("Capabilities"); }
+            foreach (string type in ExclusionTypes)
             {
-                if (options.Exclusions.Count == 0 || options.Verbose)
-                {
-                    ConsoleUi.Text(type + ": " +
-                        (backend.Supports(type) ? "supported (string[])" : "unsupported"));
-                }
+                if (options.CheckOnly && (options.Exclusions.Count == 0 || options.Exclusions.ContainsKey(type)) &&
+                    (options.Exclusions.Count == 0 || options.Verbose))
+                { ConsoleUi.Text(type + ": " + (backend.Supports(type) ? "supported (string[])" : "unsupported")); }
             }
-        }
-
-        if (options.Exclusions.Count > 0)
-        {
-            evidence.Stage = "Baseline read";
-            Dictionary<string, List<string>> baseline = backend.Read(options.Exclusions.Keys);
-            bool allPresent = true;
-            ConsoleUi.Section("Baseline");
-            foreach (var exclusion in options.Exclusions)
+            Dictionary<string, List<string>> baseline = null;
+            if (options.Exclusions.Count > 0)
             {
-                foreach (string value in exclusion.Value)
+                evidence.Stage = "Baseline read";
+                baseline = backend.Read(options.Exclusions.Keys);
+                bool allPresent = true;
+                ConsoleUi.Section("Baseline");
+                foreach (var exclusion in options.Exclusions)
                 {
-                    bool present = ContainsExclusion(baseline, exclusion.Key, value);
-                    ConsoleUi.Status(present ? "SEEN" : "INFO", exclusion.Key + ": " + value +
-                        (present ? " [present]" : " [not observed]"));
-                    allPresent &= present;
+                    foreach (string value in exclusion.Value)
+                    {
+                        bool present = ContainsExclusion(baseline, exclusion.Key, value);
+                        ConsoleUi.Status(present ? "SEEN" : "INFO", exclusion.Key + ": " + value +
+                            (present ? " [present]" : " [not observed]"));
+                        allPresent &= present;
+                    }
                 }
+                evidence.AllPresentBefore = allPresent;
             }
-            evidence.AllPresentBefore = allPresent;
+            if (options.CheckOnly)
+            {
+                evidence.Stage = "Check complete";
+                ConsoleUi.Status("OK", "Read-only check passed. No settings were changed.");
+                return new ProbeResult<DefenderBaseline>(new DefenderBaseline(baseline),
+                    ProbeStatus.ReadOnlyConfirmed, RestorationPolicy.None);
+            }
+            return new ProbeResult<DefenderBaseline>(new DefenderBaseline(baseline),
+                ProbeStatus.Ready, RestorationPolicy.Manual);
         }
 
-        if (options.CheckOnly)
+        public MutationStatus Mutate(DefenderBaseline baseline)
         {
-            evidence.Stage = "Check complete";
-            ConsoleUi.Status("OK", "Read-only check passed. No settings were changed.");
-            return 0;
+            evidence.Stage = "Add invocation";
+            ConsoleUi.Section("Apply & verify");
+            evidence.AddAttempted = true;
+            object returnValue = backend.Add();
+            evidence.AddReturned = true;
+            evidence.Stage = "Return status";
+            uint status;
+            if (!TryGetStatusCode(returnValue, out status))
+            {
+                ConsoleUi.Status("WARN", "No usable WMI return code; verifying configuration by readback.");
+                return MutationStatus.ApiUnknown;
+            }
+            if (status != 0)
+            {
+                ConsoleUi.Status("FAIL", "Defender rejected the request. WMI return code: " + status +
+                    " (0x" + status.ToString("X8") + ").", true);
+                return MutationStatus.ApiFailed;
+            }
+            return MutationStatus.ApiSucceeded;
         }
 
-        evidence.Stage = "Add invocation";
-        ConsoleUi.Section("Apply & verify");
-        evidence.AddAttempted = true;
-        object returnValue = backend.Add();
-        evidence.AddReturned = true;
-        evidence.Stage = "Return status";
-        return EvaluateAddResult(returnValue, delegate
+        public VerificationStatus Verify(DefenderBaseline baseline)
         {
             evidence.Stage = "Post-Add readback";
-            return VerifyExclusions(options.Exclusions, backend.Read(options.Exclusions.Keys));
-        });
+            return VerifyExclusions(options.Exclusions, backend.Read(options.Exclusions.Keys)) ?
+                VerificationStatus.Confirmed : VerificationStatus.Mismatch;
+        }
+
+        public void Restore(DefenderBaseline baseline) { throw new NotSupportedException("Manual restoration selected."); }
+        public VerificationStatus VerifyRestored(DefenderBaseline baseline)
+        { throw new NotSupportedException("Manual restoration selected."); }
     }
 
     internal interface IPreferenceBackend : IDisposable
@@ -400,6 +456,20 @@ internal static class DefenderModule
         bool Supports(string name);
         object Add();
         Dictionary<string, List<string>> Read(ICollection<string> types);
+    }
+
+    private sealed class GuardedPreferenceBackend : IPreferenceBackend
+    {
+        private readonly IPreferenceBackend inner;
+        private readonly ControlMutationGate gate;
+        internal GuardedPreferenceBackend(IPreferenceBackend inner, ControlMutationGate gate)
+        { this.inner = inner; this.gate = gate; }
+        public void Connect() { inner.Connect(); }
+        public void Prepare(Dictionary<string, List<string>> exclusions) { inner.Prepare(exclusions); }
+        public bool Supports(string name) { return inner.Supports(name); }
+        public Dictionary<string, List<string>> Read(ICollection<string> types) { return inner.Read(types); }
+        public object Add() { gate.RequireWrite(); return inner.Add(); }
+        public void Dispose() { inner.Dispose(); }
     }
 
     private sealed class NativeBackend : IPreferenceBackend
@@ -956,6 +1026,14 @@ internal static class DefenderModule
         ConsoleUi.Row("Exit / stage", exitCode + " / " + evidence.Stage);
         ConsoleUi.Text("Add attempted: " + evidence.AddAttempted +
             "; invocation returned: " + evidence.AddReturned);
+        if (evidence.Lifecycle != null)
+        {
+            ConsoleUi.Row("Lifecycle", "probe=" + evidence.Lifecycle.Probe +
+                "; mutation=" + evidence.Lifecycle.Mutation +
+                "; verification=" + evidence.Lifecycle.Verification +
+                "; observation=" + evidence.Lifecycle.Observation +
+                "; restoration=" + evidence.Lifecycle.Restoration);
+        }
         if (options.CheckOnly)
         {
             ConsoleUi.Text("No Add was invoked. This does not test prevention of configuration changes.");

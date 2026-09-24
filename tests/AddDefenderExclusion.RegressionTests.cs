@@ -19,6 +19,7 @@ internal static class RegressionTests
         CheckTelemetry();
         CheckRawEtw();
         CheckModuleTelemetry();
+        CheckLifecycle();
         CheckConsoleLayout();
         object[] zeroStatuses = { (uint)0, 0, (long)0, (ulong)0, (short)0,
             (ushort)0, (byte)0, (sbyte)0, "0" };
@@ -412,6 +413,161 @@ internal static class RegressionTests
         public void Dispose() { }
     }
 
+    private sealed class SyntheticBaseline
+    {
+        internal readonly string Original = "original";
+    }
+
+    private sealed class SyntheticOperation : IControlOperation<SyntheticBaseline>
+    {
+        internal readonly List<string> Calls = new List<string>();
+        internal ProbeStatus ProbeOutcome = ProbeStatus.Ready;
+        internal RestorationPolicy Policy = RestorationPolicy.Automatic;
+        internal MutationStatus ApiOutcome = MutationStatus.ApiSucceeded;
+        internal VerificationStatus VerifyOutcome = VerificationStatus.Confirmed;
+        internal VerificationStatus RestoreOutcome = VerificationStatus.Confirmed;
+        internal bool FailProbe, FailMutation, FailVerification, FailRestore;
+        internal bool TryWriteDuringProbe;
+        internal bool TryWriteDuringVerification;
+        internal bool ReadAfterFailure = true;
+        internal readonly ControlMutationGate Gate = new ControlMutationGate();
+        public string Transport { get { return "synthetic"; } }
+        public ControlMutationGate WriteGate { get { return Gate; } }
+        public bool VerifyAfterApiFailure { get { return ReadAfterFailure; } }
+        public string ManualRestoration { get { return "Restore synthetic baseline original."; } }
+        public ProbeResult<SyntheticBaseline> Probe()
+        {
+            Calls.Add("probe");
+            if (TryWriteDuringProbe) { Gate.RequireWrite(); }
+            if (FailProbe) { throw new InvalidOperationException("probe failed"); }
+            return new ProbeResult<SyntheticBaseline>(new SyntheticBaseline(), ProbeOutcome,
+                ProbeOutcome == ProbeStatus.Ready ? Policy : RestorationPolicy.None);
+        }
+        public MutationStatus Mutate(SyntheticBaseline baseline)
+        {
+            Calls.Add("mutate");
+            Assert(baseline.Original == "original", "Typed baseline reaches mutation");
+            if (FailMutation) { throw new InvalidOperationException("write failed"); }
+            return ApiOutcome;
+        }
+        public VerificationStatus Verify(SyntheticBaseline baseline)
+        {
+            Calls.Add("verify");
+            if (TryWriteDuringVerification) { Gate.RequireWrite(); }
+            if (FailVerification) { throw new InvalidOperationException("readback failed"); }
+            return VerifyOutcome;
+        }
+        public void Restore(SyntheticBaseline baseline)
+        {
+            Calls.Add("restore");
+            Assert(baseline.Original == "original", "Restoration uses captured baseline");
+            if (FailRestore) { throw new InvalidOperationException("restore failed"); }
+        }
+        public VerificationStatus VerifyRestored(SyntheticBaseline baseline)
+        { Calls.Add("verify-restored"); return RestoreOutcome; }
+    }
+
+    private static void CheckLifecycle()
+    {
+        var operation = new SyntheticOperation { FailProbe = true };
+        ControlLifecycleResult<SyntheticBaseline> result = ControlLifecycle.Run(operation, null);
+        Assert(result.ExitCode == 1 && result.Probe == ProbeStatus.Failed &&
+            result.Mutation == MutationStatus.NotAttempted && string.Join(",", operation.Calls) == "probe",
+            "Failed mandatory probe never mutates");
+
+        operation = new SyntheticOperation { TryWriteDuringProbe = true };
+        result = ControlLifecycle.Run(operation, null);
+        Assert(result.ExitCode == 1 && result.Probe == ProbeStatus.Failed &&
+            result.Mutation == MutationStatus.NotAttempted,
+            "Write gate rejects mutation during probe");
+
+        operation = new SyntheticOperation { ProbeOutcome = ProbeStatus.ReadOnlyConfirmed };
+        result = ControlLifecycle.Run(operation, null);
+        Assert(result.ExitCode == 0 && result.Restoration == RestorationStatus.NotRequired &&
+            string.Join(",", operation.Calls) == "probe", "Read-only probe never invokes a write");
+
+        operation = new SyntheticOperation { ProbeOutcome = ProbeStatus.ReadOnlyMismatch };
+        result = ControlLifecycle.Run(operation, null);
+        Assert(result.ExitCode == 3 && result.Mutation == MutationStatus.NotAttempted,
+            "Read-only expected-state mismatch is preserved");
+
+        operation = new SyntheticOperation { VerifyOutcome = VerificationStatus.Mismatch };
+        result = ControlLifecycle.Run(operation, null);
+        Assert(result.ExitCode == 3 && result.Mutation == MutationStatus.ApiSucceeded &&
+            result.Verification == VerificationStatus.Mismatch && result.Restoration == RestorationStatus.Succeeded,
+            "API success cannot override verification mismatch");
+
+        operation = new SyntheticOperation();
+        result = ControlLifecycle.Run(operation, delegate(ControlLifecycleResult<SyntheticBaseline> current)
+        {
+            Assert(current.Verification == VerificationStatus.Confirmed, "Observation sees control result");
+            operation.Calls.Add("observe");
+            throw new InvalidOperationException("collector crashed");
+        });
+        Assert(result.ExitCode == 0 && result.Observation == ObservationStatus.Failed &&
+            result.Restoration == RestorationStatus.Succeeded &&
+            string.Join(",", operation.Calls) == "probe,mutate,verify,observe,restore,verify-restored",
+            "Telemetry failure preserves control truth and cannot prevent restoration");
+
+        operation = new SyntheticOperation { FailRestore = true };
+        result = ControlLifecycle.Run(operation, null);
+        Assert(result.ExitCode == 1 && result.Verification == VerificationStatus.Confirmed &&
+            result.Restoration == RestorationStatus.Failed, "Restoration failure remains separate and visible");
+
+        operation = new SyntheticOperation { RestoreOutcome = VerificationStatus.Unavailable };
+        result = ControlLifecycle.Run(operation, null);
+        Assert(result.ExitCode == 1 && result.Restoration == RestorationStatus.Unavailable,
+            "Restore API return is not restore verification");
+
+        operation = new SyntheticOperation { RestoreOutcome = VerificationStatus.Mismatch };
+        result = ControlLifecycle.Run(operation, null);
+        Assert(result.ExitCode == 1 && result.Restoration == RestorationStatus.Failed,
+            "Restore readback mismatch is a restoration failure");
+
+        operation = new SyntheticOperation { FailVerification = true };
+        result = ControlLifecycle.Run(operation, null);
+        Assert(result.ExitCode == 3 && result.Verification == VerificationStatus.Unavailable &&
+            result.Restoration == RestorationStatus.Succeeded, "Verification exception still restores");
+
+        operation = new SyntheticOperation { TryWriteDuringVerification = true };
+        result = ControlLifecycle.Run(operation, null);
+        Assert(result.ExitCode == 3 && result.Verification == VerificationStatus.Unavailable &&
+            result.Restoration == RestorationStatus.Succeeded,
+            "Write gate rejects mutation during verification and still restores");
+
+        operation = new SyntheticOperation { FailMutation = true };
+        result = ControlLifecycle.Run(operation, null);
+        Assert(result.ExitCode == 1 && result.Mutation == MutationStatus.ApiFailed &&
+            result.Verification == VerificationStatus.Confirmed && result.Restoration == RestorationStatus.Succeeded,
+            "Ambiguous mutation failure can be read back and restored");
+
+        operation = new SyntheticOperation { ApiOutcome = MutationStatus.ApiFailed, ReadAfterFailure = false,
+            Policy = RestorationPolicy.Manual };
+        result = ControlLifecycle.Run(operation, null);
+        Assert(result.ExitCode == 1 && result.Verification == VerificationStatus.NotRun &&
+            result.Restoration == RestorationStatus.ManualRequired,
+            "Legacy failed API skips readback but preserves manual restoration requirement");
+
+        operation = new SyntheticOperation();
+        result = ControlLifecycle.Run(operation,
+            delegate(ControlLifecycleResult<SyntheticBaseline> current) { return ObservationStatus.Incomplete; });
+        Assert(result.ExitCode == 0 && result.Observation == ObservationStatus.Incomplete &&
+            result.Restoration == RestorationStatus.Succeeded,
+            "Incomplete telemetry is not a control failure");
+
+        operation = new SyntheticOperation { Policy = RestorationPolicy.Manual, ApiOutcome = MutationStatus.ApiUnknown };
+        result = ControlLifecycle.Run(operation, null);
+        Assert(result.ExitCode == 0 && result.Mutation == MutationStatus.ApiUnknown &&
+            result.Verification == VerificationStatus.Confirmed &&
+            result.Restoration == RestorationStatus.ManualRequired &&
+            !operation.Calls.Contains("restore"), "Unknown API status needs readback and explicit manual cleanup");
+
+        operation = new SyntheticOperation { Policy = RestorationPolicy.None };
+        result = ControlLifecycle.Run(operation, null);
+        Assert(result.ExitCode == 1 && result.Mutation == MutationStatus.NotAttempted,
+            "Mutating probe cannot omit restoration policy");
+    }
+
     private static void CheckTransportsAndAssessment()
     {
         TextWriter originalOut = Console.Out;
@@ -471,10 +627,9 @@ internal static class RegressionTests
                     {
                         backend = new FakeBackend { Before = absent, After = present, ThrowAt = failure };
                         evidence = new DefenderModule.RunEvidence();
-                        bool thrown = false;
-                        try { DefenderModule.RunWithBackend(options, evidence, backend); }
-                        catch (UnauthorizedAccessException) { thrown = true; }
-                        Assert(thrown, "Failure must propagate: " + failure);
+                        int failedCode = DefenderModule.RunWithBackend(options, evidence, backend);
+                        Assert(failedCode == 1 && evidence.Lifecycle.Errors.Count == 1,
+                            "Failure is captured in the lifecycle result: " + failure);
                         Assert(evidence.AddAttempted == (failure == "Add"), "Accurate Add attempt evidence");
                         Assert(!evidence.AddReturned, "Failed operation cannot report returned Add");
                         Assert(backend.Calls.FindAll(delegate(string call) { return call == "Add"; }).Count <= 1,

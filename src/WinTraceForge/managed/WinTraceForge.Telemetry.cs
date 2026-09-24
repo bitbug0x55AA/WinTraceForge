@@ -32,7 +32,7 @@ internal static class TelemetryEvidence
             new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
     }
 
-    internal static void Collect(ControlOptions options, ControlRunEvidence evidence, DateTime endUtc)
+    internal static ObservationStatus Collect(ControlOptions options, ControlRunEvidence evidence, DateTime endUtc)
     {
         ConsoleUi.Section("Telemetry evidence");
         ConsoleUi.Text("Source: existing ETW-backed Windows event channels; not raw ETW tracing.");
@@ -44,9 +44,12 @@ internal static class TelemetryEvidence
 
         ConsoleUi.Row("Telemetry profile", options.Telemetry.Name);
         int incomplete = 0;
+        int observed = 0;
         foreach (EventLogChannel channel in options.Telemetry.EventLogChannels)
         {
-            if (!ReadChannel(channel, startUtc, endUtc, options, evidence)) { incomplete++; }
+            int candidates;
+            if (!ReadChannel(channel, startUtc, endUtc, options, evidence, out candidates)) { incomplete++; }
+            observed += candidates;
         }
         Console.WriteLine();
         ConsoleUi.Status(incomplete == 0 ? "OK" : "WARN", "Collection completeness: " + (incomplete == 0 ?
@@ -56,11 +59,14 @@ internal static class TelemetryEvidence
         ConsoleUi.Detail("Events may be delayed, dropped, disabled, cleared or not emitted; no ETW loss counter is available here.");
         ConsoleUi.Detail("PID can be reused. Channels/audit policies are never enabled or changed.");
         ConsoleUi.Detail("Telemetry status does not alter the operation exit code.");
+        return incomplete == 0 ? (observed > 0 ? ObservationStatus.Observed : ObservationStatus.NotObserved) :
+            ObservationStatus.Incomplete;
     }
 
     private static bool ReadChannel(EventLogChannel channel, DateTime startUtc, DateTime endUtc,
-        ControlOptions options, ControlRunEvidence evidence)
+        ControlOptions options, ControlRunEvidence evidence, out int observed)
     {
+        observed = 0;
         int scanned = 0;
         int candidates = 0;
         int parseErrors = 0;
@@ -125,6 +131,7 @@ internal static class TelemetryEvidence
             {
                 ConsoleUi.Text((candidates - 3) + " more candidate events not displayed; use --verbose for all.");
             }
+            observed = candidates;
             if (scanned == EventLimit)
             {
                 ConsoleUi.Status("WARN", "Cap reached: newest " + EventLimit + " filtered events examined; earlier events may be omitted.");

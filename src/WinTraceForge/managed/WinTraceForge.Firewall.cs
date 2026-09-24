@@ -29,7 +29,7 @@ internal sealed class FirewallOptions : ControlOptions
     internal int Profiles;
     internal string Program = "";
     internal string RuleName { get { return FirewallModule.NameFor(Id); } }
-    internal override TelemetryProfile Telemetry { get { return TelemetryProfiles.Firewall; } }
+    internal override TelemetryProfile Telemetry { get { return FirewallTelemetry.Profile; } }
     internal override IEnumerable<string> EvidenceValues
     {
         get
@@ -44,6 +44,9 @@ internal sealed class FirewallOptions : ControlOptions
 
 internal sealed class FirewallRunEvidence : ControlRunEvidence
 {
+    internal ControlLifecycleResult<FirewallBaseline> Lifecycle;
+    internal override void RecordObservation(ObservationStatus status)
+    { if (Lifecycle != null) { Lifecycle.SetObservation(status); } }
     internal bool BaselineRead;
     internal bool MutationAttempted;
     internal bool MutationReturned;
@@ -94,7 +97,7 @@ internal sealed class FirewallRefusalException : InvalidOperationException
     internal FirewallRefusalException(string message) : base(message) { }
 }
 
-internal static class FirewallModule
+internal static partial class FirewallModule
 {
     internal const string Group = "WinTraceForge.Firewall.v1";
     private const string NamePrefix = "WinTraceForge.Firewall.";
@@ -368,140 +371,19 @@ internal static class FirewallModule
             evidence.Stage = "Firewall " + options.Transport + " backend initialization";
             using (IFirewallBackend backend = createBackend())
             {
-                if (options.Kind == ControlKind.FirewallProfiles)
+                var gate = new ControlMutationGate();
+                ControlLifecycleResult<FirewallBaseline> result = ControlLifecycle.Run(
+                    new FirewallOperation(options, evidence, new GuardedFirewallBackend(backend, gate), gate),
+                    delegate(ControlLifecycleResult<FirewallBaseline> current) { return evidence.ObserveNow(); });
+                evidence.Lifecycle = result;
+                if (result.Errors.Count != 0)
                 {
-                    evidence.Stage = "Firewall profile read";
-                    int current = backend.CurrentProfiles;
-                    ConsoleUi.Section("Firewall profiles (read-only)");
-                    ConsoleUi.Row("Active profile mask", current.ToString(CultureInfo.InvariantCulture));
-                    ConsoleUi.Row("Local modify state", ModifyState(backend.LocalPolicyModifyState));
-                    foreach (FirewallProfileData profile in backend.ReadProfiles())
-                    {
-                        ConsoleUi.Row(ProfileName(profile.Profile), "enabled=" + profile.Enabled +
-                            "; block-all-inbound=" + profile.BlockAllInbound +
-                            "; default inbound=" + ActionName(profile.DefaultInboundAction) +
-                            "; default outbound=" + ActionName(profile.DefaultOutboundAction));
-                        ConsoleUi.Row("Excluded interfaces", string.Join(", ", profile.ExcludedInterfaces));
-                    }
-                    ConsoleUi.Text("LocalPolicyModifyState describes current policy restrictions, not per-profile merge settings. " +
-                        "INetFwPolicy2 does not expose all GPO/MDM local-rule merge limits; those are not established here.");
-                    evidence.ReadbackConfirmed = true;
-                    evidence.Outcome = "Profile settings read only; no settings changed.";
-                    return 0;
+                    evidence.Outcome = evidence.Stage + ": " + string.Join("; ", result.Errors) + ". " +
+                        (evidence.MutationAttempted ? "A mutation was attempted; inspect the rule using its ID before cleanup." : "No mutation attempted.");
                 }
-
-                ConsoleUi.Section("Firewall rule " + options.Operation);
-                ConsoleUi.Row(options.GeneratedId ? "Generated ID" : "Rule ID", options.Id.ToString("D"));
-                ConsoleUi.Row("Rule name", options.RuleName);
-                ConsoleUi.Text("Cleanup: " + CleanupCommand(options));
-                ConsoleUi.Text("Name-based COM operations are not atomic with enumeration: concurrent writers can race " +
-                    "ownership checks. Use a unique ID and avoid concurrent changes. Markers are not an authentication boundary.");
-                evidence.Stage = "Firewall baseline";
-                IList<FirewallRuleData> baseline = backend.FindByName(options.RuleName);
-                evidence.BaselineRead = true;
-                ConsoleUi.Section("Baseline");
-                ConsoleUi.Status("INFO", baseline.Count == 0 ? "Rule not present." :
-                    baseline.Count + " matching rule name(s) found; ownership must be verified.");
-                if (options.Operation == "add")
-                {
-                    if (baseline.Count != 0) { throw new FirewallRefusalException("Add refused: this name already exists (including owned/duplicate rules). Choose another ID."); }
-                    int profiles = options.Profiles == 0 ? backend.CurrentProfiles : options.Profiles;
-                    if (profiles <= 0 || (profiles & ~7) != 0)
-                    {
-                        throw new FirewallRefusalException("Invalid/empty active profile mask; no fallback to all profiles and no mutation.");
-                    }
-                    evidence.FrozenProfiles = profiles;
-                    evidence.Stage = "Firewall local policy context";
-                    evidence.PolicyModifyState = backend.LocalPolicyModifyState;
-                    FirewallRuleData expected = ExpectedRule(options, profiles);
-                    ConsoleUi.Section("Request");
-                    ConsoleUi.Row("Local modify state", ModifyState(evidence.PolicyModifyState.Value));
-                    ConsoleUi.Text("Policy restriction indicator only; not complete resultant GPO/MDM policy or per-rule merge acceptance.");
-                    if (evidence.PolicyModifyState.Value != 0)
-                    {
-                        ConsoleUi.Status("WARN", "Local policy restrictions may affect enforcement even if this rule is persisted.");
-                    }
-                    ConsoleUi.Row("Direction / action", (options.Direction == 1 ? "in" : "out") + " / " + ActionName(options.Action));
-                    ConsoleUi.Row("Protocol / profiles", (options.Protocol == 6 ? "TCP" : "UDP") + " / " + profiles);
-                    ConsoleUi.Row("Remote address:port", expected.RemoteAddresses + " : " + expected.RemotePorts);
-                    ConsoleUi.Row("Local port / program", expected.LocalPorts + " / " +
-                        (expected.ApplicationName.Length == 0 ? "(all programs)" : expected.ApplicationName));
-                    evidence.Stage = "Firewall detached rule preparation";
-                    backend.PrepareAdd(expected);
-                    evidence.Stage = "Firewall add name refresh";
-                    // Refresh immediately before a name-based write; the API has no compare-and-swap.
-                    if (backend.FindByName(options.RuleName).Count != 0)
-                    {
-                        throw new FirewallRefusalException("Add refused: the rule name appeared during preflight.");
-                    }
-                    evidence.Stage = "Firewall Add";
-                    evidence.MutationAttempted = true;
-                    backend.Add();
-                    evidence.MutationReturned = true;
-                    evidence.Stage = "Firewall add readback";
-                    ConsoleUi.Section("Result / readback");
-                    IList<FirewallRuleData> actual = backend.FindByName(options.RuleName);
-                    if (actual.Count != 1)
-                    {
-                        evidence.Outcome = "Add returned, but readback did not find exactly one rule. No automatic cleanup attempted.";
-                        return 3;
-                    }
-                    IList<string> mismatches = Mismatches(expected, actual[0]);
-                    ShowRule(actual[0]);
-                    if (mismatches.Count != 0)
-                    {
-                        evidence.Outcome = "Add readback mismatch: " + string.Join(", ", mismatches) + ". No automatic cleanup attempted.";
-                        return 3;
-                    }
-                    evidence.ReadbackConfirmed = true;
-                    evidence.Outcome = "Add confirmed: all constrained rule attributes match the frozen request.";
-                    return 0;
-                }
-                if (baseline.Count == 0)
-                {
-                    if (options.Operation == "remove")
-                    {
-                        evidence.AlreadyAbsent = true;
-                        evidence.ReadbackConfirmed = true;
-                        evidence.Outcome = "Already absent at inspection; no Remove call made (idempotent).";
-                        return 0;
-                    }
-                    evidence.Outcome = "Check: expected test rule is absent; no mutation attempted.";
-                    return 3;
-                }
-                RequireOwnedUnique(options, baseline);
-                if (options.Operation == "check")
-                {
-                    ConsoleUi.Section("Result / readback");
-                    ShowRule(baseline[0]);
-                    evidence.ReadbackConfirmed = true;
-                    evidence.Outcome = "Check confirmed one matching ownership marker; properties shown, not compared to an original add request.";
-                    return 0;
-                }
-                evidence.Stage = "Firewall remove ownership refresh";
-                IList<FirewallRuleData> refreshed = backend.FindByName(options.RuleName);
-                if (refreshed.Count == 0)
-                {
-                    evidence.AlreadyAbsent = true;
-                    evidence.ReadbackConfirmed = true;
-                    evidence.Outcome = "Absent on immediate pre-remove refresh; no Remove call made.";
-                    return 0;
-                }
-                RequireOwnedUnique(options, refreshed);
-                evidence.Stage = "Firewall Remove";
-                evidence.MutationAttempted = true;
-                backend.Remove(options.RuleName);
-                evidence.MutationReturned = true;
-                evidence.Stage = "Firewall remove readback";
-                ConsoleUi.Section("Result / readback");
-                if (backend.FindByName(options.RuleName).Count != 0)
-                {
-                    evidence.Outcome = "Remove returned, but the name is still present at readback; no further deletion attempted.";
-                    return 3;
-                }
-                evidence.ReadbackConfirmed = true;
-                evidence.Outcome = "Remove confirmed: no matching rule name at readback.";
-                return 0;
+                if (result.Restoration == RestorationStatus.ManualRequired)
+                { ConsoleUi.Row("Restoration", "MANUAL_REQUIRED - " + result.ManualRestoration); }
+                return result.ExitCode;
             }
         }
         catch (FirewallRefusalException error) { return Failure(evidence, error); }
@@ -556,6 +438,14 @@ internal static class FirewallModule
         ConsoleUi.Row("Mutation attempted", evidence.MutationAttempted.ToString());
         ConsoleUi.Row("Mutation returned", evidence.MutationReturned.ToString());
         ConsoleUi.Row("Readback confirmed", evidence.ReadbackConfirmed.ToString());
+        if (evidence.Lifecycle != null)
+        {
+            ConsoleUi.Row("Lifecycle", "probe=" + evidence.Lifecycle.Probe +
+                "; mutation=" + evidence.Lifecycle.Mutation +
+                "; verification=" + evidence.Lifecycle.Verification +
+                "; observation=" + evidence.Lifecycle.Observation +
+                "; restoration=" + evidence.Lifecycle.Restoration);
+        }
         ConsoleUi.Text("Configuration evidence only: no claim of traffic enforcement, effective GPO/MDM precedence, " +
             "or local-rule merge acceptance. Firewall enablement is never changed; WFP filters are never manipulated.");
         ConsoleUi.Text("Compliance: NOT_ASSESSED | Detection/response: NOT_MEASURED");

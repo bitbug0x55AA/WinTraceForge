@@ -192,7 +192,7 @@ internal sealed class EtwCapture : IDisposable
         }
     }
 
-    internal void Report()
+    internal ObservationStatus Report()
     {
         lock (gate)
         {
@@ -205,7 +205,7 @@ internal sealed class EtwCapture : IDisposable
             if (handle == IntPtr.Zero || !stopped || stopFailed)
             {
                 ConsoleUi.Status("WARN", "ETW_STOP_INCOMPLETE; trace cannot be reliably decoded as a completed run.");
-                return;
+                return ObservationStatus.Incomplete;
             }
             ConsoleUi.Row("Events lost", captureStatus.EventsLost.ToString(CultureInfo.InvariantCulture));
             ConsoleUi.Row("File buffers lost", captureStatus.LogBuffersLost.ToString(CultureInfo.InvariantCulture));
@@ -214,7 +214,7 @@ internal sealed class EtwCapture : IDisposable
             if (!File.Exists(file))
             {
                 ConsoleUi.Status("WARN", "ETL_MISSING after session stop; no decoding attempted.");
-                return;
+                return ObservationStatus.Unavailable;
             }
             DecodedCallback callback = ReceiveEvent;
             DecodeStatus decoded;
@@ -237,6 +237,8 @@ internal sealed class EtwCapture : IDisposable
             ConsoleUi.Text("Header PID is the emitting process; ClientProcessId, when available, is a separate field.");
             ConsoleUi.Text("Activity IDs are reported, not invented. PID/value matches are candidates, not causal proof.");
             ConsoleUi.Text("ETW telemetry completeness does not change the operation exit code. ETL is not automatically deleted.");
+            return complete ? (candidates > 0 ? ObservationStatus.Observed : ObservationStatus.NotObserved) :
+                ObservationStatus.Incomplete;
         }
     }
 

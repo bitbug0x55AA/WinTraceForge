@@ -98,35 +98,50 @@ internal sealed class TelemetryProfile
     }
 }
 
+internal static class CommonTelemetryChannels
+{
+    internal static readonly EventLogChannel ProcessCreation = new EventLogChannel(
+        "Security", "Microsoft-Windows-Security-Auditing", "(EventID=4688)");
+    internal static readonly EventLogChannel Sysmon = new EventLogChannel(
+        "Microsoft-Windows-Sysmon/Operational", "Microsoft-Windows-Sysmon", "(EventID=1)");
+}
+
+// Compatibility aliases for existing tests; new families own their profiles in their own files.
 internal static class TelemetryProfiles
 {
-    private static readonly EventLogChannel ProcessCreation = new EventLogChannel(
-        "Security", "Microsoft-Windows-Security-Auditing", "(EventID=4688)");
-    private static readonly EventLogChannel Sysmon = new EventLogChannel(
-        "Microsoft-Windows-Sysmon/Operational", "Microsoft-Windows-Sysmon", "(EventID=1)");
+    internal static readonly TelemetryProfile DefenderExclusion = DefenderTelemetry.Profile;
+    internal static readonly TelemetryProfile Firewall = FirewallTelemetry.Profile;
+}
 
-    internal static readonly TelemetryProfile DefenderExclusion = new TelemetryProfile(
+internal static class DefenderTelemetry
+{
+    internal static readonly TelemetryProfile Profile = new TelemetryProfile(
         "Defender exclusions",
         new[] {
             new EventLogChannel("Microsoft-Windows-Windows Defender/Operational",
                 "Microsoft-Windows-Windows Defender", "(EventID=5007 or EventID=5013)"),
             new EventLogChannel("Microsoft-Windows-WMI-Activity/Operational", "Microsoft-Windows-WMI-Activity",
                 "(EventID=5857 or EventID=5858 or EventID=5859 or EventID=5860 or EventID=5861)"),
-            ProcessCreation, Sysmon
+            CommonTelemetryChannels.ProcessCreation, CommonTelemetryChannels.Sysmon
         },
         new[] {
             new EtwProvider("Microsoft-Windows-WMI-Activity", new Guid("1418ef04-b0b4-4623-bf7e-d74ab47bbdaa")),
             new EtwProvider("Microsoft-Windows-Windows Defender", new Guid("11cd958a-c507-4ef3-b3f2-5fd9dfbd2c78"))
         }, RequestedValues, TelemetryEvidence.CorrelateDefender);
 
-    internal static readonly TelemetryProfile Firewall = new TelemetryProfile(
+    private static IEnumerable<string> RequestedValues(ControlOptions options) { return options.EvidenceValues; }
+}
+
+internal static class FirewallTelemetry
+{
+    internal static readonly TelemetryProfile Profile = new TelemetryProfile(
         "Windows Firewall",
         new[] {
             new EventLogChannel("Microsoft-Windows-Windows Firewall With Advanced Security/Firewall",
                 "Microsoft-Windows-Windows Firewall With Advanced Security", "(EventID=2004 or EventID=2005 or EventID=2006)"),
             new EventLogChannel("Security", "Microsoft-Windows-Security-Auditing",
                 "(EventID=4688 or EventID=4946 or EventID=4947 or EventID=4948)"),
-            Sysmon
+            CommonTelemetryChannels.Sysmon
         },
         new[] {
             new EtwProvider("Microsoft-Windows-Windows Firewall With Advanced Security",

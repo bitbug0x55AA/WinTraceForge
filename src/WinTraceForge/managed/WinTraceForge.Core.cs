@@ -35,6 +35,20 @@ internal class ControlRunEvidence
     internal DateTime OperationEndUtc = DateTime.UtcNow;
     internal int ProcessId;
     internal string Stage = "Identity";
+    private Func<ObservationStatus> observer;
+    internal bool ObservationInvoked { get; private set; }
+    internal virtual void RecordObservation(ObservationStatus status) { }
+    internal void SetObserver(Func<ObservationStatus> value) { observer = value; }
+    internal ObservationStatus ObserveNow()
+    {
+        if (observer == null) { return ObservationStatus.NotRequested; }
+        if (ObservationInvoked) { throw new InvalidOperationException("Telemetry observation already completed."); }
+        ObservationInvoked = true;
+        OperationEndUtc = DateTime.UtcNow;
+        ObservationStatus status = observer();
+        RecordObservation(status);
+        return status;
+    }
 }
 
 internal static class CommonArguments
@@ -100,25 +114,52 @@ internal static class ControlRuntime
                     assessment(4);
                     return 4;
                 }
+                evidence.SetObserver(delegate
+                {
+                    capture.StopAfterWait();
+                    return capture.Report();
+                });
                 int exitCode;
                 try
                 {
                     exitCode = operation();
                     evidence.OperationEndUtc = DateTime.UtcNow;
                 }
-                finally { capture.StopAfterWait(); }
-                capture.Report();
+                finally
+                {
+                    if (!evidence.ObservationInvoked)
+                    {
+                        try { evidence.ObserveNow(); }
+                        catch (Exception error)
+                        {
+                            evidence.RecordObservation(ObservationStatus.Failed);
+                            ConsoleUi.Status("WARN", "ETW collection failed: " + error.Message);
+                        }
+                    }
+                }
                 assessment(exitCode);
                 return exitCode;
             }
         }
-        int result = operation();
-        evidence.OperationEndUtc = DateTime.UtcNow;
         if (options.CollectEventLog)
         {
-            ConsoleUi.Text("Collecting event-log evidence; waiting " + options.TelemetryWaitSeconds + "s...");
-            Thread.Sleep(options.TelemetryWaitSeconds * 1000);
-            TelemetryEvidence.Collect(options, evidence, DateTime.UtcNow);
+            evidence.SetObserver(delegate
+            {
+                ConsoleUi.Text("Collecting event-log evidence; waiting " + options.TelemetryWaitSeconds + "s...");
+                Thread.Sleep(options.TelemetryWaitSeconds * 1000);
+                return TelemetryEvidence.Collect(options, evidence, DateTime.UtcNow);
+            });
+        }
+        int result = operation();
+        evidence.OperationEndUtc = DateTime.UtcNow;
+        if (options.CollectEventLog && !evidence.ObservationInvoked)
+        {
+            try { evidence.ObserveNow(); }
+            catch (Exception error)
+            {
+                evidence.RecordObservation(ObservationStatus.Failed);
+                ConsoleUi.Status("WARN", "Event Log collection failed: " + error.Message);
+            }
         }
         assessment(result);
         return result;
