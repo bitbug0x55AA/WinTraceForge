@@ -290,7 +290,7 @@ internal sealed class EtwCapture : IDisposable
             ConsoleUi.Row("Activity ID", parsed.ActivityId);
             if (options.Verbose) { ConsoleUi.Row("Related activity ID", parsed.RelatedActivityId); }
             // ETW sequence numbers are not Windows Event Log Record IDs.
-            TelemetryEvidence.PrintEvent(parsed, correlation, options.Verbose, false);
+            TelemetryEvidence.PrintEvent(options.Telemetry, parsed, correlation, options.Verbose, false);
             return 0;
         }
         catch (XmlException ex)

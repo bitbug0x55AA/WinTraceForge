@@ -308,10 +308,9 @@ Consult per-module help for operation-specific absence behavior.
 Build
 -----
 Use an x64 Visual Studio developer terminal with the Windows SDK installed.
-Native:
-  cl /nologo /LD /O2 /MT /W4 /WX /EHsc /std:c++17 src\WinTraceForge\native\WinTraceForge.Native.cpp src\WinTraceForge\native\WinTraceForge.Etw.cpp src\WinTraceForge\native\WinTraceForge.Firewall.Native.cpp /link /OUT:WinTraceForge.Native.dll wbemuuid.lib ole32.lib oleaut32.lib advapi32.lib tdh.lib
-Managed:
-  "%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /target:exe /platform:x64 /optimize+ /warn:4 /warnaserror+ /reference:System.Management.dll /main:WinTraceForge /out:wtf.exe src\WinTraceForge\managed\WinTraceForge*.cs
+`Build.ps1` compiles C# sources recursively from `src/managed/` and the explicit
+C++ sources in `src/native/defender/`, `src/native/firewall/`, and
+`src/native/telemetry/`. It also generates version metadata for both binaries.
 
 Reproducible build/test entrypoint (included source, no downloads):
   powershell -NoProfile -File .\Build.ps1 -Test

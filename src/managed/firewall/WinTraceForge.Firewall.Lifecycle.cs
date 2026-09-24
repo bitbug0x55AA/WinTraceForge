@@ -16,17 +16,13 @@ internal sealed class FirewallBaseline
 
 internal static partial class FirewallModule
 {
-    private sealed class FirewallOperation : IControlOperation<FirewallBaseline>
+    private sealed class FirewallOperation : IControlOperation<FirewallBaseline, IFirewallReader, IFirewallWriter>
     {
         private readonly FirewallOptions options;
         private readonly FirewallRunEvidence evidence;
-        private readonly IFirewallBackend backend;
-        private readonly ControlMutationGate gate;
-        internal FirewallOperation(FirewallOptions options, FirewallRunEvidence evidence, IFirewallBackend backend,
-            ControlMutationGate gate)
-        { this.options = options; this.evidence = evidence; this.backend = backend; this.gate = gate; }
+        internal FirewallOperation(FirewallOptions options, FirewallRunEvidence evidence)
+        { this.options = options; this.evidence = evidence; }
         public string Transport { get { return options.Transport; } }
-        public ControlMutationGate WriteGate { get { return gate; } }
         public bool VerifyAfterApiFailure { get { return false; } }
         public string ManualRestoration
         {
@@ -37,7 +33,7 @@ internal static partial class FirewallModule
             }
         }
 
-        public ProbeResult<FirewallBaseline> Probe()
+        public ProbeResult<FirewallBaseline> Probe(IFirewallReader backend)
         {
             if (options.Kind == ControlKind.FirewallProfiles)
             {
@@ -140,7 +136,7 @@ internal static partial class FirewallModule
         private static ProbeResult<FirewallBaseline> ReadOnly(IList<FirewallRuleData> rules, ProbeStatus status)
         { return new ProbeResult<FirewallBaseline>(new FirewallBaseline(rules, null), status, RestorationPolicy.None); }
 
-        public MutationStatus Mutate(FirewallBaseline baseline)
+        public MutationStatus Mutate(FirewallBaseline baseline, IFirewallWriter backend)
         {
             evidence.Stage = options.Operation == "add" ? "Firewall Add" : "Firewall Remove";
             evidence.MutationAttempted = true;
@@ -150,7 +146,7 @@ internal static partial class FirewallModule
             return MutationStatus.ApiSucceeded;
         }
 
-        public VerificationStatus Verify(FirewallBaseline baseline)
+        public VerificationStatus Verify(FirewallBaseline baseline, IFirewallReader backend)
         {
             evidence.Stage = options.Operation == "add" ? "Firewall add readback" : "Firewall remove readback";
             ConsoleUi.Section("Result / readback");
@@ -183,24 +179,27 @@ internal static partial class FirewallModule
             return VerificationStatus.Confirmed;
         }
 
-        public void Restore(FirewallBaseline baseline) { throw new NotSupportedException("Manual restoration selected."); }
-        public VerificationStatus VerifyRestored(FirewallBaseline baseline)
+        public void Restore(FirewallBaseline baseline, IFirewallWriter backend) { throw new NotSupportedException("Manual restoration selected."); }
+        public VerificationStatus VerifyRestored(FirewallBaseline baseline, IFirewallReader backend)
         { throw new NotSupportedException("Manual restoration selected."); }
     }
 
-    private sealed class GuardedFirewallBackend : IFirewallBackend
+    private sealed class FirewallReader : IFirewallReader
     {
         private readonly IFirewallBackend inner;
-        private readonly ControlMutationGate gate;
-        internal GuardedFirewallBackend(IFirewallBackend inner, ControlMutationGate gate)
-        { this.inner = inner; this.gate = gate; }
+        internal FirewallReader(IFirewallBackend inner) { this.inner = inner; }
         public int CurrentProfiles { get { return inner.CurrentProfiles; } }
         public int LocalPolicyModifyState { get { return inner.LocalPolicyModifyState; } }
         public IList<FirewallProfileData> ReadProfiles() { return inner.ReadProfiles(); }
         public IList<FirewallRuleData> FindByName(string name) { return inner.FindByName(name); }
         public void PrepareAdd(FirewallRuleData rule) { inner.PrepareAdd(rule); }
-        public void Add() { gate.RequireWrite(); inner.Add(); }
-        public void Remove(string name) { gate.RequireWrite(); inner.Remove(name); }
-        public void Dispose() { inner.Dispose(); }
+    }
+
+    private sealed class FirewallWriter : IFirewallWriter
+    {
+        private readonly IFirewallBackend inner;
+        internal FirewallWriter(IFirewallBackend inner) { this.inner = inner; }
+        public void Add() { inner.Add(); }
+        public void Remove(string name) { inner.Remove(name); }
     }
 }

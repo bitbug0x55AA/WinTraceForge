@@ -16,7 +16,7 @@ All notable changes to WinTraceForge are recorded here. The project follows [Sem
 ### Changed
 
 - Public branding now presents the project as WinTraceForge (WTF).
-- Managed and native sources are organized under `src/WinTraceForge/`.
+- Managed and native sources are grouped by responsibility under `src/managed/` and `src/native/`.
 - Generated binaries are excluded from the source branch.
 
 ## Initial public baseline — 2026-09-24

@@ -36,11 +36,11 @@ if (-not (Test-Path -LiteralPath $VcVarsPath -PathType Leaf)) { throw "Missing v
 $VcVarsPath = (Resolve-Path -LiteralPath $VcVarsPath).Path
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
-$sourceDirectory = Join-Path $PSScriptRoot 'src\WinTraceForge'
+$sourceDirectory = Join-Path $PSScriptRoot 'src'
 $managedSourceDirectory = Join-Path $sourceDirectory 'managed'
 $nativeSourceDirectory = Join-Path $sourceDirectory 'native'
-$sources = @(Get-ChildItem -LiteralPath $managedSourceDirectory -Filter 'WinTraceForge*.cs' -File |
-    Sort-Object Name | ForEach-Object { $_.FullName })
+$sources = @(Get-ChildItem -LiteralPath $managedSourceDirectory -Filter 'WinTraceForge*.cs' -File -Recurse |
+    Sort-Object FullName | ForEach-Object { $_.FullName })
 $testDirectory = Join-Path $PSScriptRoot 'tests'
 $versionSource = Join-Path $OutputDirectory 'WinTraceForge.Version.g.cs'
 $versionResourceSource = Join-Path $OutputDirectory 'WinTraceForge.Version.rc'
@@ -123,7 +123,8 @@ function Invoke-TestBinary([string] $Name, [string[]] $Arguments = @()) {
 Push-Location -LiteralPath $OutputDirectory
 try {
     Invoke-VcCommand ('rc /nologo /fo"' + $versionResourceObject + '" "' + $versionResourceSource + '"')
-    $nativeSources = @('WinTraceForge.Native.cpp', 'WinTraceForge.Etw.cpp', 'WinTraceForge.Firewall.Native.cpp') |
+    $nativeSources = @('defender\WinTraceForge.Native.cpp', 'telemetry\WinTraceForge.Etw.cpp',
+        'firewall\WinTraceForge.Firewall.Native.cpp') |
         ForEach-Object { '"' + (Join-Path $nativeSourceDirectory $_) + '"' }
     Invoke-NativeBuild ('/LD ' + ($nativeSources -join ' ') + ' "' + $versionResourceObject + '"' +
         ' /link /OUT:WinTraceForge.Native.dll wbemuuid.lib ole32.lib oleaut32.lib advapi32.lib tdh.lib')
@@ -131,7 +132,7 @@ try {
     if ($Test -or $Integration) {
         Invoke-ManagedBuild 'RegressionTests' 'Control.RegressionTests.exe' 'AddDefenderExclusion.RegressionTests.cs'
         Invoke-ManagedBuild 'FirewallRegressionTests' 'Firewall.RegressionTests.exe' 'Firewall.RegressionTests.cs'
-        Invoke-NativeBuild ('/I"' + $nativeSourceDirectory + '" "' +
+        Invoke-NativeBuild ('/I"' + (Join-Path $nativeSourceDirectory 'firewall') + '" "' +
             (Join-Path $testDirectory 'Firewall.Native.RegressionTests.cpp') +
             '" /Fe:Firewall.Native.CppTests.exe /link ole32.lib oleaut32.lib advapi32.lib')
         Invoke-TestBinary 'Control.RegressionTests.exe'
@@ -146,7 +147,7 @@ try {
         Invoke-TestBinary 'Firewall.Native.CppTests.exe'
         Invoke-TestBinary 'Firewall.RegressionTests.exe' @('--native-read-only')
         Invoke-TestBinary 'Firewall.RegressionTests.exe' @('--native-detached-preflight')
-        Invoke-NativeBuild ('/I"' + $nativeSourceDirectory + '" "' +
+        Invoke-NativeBuild ('/I"' + (Join-Path $nativeSourceDirectory 'telemetry') + '" "' +
             (Join-Path $testDirectory 'Etw.RegressionTests.cpp') + '" /Fe:Etw.RegressionTests.exe /link advapi32.lib tdh.lib ole32.lib')
         $etl = Join-Path $OutputDirectory ('PrivateSelfTest-' + [guid]::NewGuid().ToString('D') + '.etl')
         try { Invoke-TestBinary 'Etw.RegressionTests.exe' @($etl) }

@@ -280,8 +280,6 @@ internal static class DefenderModule
         internal bool AddReturned;
         internal bool? AllPresentBefore;
         internal ControlLifecycleResult<DefenderBaseline> Lifecycle;
-        internal override void RecordObservation(ObservationStatus status)
-        { if (Lifecycle != null) { Lifecycle.SetObservation(status); } }
     }
 
     private static int Run(Options options, RunEvidence evidence)
@@ -340,10 +338,9 @@ internal static class DefenderModule
 
     internal static int RunWithBackend(Options options, RunEvidence evidence, IPreferenceBackend backend)
     {
-        var gate = new ControlMutationGate();
         ControlLifecycleResult<DefenderBaseline> result = ControlLifecycle.Run(
-            new DefenderOperation(options, evidence, new GuardedPreferenceBackend(backend, gate), gate),
-            delegate(ControlLifecycleResult<DefenderBaseline> current) { return evidence.ObserveNow(); });
+            new DefenderOperation(options, evidence), new PreferenceReader(backend), new PreferenceWriter(backend),
+            delegate(IControlLifecycleSnapshot current) { return evidence.ObserveNow(); });
         evidence.Lifecycle = result;
         foreach (string error in result.Errors) { ConsoleUi.Status("FAIL", error, true); }
         if (result.Restoration == RestorationStatus.ManualRequired)
@@ -357,21 +354,17 @@ internal static class DefenderModule
         internal DefenderBaseline(Dictionary<string, List<string>> values) { Values = values; }
     }
 
-    private sealed class DefenderOperation : IControlOperation<DefenderBaseline>
+    private sealed class DefenderOperation : IControlOperation<DefenderBaseline, IPreferenceReader, IPreferenceWriter>
     {
         private readonly Options options;
         private readonly RunEvidence evidence;
-        private readonly IPreferenceBackend backend;
-        private readonly ControlMutationGate gate;
-        internal DefenderOperation(Options options, RunEvidence evidence, IPreferenceBackend backend,
-            ControlMutationGate gate)
-        { this.options = options; this.evidence = evidence; this.backend = backend; this.gate = gate; }
+        internal DefenderOperation(Options options, RunEvidence evidence)
+        { this.options = options; this.evidence = evidence; }
         public string Transport { get { return options.Transport; } }
-        public ControlMutationGate WriteGate { get { return gate; } }
         public bool VerifyAfterApiFailure { get { return false; } }
         public string ManualRestoration { get { return "Remove only test-created exclusions; preserve the captured baseline."; } }
 
-        public ProbeResult<DefenderBaseline> Probe()
+        public ProbeResult<DefenderBaseline> Probe(IPreferenceReader backend)
         {
             evidence.Stage = "Connect";
             backend.Connect();
@@ -414,7 +407,7 @@ internal static class DefenderModule
                 ProbeStatus.Ready, RestorationPolicy.Manual);
         }
 
-        public MutationStatus Mutate(DefenderBaseline baseline)
+        public MutationStatus Mutate(DefenderBaseline baseline, IPreferenceWriter backend)
         {
             evidence.Stage = "Add invocation";
             ConsoleUi.Section("Apply & verify");
@@ -437,15 +430,15 @@ internal static class DefenderModule
             return MutationStatus.ApiSucceeded;
         }
 
-        public VerificationStatus Verify(DefenderBaseline baseline)
+        public VerificationStatus Verify(DefenderBaseline baseline, IPreferenceReader backend)
         {
             evidence.Stage = "Post-Add readback";
             return VerifyExclusions(options.Exclusions, backend.Read(options.Exclusions.Keys)) ?
                 VerificationStatus.Confirmed : VerificationStatus.Mismatch;
         }
 
-        public void Restore(DefenderBaseline baseline) { throw new NotSupportedException("Manual restoration selected."); }
-        public VerificationStatus VerifyRestored(DefenderBaseline baseline)
+        public void Restore(DefenderBaseline baseline, IPreferenceWriter backend) { throw new NotSupportedException("Manual restoration selected."); }
+        public VerificationStatus VerifyRestored(DefenderBaseline baseline, IPreferenceReader backend)
         { throw new NotSupportedException("Manual restoration selected."); }
     }
 
@@ -458,18 +451,31 @@ internal static class DefenderModule
         Dictionary<string, List<string>> Read(ICollection<string> types);
     }
 
-    private sealed class GuardedPreferenceBackend : IPreferenceBackend
+    internal interface IPreferenceReader
+    {
+        void Connect();
+        void Prepare(Dictionary<string, List<string>> exclusions);
+        bool Supports(string name);
+        Dictionary<string, List<string>> Read(ICollection<string> types);
+    }
+
+    internal interface IPreferenceWriter { object Add(); }
+
+    private sealed class PreferenceReader : IPreferenceReader
     {
         private readonly IPreferenceBackend inner;
-        private readonly ControlMutationGate gate;
-        internal GuardedPreferenceBackend(IPreferenceBackend inner, ControlMutationGate gate)
-        { this.inner = inner; this.gate = gate; }
+        internal PreferenceReader(IPreferenceBackend inner) { this.inner = inner; }
         public void Connect() { inner.Connect(); }
         public void Prepare(Dictionary<string, List<string>> exclusions) { inner.Prepare(exclusions); }
         public bool Supports(string name) { return inner.Supports(name); }
         public Dictionary<string, List<string>> Read(ICollection<string> types) { return inner.Read(types); }
-        public object Add() { gate.RequireWrite(); return inner.Add(); }
-        public void Dispose() { inner.Dispose(); }
+    }
+
+    private sealed class PreferenceWriter : IPreferenceWriter
+    {
+        private readonly IPreferenceBackend inner;
+        internal PreferenceWriter(IPreferenceBackend inner) { this.inner = inner; }
+        public object Add() { return inner.Add(); }
     }
 
     private sealed class NativeBackend : IPreferenceBackend

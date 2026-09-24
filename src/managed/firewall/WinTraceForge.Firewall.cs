@@ -45,8 +45,6 @@ internal sealed class FirewallOptions : ControlOptions
 internal sealed class FirewallRunEvidence : ControlRunEvidence
 {
     internal ControlLifecycleResult<FirewallBaseline> Lifecycle;
-    internal override void RecordObservation(ObservationStatus status)
-    { if (Lifecycle != null) { Lifecycle.SetObservation(status); } }
     internal bool BaselineRead;
     internal bool MutationAttempted;
     internal bool MutationReturned;
@@ -88,6 +86,21 @@ internal interface IFirewallBackend : IDisposable
     IList<FirewallProfileData> ReadProfiles();
     IList<FirewallRuleData> FindByName(string name);
     void PrepareAdd(FirewallRuleData rule);
+    void Add();
+    void Remove(string name);
+}
+
+internal interface IFirewallReader
+{
+    int CurrentProfiles { get; }
+    int LocalPolicyModifyState { get; }
+    IList<FirewallProfileData> ReadProfiles();
+    IList<FirewallRuleData> FindByName(string name);
+    void PrepareAdd(FirewallRuleData rule);
+}
+
+internal interface IFirewallWriter
+{
     void Add();
     void Remove(string name);
 }
@@ -371,10 +384,9 @@ internal static partial class FirewallModule
             evidence.Stage = "Firewall " + options.Transport + " backend initialization";
             using (IFirewallBackend backend = createBackend())
             {
-                var gate = new ControlMutationGate();
                 ControlLifecycleResult<FirewallBaseline> result = ControlLifecycle.Run(
-                    new FirewallOperation(options, evidence, new GuardedFirewallBackend(backend, gate), gate),
-                    delegate(ControlLifecycleResult<FirewallBaseline> current) { return evidence.ObserveNow(); });
+                    new FirewallOperation(options, evidence), new FirewallReader(backend), new FirewallWriter(backend),
+                    delegate(IControlLifecycleSnapshot current) { return evidence.ObserveNow(); });
                 evidence.Lifecycle = result;
                 if (result.Errors.Count != 0)
                 {

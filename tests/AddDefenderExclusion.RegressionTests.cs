@@ -4,6 +4,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Reflection;
 using System.Xml;
 using System.Text.RegularExpressions;
 
@@ -20,6 +21,7 @@ internal static class RegressionTests
         CheckRawEtw();
         CheckModuleTelemetry();
         CheckLifecycle();
+        CheckArchitecture();
         CheckConsoleLayout();
         object[] zeroStatuses = { (uint)0, 0, (long)0, (ulong)0, (short)0,
             (ushort)0, (byte)0, (sbyte)0, "0" };
@@ -284,10 +286,40 @@ internal static class RegressionTests
             new[] { syntheticProvider }, delegate(ControlOptions o) { return new[] { "test-value" }; },
             delegate(TelemetryEvidence.ParsedEvent e, IEnumerable<string> values, int pid) {
                 return e.Provider == "Synthetic.Profile" && new List<string>(values).Contains("test-value") ? "THIRD_MATCH" : null;
-            });
+            }, TelemetryPresentation.Fields("SyntheticValue"),
+            delegate(TelemetryEvidence.ParsedEvent e) { return "Synthetic event " + e.Id; });
         var thirdOptions = new TestControlOptions { Kind = (ControlKind)99, Profile = third };
         var thirdEvent = TelemetryEvidence.Parse(EventXml("Synthetic.Profile", 7, "<EventData/>"));
+        thirdEvent.Fields["SyntheticValue"] = new List<string> { "profile-owned" };
+        thirdEvent.Fields["RuleName"] = new List<string> { "must-not-display" };
+        Assert(third.DisplayField("Synthetic Value") && !third.DisplayField("RuleName") &&
+            third.Interpret(thirdEvent) == "Synthetic event 7", "Third profile owns fields and interpretation");
+        TextWriter originalOutput = Console.Out;
+        using (var presentation = new StringWriter())
+        {
+            try
+            {
+                Console.SetOut(presentation);
+                TelemetryEvidence.PrintEvent(third, thirdEvent, "THIRD_MATCH", false);
+                Assert(presentation.ToString().Contains("profile-owned") &&
+                    presentation.ToString().Contains("Synthetic event 7") &&
+                    !presentation.ToString().Contains("must-not-display"),
+                    "Shared renderer honors third profile without family dispatch");
+            }
+            finally { Console.SetOut(originalOutput); }
+        }
         Assert(TelemetryEvidence.Correlate(thirdEvent, thirdOptions, 1234) == "THIRD_MATCH", "Third profile works without core kind dispatch");
+        ControlLifecycleResult<SyntheticBaseline> thirdRun = RunSynthetic(new SyntheticOperation(),
+            delegate(IControlLifecycleSnapshot state)
+            {
+                Assert(state.Verification == VerificationStatus.Confirmed,
+                    "Third family observation receives verified control state");
+                return TelemetryEvidence.Correlate(thirdEvent, thirdOptions, 1234) == "THIRD_MATCH" ?
+                    ObservationStatus.Observed : ObservationStatus.NotObserved;
+            });
+        Assert(thirdRun.Observation == ObservationStatus.Observed &&
+            thirdRun.Restoration == RestorationStatus.Succeeded,
+            "Third control and telemetry profile integrate through shared lifecycle");
         Assert(TelemetryEvidence.Correlate(thirdEvent, firewall, 1234) == null, "No synthetic events attributed to Firewall");
         Assert(EtwCapture.Correlate(thirdEvent, firewall, 1234) == null, "ETW emitter PID does not cross profile boundary");
         thirdEvent.Provider = "";
@@ -301,7 +333,8 @@ internal static class RegressionTests
         {
             bool rejected = false;
             try { new TelemetryProfile("Invalid", new[] { third.EventLogChannels[0] }, providers,
-                third.EvidenceValues, TelemetryEvidence.CorrelateFirewall); }
+                third.EvidenceValues, TelemetryEvidence.CorrelateFirewall,
+                third.DisplayField, third.Interpret); }
             catch (ArgumentException) { rejected = true; }
             Assert(rejected, "Invalid/duplicate/unbounded provider lists rejected");
         }
@@ -373,7 +406,7 @@ internal static class RegressionTests
             try
             {
                 Console.SetOut(output);
-                TelemetryEvidence.PrintEvent(parsed, "PID_MATCH: test", false, false);
+                TelemetryEvidence.PrintEvent(TelemetryProfiles.DefenderExclusion, parsed, "PID_MATCH: test", false, false);
                 Assert(!output.ToString().Contains("Record "), "ETW sequence is not Event Log Record ID");
                 var evidence = new DefenderModule.RunEvidence { Stage = "ETW setup" };
                 DefenderModule.PrintAssessment(options, evidence, 4);
@@ -418,7 +451,19 @@ internal static class RegressionTests
         internal readonly string Original = "original";
     }
 
-    private sealed class SyntheticOperation : IControlOperation<SyntheticBaseline>
+    private interface ISyntheticReader { string Read(); }
+    private interface ISyntheticWriter { void Write(); }
+    private sealed class SyntheticReader : ISyntheticReader
+    { public string Read() { return "original"; } }
+    private sealed class SyntheticWriter : ISyntheticWriter
+    { internal int Writes; public void Write() { Writes++; } }
+    private sealed class CombinedSyntheticBackend : ISyntheticReader, ISyntheticWriter
+    {
+        public string Read() { return "original"; }
+        public void Write() { }
+    }
+
+    private sealed class SyntheticOperation : IControlOperation<SyntheticBaseline, ISyntheticReader, ISyntheticWriter>
     {
         internal readonly List<string> Calls = new List<string>();
         internal ProbeStatus ProbeOutcome = ProbeStatus.Ready;
@@ -427,80 +472,79 @@ internal static class RegressionTests
         internal VerificationStatus VerifyOutcome = VerificationStatus.Confirmed;
         internal VerificationStatus RestoreOutcome = VerificationStatus.Confirmed;
         internal bool FailProbe, FailMutation, FailVerification, FailRestore;
-        internal bool TryWriteDuringProbe;
-        internal bool TryWriteDuringVerification;
         internal bool ReadAfterFailure = true;
-        internal readonly ControlMutationGate Gate = new ControlMutationGate();
         public string Transport { get { return "synthetic"; } }
-        public ControlMutationGate WriteGate { get { return Gate; } }
         public bool VerifyAfterApiFailure { get { return ReadAfterFailure; } }
         public string ManualRestoration { get { return "Restore synthetic baseline original."; } }
-        public ProbeResult<SyntheticBaseline> Probe()
+        public ProbeResult<SyntheticBaseline> Probe(ISyntheticReader reader)
         {
             Calls.Add("probe");
-            if (TryWriteDuringProbe) { Gate.RequireWrite(); }
+            Assert(reader.Read() == "original", "Probe receives read capability");
             if (FailProbe) { throw new InvalidOperationException("probe failed"); }
             return new ProbeResult<SyntheticBaseline>(new SyntheticBaseline(), ProbeOutcome,
                 ProbeOutcome == ProbeStatus.Ready ? Policy : RestorationPolicy.None);
         }
-        public MutationStatus Mutate(SyntheticBaseline baseline)
+        public MutationStatus Mutate(SyntheticBaseline baseline, ISyntheticWriter writer)
         {
             Calls.Add("mutate");
             Assert(baseline.Original == "original", "Typed baseline reaches mutation");
+            writer.Write();
             if (FailMutation) { throw new InvalidOperationException("write failed"); }
             return ApiOutcome;
         }
-        public VerificationStatus Verify(SyntheticBaseline baseline)
+        public VerificationStatus Verify(SyntheticBaseline baseline, ISyntheticReader reader)
         {
             Calls.Add("verify");
-            if (TryWriteDuringVerification) { Gate.RequireWrite(); }
+            Assert(reader.Read() == "original", "Verify receives read capability");
             if (FailVerification) { throw new InvalidOperationException("readback failed"); }
             return VerifyOutcome;
         }
-        public void Restore(SyntheticBaseline baseline)
+        public void Restore(SyntheticBaseline baseline, ISyntheticWriter writer)
         {
             Calls.Add("restore");
             Assert(baseline.Original == "original", "Restoration uses captured baseline");
+            writer.Write();
             if (FailRestore) { throw new InvalidOperationException("restore failed"); }
         }
-        public VerificationStatus VerifyRestored(SyntheticBaseline baseline)
-        { Calls.Add("verify-restored"); return RestoreOutcome; }
+        public VerificationStatus VerifyRestored(SyntheticBaseline baseline, ISyntheticReader reader)
+        { Calls.Add("verify-restored"); Assert(reader.Read() == "original", "Restore verification receives read capability"); return RestoreOutcome; }
     }
+
+    private static ControlLifecycleResult<SyntheticBaseline> RunSynthetic(SyntheticOperation operation,
+        Func<IControlLifecycleSnapshot, ObservationStatus> observe)
+    { return ControlLifecycle.Run(operation, new SyntheticReader(), new SyntheticWriter(), observe); }
 
     private static void CheckLifecycle()
     {
         var operation = new SyntheticOperation { FailProbe = true };
-        ControlLifecycleResult<SyntheticBaseline> result = ControlLifecycle.Run(operation, null);
+        ControlLifecycleResult<SyntheticBaseline> result = RunSynthetic(operation, null);
         Assert(result.ExitCode == 1 && result.Probe == ProbeStatus.Failed &&
             result.Mutation == MutationStatus.NotAttempted && string.Join(",", operation.Calls) == "probe",
             "Failed mandatory probe never mutates");
 
-        operation = new SyntheticOperation { TryWriteDuringProbe = true };
-        result = ControlLifecycle.Run(operation, null);
-        Assert(result.ExitCode == 1 && result.Probe == ProbeStatus.Failed &&
-            result.Mutation == MutationStatus.NotAttempted,
-            "Write gate rejects mutation during probe");
-
         operation = new SyntheticOperation { ProbeOutcome = ProbeStatus.ReadOnlyConfirmed };
-        result = ControlLifecycle.Run(operation, null);
+        result = RunSynthetic(operation, null);
         Assert(result.ExitCode == 0 && result.Restoration == RestorationStatus.NotRequired &&
             string.Join(",", operation.Calls) == "probe", "Read-only probe never invokes a write");
 
         operation = new SyntheticOperation { ProbeOutcome = ProbeStatus.ReadOnlyMismatch };
-        result = ControlLifecycle.Run(operation, null);
+        result = RunSynthetic(operation, null);
         Assert(result.ExitCode == 3 && result.Mutation == MutationStatus.NotAttempted,
             "Read-only expected-state mismatch is preserved");
 
         operation = new SyntheticOperation { VerifyOutcome = VerificationStatus.Mismatch };
-        result = ControlLifecycle.Run(operation, null);
+        result = RunSynthetic(operation, null);
         Assert(result.ExitCode == 3 && result.Mutation == MutationStatus.ApiSucceeded &&
             result.Verification == VerificationStatus.Mismatch && result.Restoration == RestorationStatus.Succeeded,
             "API success cannot override verification mismatch");
 
         operation = new SyntheticOperation();
-        result = ControlLifecycle.Run(operation, delegate(ControlLifecycleResult<SyntheticBaseline> current)
+        result = RunSynthetic(operation, delegate(IControlLifecycleSnapshot current)
         {
             Assert(current.Verification == VerificationStatus.Confirmed, "Observation sees control result");
+            Assert(!((object)current is ControlLifecycleResult<SyntheticBaseline>) &&
+                current.GetType().GetProperty("Baseline", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance) == null,
+                "Observer has no baseline or mutable result");
             operation.Calls.Add("observe");
             throw new InvalidOperationException("collector crashed");
         });
@@ -510,62 +554,118 @@ internal static class RegressionTests
             "Telemetry failure preserves control truth and cannot prevent restoration");
 
         operation = new SyntheticOperation { FailRestore = true };
-        result = ControlLifecycle.Run(operation, null);
+        result = RunSynthetic(operation, null);
         Assert(result.ExitCode == 1 && result.Verification == VerificationStatus.Confirmed &&
             result.Restoration == RestorationStatus.Failed, "Restoration failure remains separate and visible");
 
         operation = new SyntheticOperation { RestoreOutcome = VerificationStatus.Unavailable };
-        result = ControlLifecycle.Run(operation, null);
+        result = RunSynthetic(operation, null);
         Assert(result.ExitCode == 1 && result.Restoration == RestorationStatus.Unavailable,
             "Restore API return is not restore verification");
 
         operation = new SyntheticOperation { RestoreOutcome = VerificationStatus.Mismatch };
-        result = ControlLifecycle.Run(operation, null);
+        result = RunSynthetic(operation, null);
         Assert(result.ExitCode == 1 && result.Restoration == RestorationStatus.Failed,
             "Restore readback mismatch is a restoration failure");
 
         operation = new SyntheticOperation { FailVerification = true };
-        result = ControlLifecycle.Run(operation, null);
+        result = RunSynthetic(operation, null);
         Assert(result.ExitCode == 3 && result.Verification == VerificationStatus.Unavailable &&
             result.Restoration == RestorationStatus.Succeeded, "Verification exception still restores");
 
-        operation = new SyntheticOperation { TryWriteDuringVerification = true };
-        result = ControlLifecycle.Run(operation, null);
-        Assert(result.ExitCode == 3 && result.Verification == VerificationStatus.Unavailable &&
-            result.Restoration == RestorationStatus.Succeeded,
-            "Write gate rejects mutation during verification and still restores");
-
         operation = new SyntheticOperation { FailMutation = true };
-        result = ControlLifecycle.Run(operation, null);
+        result = RunSynthetic(operation, null);
         Assert(result.ExitCode == 1 && result.Mutation == MutationStatus.ApiFailed &&
             result.Verification == VerificationStatus.Confirmed && result.Restoration == RestorationStatus.Succeeded,
             "Ambiguous mutation failure can be read back and restored");
 
         operation = new SyntheticOperation { ApiOutcome = MutationStatus.ApiFailed, ReadAfterFailure = false,
             Policy = RestorationPolicy.Manual };
-        result = ControlLifecycle.Run(operation, null);
+        result = RunSynthetic(operation, null);
         Assert(result.ExitCode == 1 && result.Verification == VerificationStatus.NotRun &&
             result.Restoration == RestorationStatus.ManualRequired,
             "Legacy failed API skips readback but preserves manual restoration requirement");
 
         operation = new SyntheticOperation();
-        result = ControlLifecycle.Run(operation,
-            delegate(ControlLifecycleResult<SyntheticBaseline> current) { return ObservationStatus.Incomplete; });
+        result = RunSynthetic(operation,
+            delegate(IControlLifecycleSnapshot current) { return ObservationStatus.Incomplete; });
         Assert(result.ExitCode == 0 && result.Observation == ObservationStatus.Incomplete &&
             result.Restoration == RestorationStatus.Succeeded,
             "Incomplete telemetry is not a control failure");
 
         operation = new SyntheticOperation { Policy = RestorationPolicy.Manual, ApiOutcome = MutationStatus.ApiUnknown };
-        result = ControlLifecycle.Run(operation, null);
+        result = RunSynthetic(operation, null);
         Assert(result.ExitCode == 0 && result.Mutation == MutationStatus.ApiUnknown &&
             result.Verification == VerificationStatus.Confirmed &&
             result.Restoration == RestorationStatus.ManualRequired &&
             !operation.Calls.Contains("restore"), "Unknown API status needs readback and explicit manual cleanup");
 
         operation = new SyntheticOperation { Policy = RestorationPolicy.None };
-        result = ControlLifecycle.Run(operation, null);
+        result = RunSynthetic(operation, null);
         Assert(result.ExitCode == 1 && result.Mutation == MutationStatus.NotAttempted,
             "Mutating probe cannot omit restoration policy");
+
+        operation = new SyntheticOperation();
+        var writer = new SyntheticWriter();
+        result = ControlLifecycle.Run(operation, new SyntheticReader(), writer, null);
+        Assert(writer.Writes == 2 && result.Restoration == RestorationStatus.Succeeded,
+            "Runner provides write capability for mutation and restoration");
+        bool combinedRejected = false;
+        try
+        {
+            var combined = new CombinedSyntheticBackend();
+            ControlLifecycle.Run(operation, (ISyntheticReader)combined, (ISyntheticWriter)combined, null);
+        }
+        catch (ArgumentException) { combinedRejected = true; }
+        Assert(combinedRejected, "Runner rejects a reader that also exposes writes");
+    }
+
+    private static void CheckArchitecture()
+    {
+        Type read = typeof(DefenderModule.IPreferenceReader);
+        Type write = typeof(DefenderModule.IPreferenceWriter);
+        Assert(read.GetMethod("Add") == null && write.GetMethod("Add") != null,
+            "Defender read capability cannot Add");
+        Assert(typeof(IFirewallReader).GetMethod("Add") == null &&
+            typeof(IFirewallReader).GetMethod("Remove") == null &&
+            typeof(IFirewallWriter).GetMethod("Add") != null &&
+            typeof(IFirewallWriter).GetMethod("Remove") != null,
+            "Firewall read capability cannot mutate");
+        foreach (string name in new[] { "DefenderOperation" })
+        {
+            Type operation = typeof(DefenderModule).GetNestedType(name, BindingFlags.NonPublic);
+            Assert(operation != null, "Defender operation exists");
+            foreach (FieldInfo field in operation.GetFields(BindingFlags.Instance | BindingFlags.NonPublic))
+            {
+                Assert(!typeof(DefenderModule.IPreferenceBackend).IsAssignableFrom(field.FieldType) &&
+                    !write.IsAssignableFrom(field.FieldType), "Defender operation retains no mutable backend");
+            }
+            Assert(operation.GetMethod("Probe").GetParameters()[0].ParameterType == read &&
+                operation.GetMethod("Verify").GetParameters()[1].ParameterType == read &&
+                operation.GetMethod("Mutate").GetParameters()[1].ParameterType == write,
+                "Defender phase signatures fence writes");
+        }
+        Type firewall = typeof(FirewallModule).GetNestedType("FirewallOperation", BindingFlags.NonPublic);
+        Assert(firewall != null, "Firewall operation exists");
+        foreach (FieldInfo field in firewall.GetFields(BindingFlags.Instance | BindingFlags.NonPublic))
+        {
+            Assert(!typeof(IFirewallBackend).IsAssignableFrom(field.FieldType) &&
+                !typeof(IFirewallWriter).IsAssignableFrom(field.FieldType),
+                "Firewall operation retains no mutable backend");
+        }
+        Assert(firewall.GetMethod("Probe").GetParameters()[0].ParameterType == typeof(IFirewallReader) &&
+            firewall.GetMethod("Verify").GetParameters()[1].ParameterType == typeof(IFirewallReader) &&
+            firewall.GetMethod("Mutate").GetParameters()[1].ParameterType == typeof(IFirewallWriter),
+            "Firewall phase signatures fence writes");
+        foreach (PropertyInfo property in typeof(IControlLifecycleSnapshot).GetProperties())
+        { Assert(property.GetSetMethod() == null, "Observation snapshot is read-only"); }
+        foreach (PropertyInfo property in typeof(ControlLifecycleResult<SyntheticBaseline>).GetProperties(
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+        { Assert(property.GetSetMethod(true) == null || property.GetSetMethod(true).IsPrivate,
+            "Lifecycle result has no externally callable setter"); }
+        Assert(typeof(ControlLifecycleResult<SyntheticBaseline>).GetConstructors(
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)[0].IsPrivate,
+            "Only lifecycle result runtime can construct lifecycle truth");
     }
 
     private static void CheckTransportsAndAssessment()
@@ -739,11 +839,11 @@ internal static class RegressionTests
                 var parsed = TelemetryEvidence.Parse(EventXml("Microsoft-Windows-WMI-Activity", 5858,
                     "<EventData><Data Name='ClientProcessId'>1234</Data>" +
                     "<Data Name='Operation'>" + new string('x', 300) + "</Data></EventData>"));
-                TelemetryEvidence.PrintEvent(parsed, "PID_MATCH: client PID matched", false);
+                TelemetryEvidence.PrintEvent(TelemetryProfiles.DefenderExclusion, parsed, "PID_MATCH: client PID matched", false);
                 Assert(output.ToString().Contains("shortened; --verbose"), "Compact evidence truncation explicit");
                 Assert(Normalize(output.ToString()).Contains("does not by itself prove Add"), "Evidence meaning retained");
                 output.GetStringBuilder().Clear();
-                TelemetryEvidence.PrintEvent(parsed, "PID_MATCH: client PID matched", true);
+                TelemetryEvidence.PrintEvent(TelemetryProfiles.DefenderExclusion, parsed, "PID_MATCH: client PID matched", true);
                 Assert(!output.ToString().Contains("shortened; --verbose"), "Verbose evidence retains field data");
             }
             finally

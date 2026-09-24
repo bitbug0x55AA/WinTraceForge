@@ -37,7 +37,6 @@ internal class ControlRunEvidence
     internal string Stage = "Identity";
     private Func<ObservationStatus> observer;
     internal bool ObservationInvoked { get; private set; }
-    internal virtual void RecordObservation(ObservationStatus status) { }
     internal void SetObserver(Func<ObservationStatus> value) { observer = value; }
     internal ObservationStatus ObserveNow()
     {
@@ -45,9 +44,7 @@ internal class ControlRunEvidence
         if (ObservationInvoked) { throw new InvalidOperationException("Telemetry observation already completed."); }
         ObservationInvoked = true;
         OperationEndUtc = DateTime.UtcNow;
-        ObservationStatus status = observer();
-        RecordObservation(status);
-        return status;
+        return observer();
     }
 }
 
@@ -132,7 +129,6 @@ internal static class ControlRuntime
                         try { evidence.ObserveNow(); }
                         catch (Exception error)
                         {
-                            evidence.RecordObservation(ObservationStatus.Failed);
                             ConsoleUi.Status("WARN", "ETW collection failed: " + error.Message);
                         }
                     }
@@ -157,7 +153,6 @@ internal static class ControlRuntime
             try { evidence.ObserveNow(); }
             catch (Exception error)
             {
-                evidence.RecordObservation(ObservationStatus.Failed);
                 ConsoleUi.Status("WARN", "Event Log collection failed: " + error.Message);
             }
         }

@@ -37,14 +37,18 @@ internal sealed class TelemetryProfile
     internal readonly ReadOnlyCollection<EtwProvider> EtwProviders;
     internal readonly Func<ControlOptions, IEnumerable<string>> EvidenceValues;
     private readonly Func<TelemetryEvidence.ParsedEvent, IEnumerable<string>, int, string> correlator;
+    private readonly Func<string, bool> interestingField;
+    private readonly Func<TelemetryEvidence.ParsedEvent, string> interpreter;
 
     internal TelemetryProfile(string name, EventLogChannel[] channels, EtwProvider[] providers,
         Func<ControlOptions, IEnumerable<string>> evidenceValues,
-        Func<TelemetryEvidence.ParsedEvent, IEnumerable<string>, int, string> correlator)
+        Func<TelemetryEvidence.ParsedEvent, IEnumerable<string>, int, string> correlator,
+        Func<string, bool> interestingField,
+        Func<TelemetryEvidence.ParsedEvent, string> interpreter)
     {
         if (string.IsNullOrWhiteSpace(name) || channels == null || channels.Length == 0 ||
             providers == null || providers.Length == 0 || providers.Length > MaxEtwProviders ||
-            evidenceValues == null || correlator == null)
+            evidenceValues == null || correlator == null || interestingField == null || interpreter == null)
         { throw new ArgumentException("Telemetry profile requires explicit channels, 1..16 providers, evidence and correlator."); }
         var ids = new HashSet<Guid>();
         foreach (EtwProvider provider in providers)
@@ -61,7 +65,12 @@ internal sealed class TelemetryProfile
         EtwProviders = Array.AsReadOnly((EtwProvider[])providers.Clone());
         EvidenceValues = evidenceValues;
         this.correlator = correlator;
+        this.interestingField = interestingField;
+        this.interpreter = interpreter;
     }
+
+    internal bool DisplayField(string name) { return interestingField(name); }
+    internal string Interpret(TelemetryEvidence.ParsedEvent parsed) { return interpreter(parsed); }
 
     internal Guid[] ProviderIds()
     {
@@ -106,6 +115,27 @@ internal static class CommonTelemetryChannels
         "Microsoft-Windows-Sysmon/Operational", "Microsoft-Windows-Sysmon", "(EventID=1)");
 }
 
+internal static class TelemetryPresentation
+{
+    internal static Func<string, bool> Fields(params string[] names)
+    {
+        var allowed = new HashSet<string>(names, StringComparer.OrdinalIgnoreCase);
+        return delegate(string name) { return allowed.Contains(name.Replace(" ", "").Replace("_", "")); };
+    }
+    internal static readonly Func<string, bool> DefenderFields = Fields(
+        "OldValue", "NewValue", "Setting", "SettingName", "Value", "ClientProcessId",
+        "ProcessId", "NewProcessId", "NewProcessName", "ParentProcessName", "Image",
+        "ParentImage", "CommandLine", "User", "SubjectUserName", "SubjectDomainName",
+        "Operation", "ResultCode", "PossibleCause", "ClientMachine", "ProcessGuid");
+    internal static readonly Func<string, bool> FirewallFields = Fields(
+        "RuleName", "RuleId", "Action", "Direction", "Profiles", "Active",
+        "ApplicationPath", "ModifyingApplication", "ModifyingUser", "RemoteAddresses",
+        "RemotePorts", "LocalPorts", "Protocol", "LocalAddresses", "ServiceName",
+        "EdgeTraversal", "SecurityOptions", "RuleStatus", "Origin", "ProcessId",
+        "NewProcessId", "NewProcessName", "ParentProcessName", "Image", "ParentImage",
+        "CommandLine", "User", "SubjectUserName", "SubjectDomainName", "ProcessGuid");
+}
+
 // Compatibility aliases for existing tests; new families own their profiles in their own files.
 internal static class TelemetryProfiles
 {
@@ -127,9 +157,19 @@ internal static class DefenderTelemetry
         new[] {
             new EtwProvider("Microsoft-Windows-WMI-Activity", new Guid("1418ef04-b0b4-4623-bf7e-d74ab47bbdaa")),
             new EtwProvider("Microsoft-Windows-Windows Defender", new Guid("11cd958a-c507-4ef3-b3f2-5fd9dfbd2c78"))
-        }, RequestedValues, TelemetryEvidence.CorrelateDefender);
+        }, RequestedValues, TelemetryEvidence.CorrelateDefender,
+        TelemetryPresentation.DefenderFields, Interpret);
 
     private static IEnumerable<string> RequestedValues(ControlOptions options) { return options.EvidenceValues; }
+    private static string Interpret(TelemetryEvidence.ParsedEvent parsed)
+    {
+        if (parsed.Provider == "Microsoft-Windows-WMI-Activity")
+        { return "WMI activity may be a query; it does not by itself prove Add was invoked."; }
+        if (parsed.Provider == "Microsoft-Windows-Windows Defender")
+        { return parsed.Id == 5007 ? "Configuration change: verify setting and authorization." :
+            "Blocked setting change: verify the setting and attribution to this run."; }
+        return "Process-start evidence only; not proof of a WMI method invocation.";
+    }
 }
 
 internal static class FirewallTelemetry
@@ -146,7 +186,15 @@ internal static class FirewallTelemetry
         new[] {
             new EtwProvider("Microsoft-Windows-Windows Firewall With Advanced Security",
                 new Guid("d1bc9aff-2abf-4d71-9146-ecb2a986eb85"))
-        }, RequestedValues, TelemetryEvidence.CorrelateFirewall);
+        }, RequestedValues, TelemetryEvidence.CorrelateFirewall,
+        TelemetryPresentation.FirewallFields, Interpret);
 
     private static IEnumerable<string> RequestedValues(ControlOptions options) { return options.EvidenceValues; }
+    private static string Interpret(TelemetryEvidence.ParsedEvent parsed)
+    {
+        if (parsed.Provider == "Microsoft-Windows-Windows Firewall With Advanced Security" ||
+            (parsed.Provider == "Microsoft-Windows-Security-Auditing" && parsed.Id >= 4946 && parsed.Id <= 4948))
+        { return "Firewall rule-change evidence only; not proof of packet blocking/allowing."; }
+        return "Process-start evidence only; not proof of a WMI method invocation.";
+    }
 }

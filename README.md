@@ -172,8 +172,8 @@ See [docs/technical-reference.md](docs/technical-reference.md) for transport map
 
 ## Repository contents
 
-- `src/WinTraceForge/managed/` — managed CLI, control modules, native interop, telemetry, and console output
-- `src/WinTraceForge/native/` — native WMI, Windows Firewall, and ETW implementation
+- `src/managed/` — C# sources grouped into `app/`, `lifecycle/`, `defender/`, `firewall/`, and `telemetry/`
+- `src/native/` — C++ sources grouped into `defender/`, `firewall/`, and `telemetry/`
 - `tests/` — regression and non-mutating integration runners
 - `.github/workflows/build.yml` — Windows CI build and regression workflow
 - `Build.ps1` — reproducible local build/test entry point

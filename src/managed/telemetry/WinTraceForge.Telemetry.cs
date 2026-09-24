@@ -120,7 +120,7 @@ internal static class TelemetryEvidence
                         string correlation = Correlate(parsed, options, evidence.ProcessId);
                         if (correlation == null) { continue; }
                         candidates++;
-                        if (options.Verbose || candidates <= 3) { PrintEvent(parsed, correlation, options.Verbose); }
+                        if (options.Verbose || candidates <= 3) { PrintEvent(options.Telemetry, parsed, correlation, options.Verbose); }
                     }
                 }
             }
@@ -158,7 +158,7 @@ internal static class TelemetryEvidence
         return false;
     }
 
-    internal static void PrintEvent(ParsedEvent parsed, string correlation, bool verbose, bool eventLogRecord = true)
+    internal static void PrintEvent(TelemetryProfile profile, ParsedEvent parsed, string correlation, bool verbose, bool eventLogRecord = true)
     {
         string kind = correlation.Split(':')[0];
         ConsoleUi.Status("INFO", "Event " + parsed.Id +
@@ -169,28 +169,10 @@ internal static class TelemetryEvidence
             ConsoleUi.Row("Provider", Safe(parsed.Provider));
             ConsoleUi.Row("Correlation", correlation);
         }
-        if (parsed.Provider == "Microsoft-Windows-WMI-Activity")
-        {
-            ConsoleUi.Text("WMI activity may be a query; it does not by itself prove Add was invoked.");
-        }
-        else if (parsed.Provider == "Microsoft-Windows-Windows Defender")
-        {
-            ConsoleUi.Text(parsed.Id == 5007 ?
-                "Configuration change: verify setting and authorization." :
-                "Blocked setting change: verify the setting and attribution to this run.");
-        }
-        else if (parsed.Provider == "Microsoft-Windows-Windows Firewall With Advanced Security" ||
-            (parsed.Provider == "Microsoft-Windows-Security-Auditing" && parsed.Id >= 4946 && parsed.Id <= 4948))
-        {
-            ConsoleUi.Text("Firewall rule-change evidence only; not proof of packet blocking/allowing.");
-        }
-        else
-        {
-            ConsoleUi.Text("Process-start evidence only; not proof of a WMI method invocation.");
-        }
+        ConsoleUi.Text(profile.Interpret(parsed));
         foreach (var field in parsed.Fields)
         {
-            if (!DisplayField(field.Key)) { continue; }
+            if (!profile.DisplayField(field.Key)) { continue; }
             foreach (string value in field.Value)
             {
                 string display = Safe(value);
@@ -369,22 +351,6 @@ internal static class TelemetryEvidence
             {
                 return true;
             }
-        }
-        return false;
-    }
-
-    private static bool DisplayField(string name)
-    {
-        string compact = name.Replace(" ", "").Replace("_", "");
-        foreach (string allowed in new[] { "OldValue", "NewValue", "Setting", "SettingName", "Value",
-            "ClientProcessId", "ProcessId", "NewProcessId", "NewProcessName", "ParentProcessName",
-            "Image", "ParentImage", "CommandLine", "User", "SubjectUserName", "SubjectDomainName",
-            "Operation", "ResultCode", "PossibleCause", "ClientMachine", "ProcessGuid",
-            "RuleName", "RuleId", "Action", "Direction", "Profiles", "Active", "ApplicationPath",
-            "ModifyingApplication", "ModifyingUser", "RemoteAddresses", "RemotePorts", "LocalPorts", "Protocol",
-            "LocalAddresses", "ServiceName", "EdgeTraversal", "SecurityOptions", "RuleStatus", "Origin" })
-        {
-            if (string.Equals(compact, allowed, StringComparison.OrdinalIgnoreCase)) { return true; }
         }
         return false;
     }
