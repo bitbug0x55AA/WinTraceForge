@@ -4,16 +4,24 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Management;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Xml;
 using System.Text.RegularExpressions;
+using Microsoft.Win32.SafeHandles;
 
 internal static class RegressionTests
 {
     private static int passed;
 
-    private static int Main()
+    private static int Main(string[] args)
     {
+        if (args.Length == 1 && args[0] == "--asr-read-only")
+        {
+            RunAsrReadOnlyIntegrationCheck();
+            return 0;
+        }
         CheckArguments();
         CheckReadback();
         CheckTransportsAndAssessment();
@@ -22,6 +30,13 @@ internal static class RegressionTests
         CheckModuleTelemetry();
         CheckLifecycle();
         CheckArchitecture();
+        CheckAsrArguments();
+        CheckAsrLifecycle();
+        CheckAsrPolicySourceAndCatalog();
+        CheckAsrTelemetry();
+        CheckAsrArchitecture();
+        CheckAsrBuiltInPrimitive();
+        CheckAsrCleanupUnverifiableLabel();
         CheckConsoleLayout();
         object[] zeroStatuses = { (uint)0, 0, (long)0, (ulong)0, (short)0,
             (ushort)0, (byte)0, (sbyte)0, "0" };
@@ -444,6 +459,534 @@ internal static class RegressionTests
             return readCount++ == 0 ? Before : After;
         }
         public void Dispose() { }
+    }
+
+    private sealed class FakeAsrBackend : IAsrBackend
+    {
+        internal readonly List<string> Calls = new List<string>();
+        internal AsrSnapshot Snapshot;
+        internal AsrSnapshot AfterSnapshot;
+        internal object Status;
+        internal readonly Dictionary<string, AsrPolicySourceKind> PolicySource =
+            new Dictionary<string, AsrPolicySourceKind>(StringComparer.OrdinalIgnoreCase);
+        internal bool NotepadRedirectionActive;
+        private int readCount;
+
+        public void Connect() { Calls.Add("Connect"); }
+        public void Prepare(AsrMutationRequest request) { Calls.Add("Prepare"); }
+        public bool Supports(string name) { Calls.Add("Supports"); return true; }
+        public object Add() { Calls.Add("Add"); return Status; }
+        public AsrSnapshot Read()
+        {
+            Calls.Add("Read");
+            return readCount++ == 0 ? Snapshot : (AfterSnapshot ?? Snapshot);
+        }
+        public Dictionary<string, AsrPolicySourceKind> ReadPolicySource(IEnumerable<string> keys)
+        {
+            Calls.Add("ReadPolicySource");
+            var result = new Dictionary<string, AsrPolicySourceKind>(StringComparer.OrdinalIgnoreCase);
+            foreach (string key in keys)
+            {
+                AsrPolicySourceKind kind;
+                result[key] = PolicySource.TryGetValue(key, out kind) ? kind : AsrPolicySourceKind.Unknown;
+            }
+            return result;
+        }
+        public bool IsNotepadRedirectionActive() { return NotepadRedirectionActive; }
+        public void Dispose() { }
+    }
+
+    private static AsrSnapshot EmptyAsrSnapshot()
+    {
+        return new AsrSnapshot(new Dictionary<string, AsrAction>(StringComparer.OrdinalIgnoreCase), new List<string>(),
+            new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase)
+            {
+                { "ExclusionPath", new List<string>() }, { "ExclusionExtension", new List<string>() },
+                { "ExclusionProcess", new List<string>() }, { "ExclusionIpAddress", new List<string>() }
+            });
+    }
+
+    // -Integration only: exercises the real ManagementAsrBackend against live WMI to prove the
+    // CimType gate (B1) actually accepts a real Prepare(RuleAction) call end to end. Add is never
+    // invoked, so no Defender setting is touched; this only proves the request would be accepted.
+    private static void RunAsrReadOnlyIntegrationCheck()
+    {
+        using (IAsrBackend backend = AsrModule.CreateBackend("management"))
+        {
+            backend.Connect();
+            backend.Prepare(new AsrMutationRequest
+            {
+                Kind = AsrRequestKind.RuleAction,
+                RuleId = Guid.NewGuid().ToString("D"),
+                Action = AsrAction.Audit
+            });
+            Console.WriteLine("PASS: real ManagementAsrBackend.Prepare(RuleAction) accepted the UInt8 Actions array " +
+                "against live WMI; Add was not called and no Defender setting was changed.");
+        }
+    }
+
+    private static void CheckAsrArguments()
+    {
+        Assert(AsrModule.Parse(new[] { "--help" }).Help, "ASR help");
+        Assert(AsrModule.Parse(new[] { "status", "--help" }).Help, "ASR status help");
+        AsrOptions status = AsrModule.Parse(new[] { "status" });
+        Assert(status.Kind == ControlKind.DefenderAsrStatus && !status.CheckOnly, "ASR status kind");
+
+        AsrOptions check = AsrModule.Parse(new[] { "exclusion", "--check", "-Path", @"C:\Lab" });
+        Assert(check.Kind == ControlKind.DefenderAsrExclusion && check.CheckOnly && check.Paths.Count == 1,
+            "ASR exclusion check parse");
+
+        AsrOptions add = AsrModule.Parse(new[] { "exclusion", "-Path", @"C:\Lab", @"C:\Lab2" });
+        Assert(!add.CheckOnly && add.Paths.Count == 2, "ASR exclusion add parse");
+
+        Guid ruleId = Guid.NewGuid();
+        AsrOptions ruleCheck = AsrModule.Parse(new[] { "rule", "--check", "-RuleId", ruleId.ToString("D") });
+        Assert(ruleCheck.Kind == ControlKind.DefenderAsrRule && ruleCheck.CheckOnly && ruleCheck.RuleId == ruleId,
+            "ASR rule check parse");
+
+        AsrOptions ruleSet = AsrModule.Parse(new[] { "rule", "-RuleId", ruleId.ToString("D"), "-Action", "Block" });
+        Assert(ruleSet.Action == AsrAction.Block, "ASR rule set parse");
+        Assert(AsrModule.Parse(new[] { "rule", "-RuleId", ruleId.ToString("D"), "-Action", "NotConfigured" }).Action
+            == AsrAction.NotConfigured, "ASR rule set accepts NotConfigured");
+
+        AsrOptions verifyBuiltIn = AsrModule.Parse(new[] { "verify", "-RuleId", AsrRuleCatalog.JavaScriptOrVbScriptRuleId });
+        Assert(verifyBuiltIn.TestCommand == null, "ASR verify built-in parse");
+
+        AsrOptions verifyCustom = AsrModule.Parse(new[] {
+            "verify", "-RuleId", ruleId.ToString("D"), "-TestCommand", "cmd.exe", "-TestArguments", "/c exit 0" });
+        Assert(verifyCustom.TestCommand == "cmd.exe" && verifyCustom.TestArguments == "/c exit 0",
+            "ASR verify custom command parse");
+
+        string[][] invalid = {
+            new string[0],
+            new[] { "bogus" },
+            new[] { "status", "--check" },
+            new[] { "status", "-Path", @"C:\Lab" },
+            new[] { "exclusion" },
+            new[] { "exclusion", "--check" },
+            new[] { "exclusion", "-Path" },
+            new[] { "exclusion", "--check", "-Path" },
+            new[] { "rule" },
+            new[] { "rule", "-RuleId", "not-a-guid" },
+            new[] { "rule", "-RuleId", ruleId.ToString("D") },
+            new[] { "rule", "--check", "-RuleId", ruleId.ToString("D"), "-Action", "Block" },
+            new[] { "rule", "-RuleId", ruleId.ToString("D"), "-Action", "Bogus" },
+            new[] { "verify" },
+            new[] { "verify", "-RuleId", ruleId.ToString("D") },
+            new[] { "verify", "-RuleId", ruleId.ToString("D"), "-TestArguments", "/c exit 0" },
+            new[] { "exclusion", "--transport", "com", "-Path", @"C:\Lab" }
+        };
+        foreach (string[] arguments in invalid)
+        {
+            bool rejected = false;
+            try { AsrModule.Parse(arguments); }
+            catch (ArgumentException) { rejected = true; }
+            Assert(rejected, "Reject invalid ASR arguments: " + string.Join(" ", arguments));
+        }
+    }
+
+    private static void CheckAsrLifecycle()
+    {
+        AsrOptions check = AsrModule.Parse(new[] { "exclusion", "--check", "-Path", @"C:\Lab" });
+        var backend = new FakeAsrBackend { Snapshot = EmptyAsrSnapshot() };
+        var evidence = new AsrRunEvidence();
+        int exitCode = AsrModule.RunWithBackend(check, evidence, backend);
+        Assert(exitCode == 0 && !backend.Calls.Contains("Add"), "ASR exclusion check never calls Add");
+
+        AsrOptions add = AsrModule.Parse(new[] { "exclusion", "-Path", @"C:\Lab" });
+        AsrSnapshot before = EmptyAsrSnapshot();
+        var after = new AsrSnapshot(new Dictionary<string, AsrAction>(StringComparer.OrdinalIgnoreCase),
+            new List<string> { @"C:\Lab" }, before.AvExclusions);
+        backend = new FakeAsrBackend { Snapshot = before, AfterSnapshot = after, Status = (uint)0 };
+        evidence = new AsrRunEvidence();
+        exitCode = AsrModule.RunWithBackend(add, evidence, backend);
+        Assert(exitCode == 0 && evidence.Lifecycle.Restoration == RestorationStatus.ManualRequired,
+            "ASR exclusion add confirmed with manual restoration");
+        Assert(string.Join(",", backend.Calls) == "Connect,Prepare,Read,Add,Read", "ASR exclusion call order");
+        Assert(evidence.Lifecycle.ManualRestoration.Contains("C:\\Lab") &&
+            evidence.Lifecycle.ManualRestoration.Contains("Remove-MpPreference"),
+            "ASR exclusion restoration names the newly-added path with an executable command");
+
+        // R1: a request that mixes an already-existing baseline path with a genuinely new one must
+        // list ONLY the new path for removal -- never a pre-existing, possibly-organizational entry.
+        AsrOptions mixedAdd = AsrModule.Parse(new[] { "exclusion", "-Path", @"C:\OrgExisting", @"C:\New" });
+        var mixedBefore = new AsrSnapshot(new Dictionary<string, AsrAction>(StringComparer.OrdinalIgnoreCase),
+            new List<string> { @"C:\OrgExisting" }, EmptyAsrSnapshot().AvExclusions);
+        var mixedAfter = new AsrSnapshot(new Dictionary<string, AsrAction>(StringComparer.OrdinalIgnoreCase),
+            new List<string> { @"C:\OrgExisting", @"C:\New" }, EmptyAsrSnapshot().AvExclusions);
+        backend = new FakeAsrBackend { Snapshot = mixedBefore, AfterSnapshot = mixedAfter, Status = (uint)0 };
+        evidence = new AsrRunEvidence();
+        exitCode = AsrModule.RunWithBackend(mixedAdd, evidence, backend);
+        Assert(exitCode == 0 && evidence.Lifecycle.ManualRestoration.Contains(@"C:\New") &&
+            !evidence.Lifecycle.ManualRestoration.Contains(@"C:\OrgExisting"),
+            "ASR exclusion restoration lists only the newly-added path, never a pre-existing baseline path");
+
+        // R1: when every requested path already existed, there is nothing new to remove.
+        AsrOptions allExisting = AsrModule.Parse(new[] { "exclusion", "-Path", @"C:\OrgExisting" });
+        backend = new FakeAsrBackend { Snapshot = mixedBefore, AfterSnapshot = mixedBefore, Status = (uint)0 };
+        evidence = new AsrRunEvidence();
+        exitCode = AsrModule.RunWithBackend(allExisting, evidence, backend);
+        Assert(exitCode == 0 && evidence.Lifecycle.ManualRestoration.Contains("nothing new to remove"),
+            "ASR exclusion restoration says so when every requested path already existed");
+
+        // T1: an unquoted path with a space would be parsed as a separate positional argument by
+        // PowerShell, and one containing '$' would have that treated as a variable to expand -- e.g.
+        // "C:\Temp$Lab" silently becomes "C:\Temp", which could be a real, unrelated, pre-existing
+        // exclusion. Every path in the printed command must be single-quoted (with '' escaping).
+        AsrOptions trickyAdd = AsrModule.Parse(new[] { "exclusion", "-Path", @"C:\Lab Data", @"C:\Temp$Lab" });
+        var trickyAfter = new AsrSnapshot(new Dictionary<string, AsrAction>(StringComparer.OrdinalIgnoreCase),
+            new List<string> { @"C:\Lab Data", @"C:\Temp$Lab" }, EmptyAsrSnapshot().AvExclusions);
+        backend = new FakeAsrBackend { Snapshot = EmptyAsrSnapshot(), AfterSnapshot = trickyAfter, Status = (uint)0 };
+        evidence = new AsrRunEvidence();
+        exitCode = AsrModule.RunWithBackend(trickyAdd, evidence, backend);
+        Assert(exitCode == 0 && evidence.Lifecycle.ManualRestoration.Contains("'C:\\Lab Data'") &&
+            evidence.Lifecycle.ManualRestoration.Contains("'C:\\Temp$Lab'"),
+            "ASR exclusion restoration single-quotes every path (spaces and '$' cannot be left bare)");
+        Assert(string.Join(",", AsrModule.QuotePowerShellPaths(new[] { @"O'Brien's" })) == "'O''Brien''s'",
+            "QuotePowerShellPaths escapes an embedded single quote by doubling it");
+        // U1: PowerShell's tokenizer also treats the Unicode "smart quote" variants as quote
+        // characters -- real in copy-pasted folder names (e.g. from Office) -- so each must be
+        // doubled exactly like an ASCII ' or the generated command fails to parse at all.
+        Assert(string.Join(",", AsrModule.QuotePowerShellPaths(new[] { "C:\\Bob\u2019s Lab" })) ==
+            "'C:\\Bob\u2019\u2019s Lab'",
+            "QuotePowerShellPaths escapes U+2019 (right single quotation mark) the same way as ASCII '");
+        Assert(string.Join(",", AsrModule.QuotePowerShellPaths(new[] { "\u2018\u2019\u201A\u201B" })) ==
+            "'\u2018\u2018\u2019\u2019\u201A\u201A\u201B\u201B'",
+            "QuotePowerShellPaths escapes every recognized smart-quote variant (U+2018/2019/201A/201B)");
+
+        backend = new FakeAsrBackend { Snapshot = before, AfterSnapshot = before, Status = (uint)5 };
+        evidence = new AsrRunEvidence();
+        exitCode = AsrModule.RunWithBackend(add, evidence, backend);
+        Assert(exitCode == 1, "ASR exclusion add explicit failure status");
+
+        Guid ruleId = Guid.NewGuid();
+        AsrOptions ruleCheck = AsrModule.Parse(new[] { "rule", "--check", "-RuleId", ruleId.ToString("D") });
+        backend = new FakeAsrBackend { Snapshot = EmptyAsrSnapshot() };
+        evidence = new AsrRunEvidence();
+        exitCode = AsrModule.RunWithBackend(ruleCheck, evidence, backend);
+        Assert(exitCode == 0 && !backend.Calls.Contains("Add"), "ASR rule check never calls Add");
+
+        AsrOptions ruleSet = AsrModule.Parse(new[] { "rule", "-RuleId", ruleId.ToString("D"), "-Action", "Block" });
+        AsrSnapshot ruleBefore = EmptyAsrSnapshot();
+        var ruleAfterRules = new Dictionary<string, AsrAction>(StringComparer.OrdinalIgnoreCase)
+            { { ruleId.ToString("D"), AsrAction.Block } };
+        var ruleAfter = new AsrSnapshot(ruleAfterRules, new List<string>(), ruleBefore.AvExclusions);
+        backend = new FakeAsrBackend { Snapshot = ruleBefore, AfterSnapshot = ruleAfter, Status = (uint)0 };
+        evidence = new AsrRunEvidence();
+        exitCode = AsrModule.RunWithBackend(ruleSet, evidence, backend);
+        Assert(exitCode == 0 && evidence.Lifecycle.Restoration == RestorationStatus.ManualRequired &&
+            evidence.Lifecycle.ManualRestoration.Contains("-Action NotConfigured"),
+            "ASR rule set from NotConfigured documents an exact NotConfigured restore command");
+
+        var priorRules = new Dictionary<string, AsrAction>(StringComparer.OrdinalIgnoreCase)
+            { { ruleId.ToString("D"), AsrAction.Audit } };
+        var priorSnapshot = new AsrSnapshot(priorRules, new List<string>(), ruleBefore.AvExclusions);
+        backend = new FakeAsrBackend { Snapshot = priorSnapshot, AfterSnapshot = ruleAfter, Status = (uint)0 };
+        evidence = new AsrRunEvidence();
+        exitCode = AsrModule.RunWithBackend(ruleSet, evidence, backend);
+        Assert(exitCode == 0 && evidence.Lifecycle.ManualRestoration.Contains("-Action Audit"),
+            "ASR rule set from a prior action documents the exact restore command");
+
+        // T6 / R2: requesting NotConfigured(5) may leave Defender with an explicit (guid, 5) entry, or
+        // it may remove the entry entirely -- unobserved either way, and Microsoft documents both as
+        // functionally unconfigured -- so readback must accept BOTH representations as Confirmed.
+        AsrOptions ruleClear = AsrModule.Parse(new[] { "rule", "-RuleId", ruleId.ToString("D"), "-Action", "NotConfigured" });
+        backend = new FakeAsrBackend { Snapshot = ruleAfter, AfterSnapshot = EmptyAsrSnapshot(), Status = (uint)0 };
+        evidence = new AsrRunEvidence();
+        exitCode = AsrModule.RunWithBackend(ruleClear, evidence, backend);
+        Assert(exitCode == 0 && evidence.Lifecycle.Verification == VerificationStatus.Confirmed,
+            "ASR rule NotConfigured readback is Confirmed when Defender removes the entry entirely");
+        var explicitNotConfigured = new Dictionary<string, AsrAction>(StringComparer.OrdinalIgnoreCase)
+            { { ruleId.ToString("D"), AsrAction.NotConfigured } };
+        backend = new FakeAsrBackend { Snapshot = ruleAfter,
+            AfterSnapshot = new AsrSnapshot(explicitNotConfigured, new List<string>(), ruleBefore.AvExclusions), Status = (uint)0 };
+        evidence = new AsrRunEvidence();
+        exitCode = AsrModule.RunWithBackend(ruleClear, evidence, backend);
+        Assert(exitCode == 0 && evidence.Lifecycle.Verification == VerificationStatus.Confirmed,
+            "ASR rule NotConfigured readback is also Confirmed when Defender keeps an explicit (guid, 5) entry");
+
+        AsrOptions verifyCheck = AsrModule.Parse(new[] { "verify", "-RuleId", AsrRuleCatalog.JavaScriptOrVbScriptRuleId, "--check" });
+        backend = new FakeAsrBackend { Snapshot = EmptyAsrSnapshot() };
+        evidence = new AsrRunEvidence();
+        exitCode = AsrModule.RunWithBackend(verifyCheck, evidence, backend);
+        Assert(exitCode == 0 && evidence.Lifecycle.Restoration == RestorationStatus.NotRequired,
+            "ASR verify check is read-only");
+
+        // The redirection check is wired through the backend (fakeable), not a hardcoded static
+        // registry call; --check never launches anything, so this is safe to exercise for real.
+        backend = new FakeAsrBackend { Snapshot = EmptyAsrSnapshot(), NotepadRedirectionActive = true };
+        evidence = new AsrRunEvidence();
+        TextWriter originalOutForRedirect = Console.Out;
+        using (var redirectOutput = new StringWriter())
+        {
+            try { Console.SetOut(redirectOutput); exitCode = AsrModule.RunWithBackend(verifyCheck, evidence, backend); }
+            finally { Console.SetOut(originalOutForRedirect); }
+            Assert(exitCode == 0 && redirectOutput.ToString().Contains("redirects notepad.exe"),
+                "ASR verify surfaces the backend's redirection signal through Probe's own output");
+        }
+
+        AsrOptions verifyCustom = AsrModule.Parse(new[] {
+            "verify", "-RuleId", Guid.NewGuid().ToString("D"), "-TestCommand", "cmd.exe", "-TestArguments", "/c exit 0" });
+        backend = new FakeAsrBackend { Snapshot = EmptyAsrSnapshot() };
+        evidence = new AsrRunEvidence();
+        exitCode = AsrModule.RunWithBackend(verifyCustom, evidence, backend);
+        // The ASR backend here is fake, but the process cleanup this exercises always queries real
+        // Win32_Process regardless: on a host where that WMI query is itself restricted, cleanup
+        // correctly reports Unavailable (never crashes into Failed, never falsely claims Succeeded) --
+        // both outcomes are accepted here so this suite runs the real code path without requiring a
+        // specific host WMI posture; only Failed (a genuine, unhandled regression) would fail this.
+        Assert(evidence.Lifecycle.Verification == VerificationStatus.Unavailable &&
+            (evidence.Lifecycle.Restoration == RestorationStatus.Succeeded ||
+                evidence.Lifecycle.Restoration == RestorationStatus.Unavailable) &&
+            (exitCode == 1 || exitCode == 3),
+            "ASR verify with a custom command and no known child signature is unavailable, and restoration is " +
+            "either confirmed or honestly unavailable depending on host WMI access, but never falsely Succeeded");
+
+        // A non-administrator sees Defender's elevation sentinel, not a genuine empty exclusion list.
+        // --check must not silently claim success over content it could not actually observe.
+        var elevationGated = new AsrSnapshot(new Dictionary<string, AsrAction>(StringComparer.OrdinalIgnoreCase),
+            new List<string>(), EmptyAsrSnapshot().AvExclusions, globalExclusionsRequireElevation: true);
+        backend = new FakeAsrBackend { Snapshot = elevationGated };
+        evidence = new AsrRunEvidence();
+        exitCode = AsrModule.RunWithBackend(check, evidence, backend);
+        Assert(exitCode == 3 && evidence.Lifecycle.Probe == ProbeStatus.ReadOnlyMismatch,
+            "ASR exclusion check cannot claim success when Defender hides exclusion content non-elevated");
+
+        backend = new FakeAsrBackend { Snapshot = before, AfterSnapshot = elevationGated, Status = (uint)0 };
+        evidence = new AsrRunEvidence();
+        exitCode = AsrModule.RunWithBackend(add, evidence, backend);
+        Assert(exitCode == 3 && evidence.Lifecycle.Verification == VerificationStatus.Unavailable,
+            "ASR exclusion Add readback cannot claim confirmation when Defender hides exclusion content");
+    }
+
+    // Synthetic IAsrReader/IAsrWriter and operation, used only to drive a real
+    // ControlLifecycleResult<AsrBaseline> through the shared runner without ever launching the real
+    // built-in primitive (which would open a real notepad.exe window on the host running this suite).
+    private sealed class NullAsrReader : IAsrReader
+    {
+        public void Connect() { }
+        public void Prepare(AsrMutationRequest request) { }
+        public bool Supports(string name) { return true; }
+        public AsrSnapshot Read() { return EmptyAsrSnapshot(); }
+        public Dictionary<string, AsrPolicySourceKind> ReadPolicySource(IEnumerable<string> keys)
+        { return new Dictionary<string, AsrPolicySourceKind>(StringComparer.OrdinalIgnoreCase); }
+        public bool IsNotepadRedirectionActive() { return false; }
+    }
+
+    private sealed class NullAsrWriter : IAsrWriter { public object Add() { return null; } }
+
+    private sealed class FakeAsrLifecycleOperation : IControlOperation<AsrBaseline, IAsrReader, IAsrWriter>
+    {
+        internal VerificationStatus RestoreOutcome = VerificationStatus.Confirmed;
+        public string Transport { get { return "fake"; } }
+        public bool VerifyAfterApiFailure { get { return false; } }
+        public string ManualRestoration { get { return "n/a"; } }
+        public ProbeResult<AsrBaseline> Probe(IAsrReader reader)
+        { return new ProbeResult<AsrBaseline>(new AsrBaseline(EmptyAsrSnapshot(), null), ProbeStatus.Ready, RestorationPolicy.Automatic); }
+        public MutationStatus Mutate(AsrBaseline baseline, IAsrWriter writer) { return MutationStatus.ApiSucceeded; }
+        public VerificationStatus Verify(AsrBaseline baseline, IAsrReader reader) { return VerificationStatus.Confirmed; }
+        public void Restore(AsrBaseline baseline, IAsrWriter writer) { }
+        public VerificationStatus VerifyRestored(AsrBaseline baseline, IAsrReader reader) { return RestoreOutcome; }
+    }
+
+    // T2: on a host where the built-in primitive's target is redirected (confirmed present on this
+    // development machine via IFEO/AppExecutionAlias), 'verify' cannot confirm cleanup and reports
+    // Restoration=Unavailable. That must be its own outcome label, not a generic OPERATION_ERROR.
+    private static void CheckAsrCleanupUnverifiableLabel()
+    {
+        var operation = new FakeAsrLifecycleOperation { RestoreOutcome = VerificationStatus.Unavailable };
+        ControlLifecycleResult<AsrBaseline> result = ControlLifecycle.Run(operation, new NullAsrReader(), new NullAsrWriter(), null);
+        Assert(result.Restoration == RestorationStatus.Unavailable && result.ExitCode == 1,
+            "Synthetic ASR lifecycle reaches Restoration=Unavailable with exit 1, matching a redirected host");
+
+        AsrOptions verifyOptions = AsrModule.Parse(new[] { "verify", "-RuleId", AsrRuleCatalog.JavaScriptOrVbScriptRuleId, "--verbose" });
+        var evidence = new AsrRunEvidence { Lifecycle = result };
+        TextWriter original = Console.Out;
+        using (var output = new StringWriter())
+        {
+            try
+            {
+                Console.SetOut(output);
+                AsrModule.PrintAssessment(verifyOptions, evidence, result.ExitCode);
+                Assert(output.ToString().Contains("CLEANUP_UNVERIFIABLE") && !output.ToString().Contains("OPERATION_ERROR"),
+                    "Unconfirmable cleanup is labeled distinctly, not as a generic operation error");
+            }
+            finally { Console.SetOut(original); }
+        }
+    }
+
+    private static void CheckAsrPolicySourceAndCatalog()
+    {
+        Assert(AsrRuleCatalog.NameOf(AsrRuleCatalog.JavaScriptOrVbScriptRuleId).Contains("JavaScript"),
+            "ASR catalog resolves a known rule name");
+        Assert(AsrRuleCatalog.NameOf(Guid.NewGuid().ToString("D")) == "(unrecognized rule; verify against Microsoft Learn)",
+            "ASR catalog is safe for unknown GUIDs");
+
+        string ruleKey = Guid.NewGuid().ToString("D");
+        Dictionary<string, AsrPolicySourceKind> sources = AsrRegistry.ReadPolicySource(
+            new[] { ruleKey, AsrRegistry.GlobalExclusionsSourceKey });
+        Assert(sources.ContainsKey(ruleKey) && sources.ContainsKey(AsrRegistry.GlobalExclusionsSourceKey),
+            "ASR registry policy-source lookup returns every requested key without throwing");
+    }
+
+    private static void CheckAsrTelemetry()
+    {
+        string ruleId = Guid.NewGuid().ToString("D");
+        AsrOptions options = AsrModule.Parse(new[] { "rule", "--check", "-RuleId", ruleId });
+        TelemetryEvidence.ParsedEvent blocked = TelemetryEvidence.Parse(EventXml("Microsoft-Windows-Windows Defender", 1121,
+            "<EventData><Data Name='ID'>" + ruleId + "</Data></EventData>"));
+        Assert(TelemetryEvidence.Correlate(blocked, options, 1234).StartsWith("REQUEST_VALUE_MATCH"),
+            "ASR block event correlates on rule GUID substring");
+        TelemetryEvidence.ParsedEvent unrelatedBlocked = TelemetryEvidence.Parse(EventXml("Microsoft-Windows-Windows Defender", 1121,
+            "<EventData><Data Name='ID'>" + Guid.NewGuid().ToString("D") + "</Data></EventData>"));
+        Assert(TelemetryEvidence.Correlate(unrelatedBlocked, options, 1234) ==
+            "ASR_EVENT_TIME_ONLY: an ASR block/audit event fired in the window; value not matched to this rule/path.",
+            "Unrelated ASR block event is time-only, not a match");
+        TelemetryEvidence.ParsedEvent wmi = TelemetryEvidence.Parse(EventXml("Microsoft-Windows-WMI-Activity", 5858,
+            "<UserData><Operation xmlns='urn:wmi'><ClientProcessId>1234</ClientProcessId></Operation></UserData>"));
+        Assert(TelemetryEvidence.Correlate(wmi, options, 1234).StartsWith("PID_MATCH"), "ASR WMI client PID correlates");
+        Assert(TelemetryEvidence.Correlate(wmi, options, 4321) == null, "ASR WMI different PID excluded");
+        var firewallOptions = new TestControlOptions { Kind = ControlKind.FirewallRule };
+        Assert(TelemetryEvidence.Correlate(blocked, firewallOptions, 1234) == null, "No ASR events attributed to Firewall profile");
+        Assert(AsrTelemetry.Profile.EventLogChannels.Count == 4, "ASR profile owns its channel list");
+        Assert(AsrTelemetry.Profile.EtwProviders.Count == 2, "ASR profile owns its ETW providers");
+        Assert(AsrTelemetry.Profile.DisplayField("Process Name") && AsrTelemetry.Profile.DisplayField("Path") &&
+            AsrTelemetry.Profile.DisplayField("Target Commandline"),
+            "ASR profile displays its own 1121/1122 template fields, not just generic Defender fields");
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern SafeFileHandle CreateFileW(string lpFileName, uint dwDesiredAccess, uint dwShareMode,
+        IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+
+    // Managed File/FileInfo APIs go through the same legacy path validation that broke the
+    // production ADS write (B2); reading the stream back must bypass it the same way Production does.
+    private static bool AlternateStreamExists(string streamPath)
+    {
+        const uint GenericRead = 0x80000000;
+        const uint FileShareRead = 1;
+        const uint OpenExisting = 3;
+        SafeFileHandle handle = CreateFileW(streamPath, GenericRead, FileShareRead, IntPtr.Zero, OpenExisting, 0, IntPtr.Zero);
+        bool exists = !handle.IsInvalid;
+        handle.Dispose();
+        return exists;
+    }
+
+    private static void CheckAsrBuiltInPrimitive()
+    {
+        Assert(AsrPropertySchema.ExpectedType("AttackSurfaceReductionRules_Actions") == CimType.UInt8,
+            "ASR Actions property is UInt8Array (Add-MpPreference's own action enum is byte-sized), not UInt32");
+        Assert(AsrPropertySchema.ExpectedType("AttackSurfaceReductionRules_Ids") == CimType.String,
+            "ASR Ids property is StringArray");
+        Assert(AsrPropertySchema.ExpectedType("AttackSurfaceReductionOnlyExclusions") == CimType.String,
+            "ASR OnlyExclusions property is StringArray");
+
+        string directory = Path.Combine(Path.GetTempPath(), "WtfAsrArtifactTest-" + Guid.NewGuid().ToString("D"));
+        string filePath = Path.Combine(directory, "test.js");
+        try
+        {
+            AsrModule.CreateTestArtifact(directory, filePath);
+            Assert(File.Exists(filePath), "ASR test artifact file was created");
+            Assert(File.ReadAllText(filePath).Contains("notepad.exe"), "ASR test artifact contains the expected payload");
+            Assert(AlternateStreamExists(filePath + ":Zone.Identifier"),
+                "ASR test artifact has a real Zone.Identifier alternate data stream, not a silently-swallowed write");
+        }
+        finally { if (Directory.Exists(directory)) { Directory.Delete(directory, true); } }
+
+        // Fault injection through the REAL path: run 'verify' with the built-in primitive end to end
+        // via RunWithBackend (not a hand-rolled call to CreateTestArtifact), with the artifact file's
+        // path pre-occupied by a directory so MutateVerify's write fails partway through. This is the
+        // actual production sequence Mutate -> (throws) -> Restore -> VerifyRestored, so it fails if
+        // 'createdArtifact' regresses back to being set only after both writes succeed.
+        AsrOptions verifyBuiltIn = AsrModule.Parse(new[] { "verify", "-RuleId", AsrRuleCatalog.JavaScriptOrVbScriptRuleId });
+        var faultEvidence = new AsrRunEvidence();
+        string expectedDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "WinTraceForge", "AsrTests", faultEvidence.RunId);
+        Directory.CreateDirectory(Path.Combine(expectedDirectory, "test.js"));
+        var faultBackend = new FakeAsrBackend { Snapshot = EmptyAsrSnapshot() };
+        int faultExitCode = AsrModule.RunWithBackend(verifyBuiltIn, faultEvidence, faultBackend);
+        Assert(faultExitCode == 1 && faultEvidence.Lifecycle.Mutation == MutationStatus.ApiFailed,
+            "ASR verify surfaces a partial artifact-creation failure as a real mutation failure, not silent success");
+        Assert(faultEvidence.Lifecycle.Restoration == RestorationStatus.Succeeded,
+            "ASR verify still restores cleanly after a partial artifact-creation failure");
+        Assert(!Directory.Exists(expectedDirectory),
+            "The partially created ASR artifact directory was actually removed by the real Restore path");
+
+        var table = new[]
+        {
+            new { Action = AsrAction.Block, Observed = true, Expected = VerificationStatus.Mismatch },
+            new { Action = AsrAction.Block, Observed = false, Expected = VerificationStatus.Unavailable },
+            new { Action = AsrAction.Warn, Observed = true, Expected = VerificationStatus.Mismatch },
+            new { Action = AsrAction.Warn, Observed = false, Expected = VerificationStatus.Unavailable },
+            new { Action = AsrAction.Audit, Observed = true, Expected = VerificationStatus.Unavailable },
+            new { Action = AsrAction.Audit, Observed = false, Expected = VerificationStatus.Unavailable },
+            new { Action = AsrAction.Disabled, Observed = true, Expected = VerificationStatus.Unavailable },
+            new { Action = AsrAction.NotConfigured, Observed = true, Expected = VerificationStatus.Unavailable }
+        };
+        foreach (var row in table)
+        {
+            VerificationStatus actual = AsrModule.EvaluateTestOutcome(row.Action, row.Observed);
+            Assert(actual == row.Expected,
+                "ASR outcome decision (" + row.Action + ", observed=" + row.Observed + ") -> " + row.Expected);
+        }
+        foreach (AsrAction action in (AsrAction[])Enum.GetValues(typeof(AsrAction)))
+        {
+            Assert(AsrModule.EvaluateTestOutcome(action, true) != VerificationStatus.Confirmed &&
+                AsrModule.EvaluateTestOutcome(action, false) != VerificationStatus.Confirmed,
+                "ASR outcome decision never returns Confirmed from local process observation alone: " + action);
+        }
+
+        // A same-named process that isn't a child of the exact launcher PID must never be selected
+        // (this is what previously let an unrelated user notepad.exe get killed/miscounted), and a
+        // same-PPID/same-name process created BEFORE the launcher started must also be excluded --
+        // that combination can only occur when the launcher's PID was already reused by the OS.
+        DateTime launcherStart = new DateTime(2026, 1, 1, 12, 0, 0);
+        Assert(AsrModule.IsOwnedChildProcess(100, "notepad.exe", launcherStart.AddSeconds(1), 100, "notepad.exe", launcherStart),
+            "Owned: correct parent PID, correct image, created after the launcher started");
+        Assert(!AsrModule.IsOwnedChildProcess(999, "notepad.exe", launcherStart.AddSeconds(1), 100, "notepad.exe", launcherStart),
+            "Not owned: different parent PID (an unrelated process with the same image name)");
+        Assert(!AsrModule.IsOwnedChildProcess(100, "calc.exe", launcherStart.AddSeconds(1), 100, "notepad.exe", launcherStart),
+            "Not owned: different image name");
+        Assert(!AsrModule.IsOwnedChildProcess(100, "notepad.exe", launcherStart.AddSeconds(-1), 100, "notepad.exe", launcherStart),
+            "Not owned: created before the launcher started (PID reuse of an already-exited launcher)");
+        Assert(AsrModule.IsOwnedChildProcess(100, "NOTEPAD.EXE", launcherStart, 100, "notepad.exe", launcherStart),
+            "Owned: image name comparison is case-insensitive");
+        // Restore/VerifyRestored pass null for "any image name" (a custom -TestCommand's children
+        // have no known expected name at all, and this also catches anything unexpected the built-in
+        // primitive's launcher spawned); parent PID and creation-time ordering still must hold.
+        Assert(AsrModule.IsOwnedChildProcess(100, "anything.exe", launcherStart.AddSeconds(1), 100, null, launcherStart),
+            "Owned (any-name mode): correct parent PID and created after the launcher is sufficient");
+        Assert(!AsrModule.IsOwnedChildProcess(999, "anything.exe", launcherStart.AddSeconds(1), 100, null, launcherStart),
+            "Not owned (any-name mode): wrong parent PID is still excluded");
+
+        // Killing by PID alone races with PID reuse: only a freshly-opened handle whose own StartTime
+        // matches what WMI recorded at query time may actually be terminated.
+        DateTime recorded = new DateTime(2026, 1, 1, 12, 0, 0, 123);
+        Assert(AsrModule.IsSameProcessInstance(recorded, recorded), "Same instance: identical timestamps");
+        Assert(AsrModule.IsSameProcessInstance(recorded, recorded.AddMilliseconds(1)),
+            "Same instance: within WMI's microsecond-vs-FILETIME rounding tolerance");
+        Assert(!AsrModule.IsSameProcessInstance(recorded, recorded.AddSeconds(5)),
+            "Different instance: a PID reused by an unrelated process created seconds later is rejected");
+        Assert(!AsrModule.IsSameProcessInstance(recorded, recorded.AddSeconds(-5)),
+            "Different instance: a completely different creation time is rejected");
+    }
+
+    private static void CheckAsrArchitecture()
+    {
+        Type read = typeof(IAsrReader);
+        Type write = typeof(IAsrWriter);
+        Assert(read.GetMethod("Add") == null && write.GetMethod("Add") != null, "ASR read capability cannot Add");
+        Type operation = typeof(AsrModule).GetNestedType("AsrOperation", BindingFlags.NonPublic);
+        Assert(operation != null, "ASR operation exists");
+        foreach (FieldInfo field in operation.GetFields(BindingFlags.Instance | BindingFlags.NonPublic))
+        {
+            Assert(!typeof(IAsrBackend).IsAssignableFrom(field.FieldType) && !write.IsAssignableFrom(field.FieldType),
+                "ASR operation retains no mutable backend");
+        }
+        Assert(operation.GetMethod("Probe").GetParameters()[0].ParameterType == read &&
+            operation.GetMethod("Verify").GetParameters()[1].ParameterType == read &&
+            operation.GetMethod("Mutate").GetParameters()[1].ParameterType == write,
+            "ASR phase signatures fence writes");
     }
 
     private sealed class SyntheticBaseline

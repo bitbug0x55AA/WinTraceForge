@@ -28,12 +28,16 @@ internal static class WinTraceForge
         {
             return DefenderModule.Main(Slice(args, 2));
         }
+        if (args.Length >= 2 && Same(args[0], "defender") && Same(args[1], "asr"))
+        {
+            return AsrModule.Main(Slice(args, 2));
+        }
         if (Same(args[0], "firewall")) { return FirewallModule.Main(Slice(args, 1)); }
         if (args.Length == 2 && Same(args[0], "defender") && Same(args[1], "--help"))
         {
             return DefenderModule.Main(new[] { "--help" });
         }
-        ConsoleUi.Status("FAIL", "Unknown command. Use 'defender exclusion', 'firewall rule', or 'firewall profiles'.", true);
+        ConsoleUi.Status("FAIL", "Unknown command. Use 'defender exclusion', 'defender asr', 'firewall rule', or 'firewall profiles'.", true);
         ConsoleUi.Text("Run wtf.exe --help. No control operation was performed.");
         return 2;
     }
@@ -65,6 +69,10 @@ internal static class WinTraceForge
     {
         ConsoleUi.Section("Control modules");
         ConsoleUi.Row("defender exclusion", "Add/check Defender antivirus exclusions.");
+        ConsoleUi.Row("defender asr status", "Read ASR rule state, policy source and exclusion exposure.");
+        ConsoleUi.Row("defender asr exclusion", "Add/check ASR-only (global) exclusions.");
+        ConsoleUi.Row("defender asr rule", "Read or set a single ASR rule's action.");
+        ConsoleUi.Row("defender asr verify", "Run a controlled test primitive against one ASR rule.");
         ConsoleUi.Row("firewall rule add", "Create a marked, narrowly scoped test rule; refuse existing names.");
         ConsoleUi.Row("firewall rule check", "Read a marked rule by its test ID.");
         ConsoleUi.Row("firewall rule remove", "Remove only a unique, correctly marked test rule.");

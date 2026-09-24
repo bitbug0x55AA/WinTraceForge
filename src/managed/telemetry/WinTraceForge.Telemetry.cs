@@ -335,6 +335,43 @@ internal static class TelemetryEvidence
             "SETTING_TIME_ONLY: exclusion-related text in the time window; not attributed to this process." : null;
     }
 
+    internal static string CorrelateAsr(ParsedEvent parsed, IEnumerable<string> evidenceValues, int processId)
+    {
+        string process = CorrelateProcess(parsed, processId);
+        if (process != null) { return process; }
+        if (parsed.Provider == "Microsoft-Windows-WMI-Activity")
+        {
+            return MatchesPid(parsed, "ClientProcessId", processId) ? "PID_MATCH: WMI ClientProcessId matches this process." : null;
+        }
+        if (parsed.Provider != "Microsoft-Windows-Windows Defender" ||
+            (parsed.Id != 1121 && parsed.Id != 1122 && parsed.Id != 5007 && parsed.Id != 5013))
+        {
+            return null;
+        }
+        bool settingMatch = false;
+        foreach (var field in parsed.Fields)
+        {
+            foreach (string text in field.Value)
+            {
+                foreach (string requested in evidenceValues)
+                {
+                    if (text.IndexOf(requested, StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        return "REQUEST_VALUE_MATCH: rule ID or exclusion value substring within the collection window; not causal proof.";
+                    }
+                }
+                if (text.IndexOf("Exploit Guard", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    text.IndexOf("Attack Surface Reduction", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    settingMatch = true;
+                }
+            }
+        }
+        if (parsed.Id == 1121 || parsed.Id == 1122) { return "ASR_EVENT_TIME_ONLY: an ASR block/audit event fired in the window; value not matched to this rule/path."; }
+        return settingMatch ?
+            "SETTING_TIME_ONLY: ASR-related text in the time window; not attributed to this process." : null;
+    }
+
     private static bool MatchesPid(ParsedEvent parsed, string field, int processId)
     {
         if (processId <= 0) { return false; }

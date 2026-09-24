@@ -134,6 +134,14 @@ internal static class TelemetryPresentation
         "EdgeTraversal", "SecurityOptions", "RuleStatus", "Origin", "ProcessId",
         "NewProcessId", "NewProcessName", "ParentProcessName", "Image", "ParentImage",
         "CommandLine", "User", "SubjectUserName", "SubjectDomainName", "ProcessGuid");
+    // Event 1121/1122's own template fields (ID, Path, Process Name, Target/Parent Commandline,
+    // Involved File, Rule Type), plus the shared Defender/process fields also relevant to ASR.
+    internal static readonly Func<string, bool> AsrFields = Fields(
+        "ID", "Path", "ProcessName", "TargetCommandline", "ParentCommandline", "InvolvedFile", "RuleType",
+        "OldValue", "NewValue", "Setting", "SettingName", "Value", "ClientProcessId",
+        "ProcessId", "NewProcessId", "NewProcessName", "ParentProcessName", "Image",
+        "ParentImage", "CommandLine", "User", "SubjectUserName", "SubjectDomainName",
+        "Operation", "ResultCode", "PossibleCause", "ClientMachine", "ProcessGuid");
 }
 
 // Compatibility aliases for existing tests; new families own their profiles in their own files.
@@ -196,5 +204,44 @@ internal static class FirewallTelemetry
             (parsed.Provider == "Microsoft-Windows-Security-Auditing" && parsed.Id >= 4946 && parsed.Id <= 4948))
         { return "Firewall rule-change evidence only; not proof of packet blocking/allowing."; }
         return "Process-start evidence only; not proof of a WMI method invocation.";
+    }
+}
+
+internal static class AsrTelemetry
+{
+    internal static readonly TelemetryProfile Profile = new TelemetryProfile(
+        "Attack Surface Reduction",
+        new[] {
+            new EventLogChannel("Microsoft-Windows-Windows Defender/Operational", "Microsoft-Windows-Windows Defender",
+                "(EventID=1121 or EventID=1122 or EventID=5007 or EventID=5013)"),
+            new EventLogChannel("Microsoft-Windows-WMI-Activity/Operational", "Microsoft-Windows-WMI-Activity",
+                "(EventID=5857 or EventID=5858 or EventID=5859 or EventID=5860 or EventID=5861)"),
+            CommonTelemetryChannels.ProcessCreation, CommonTelemetryChannels.Sysmon
+        },
+        new[] {
+            new EtwProvider("Microsoft-Windows-WMI-Activity", new Guid("1418ef04-b0b4-4623-bf7e-d74ab47bbdaa")),
+            new EtwProvider("Microsoft-Windows-Windows Defender", new Guid("11cd958a-c507-4ef3-b3f2-5fd9dfbd2c78"))
+        }, RequestedValues, TelemetryEvidence.CorrelateAsr,
+        TelemetryPresentation.AsrFields, Interpret);
+
+    private static IEnumerable<string> RequestedValues(ControlOptions options) { return options.EvidenceValues; }
+    private static string Interpret(TelemetryEvidence.ParsedEvent parsed)
+    {
+        if (parsed.Provider == "Microsoft-Windows-WMI-Activity")
+        { return "WMI activity may be a query; it does not by itself prove a rule/exclusion Add was invoked."; }
+        if (parsed.Provider == "Microsoft-Windows-Windows Defender")
+        {
+            if (parsed.Id == 1121)
+            {
+                return "ASR rule blocked an operation. Block and Warn both raise this event by default; Warn additionally " +
+                    "offers the user a bypass that this event alone does not confirm was declined. Verify the rule ID and " +
+                    "target path/process (ID/Path fields).";
+            }
+            if (parsed.Id == 1122)
+            { return "ASR rule audited an operation (AuditMode only): the operation was allowed and only logged."; }
+            return parsed.Id == 5007 ? "Configuration change: verify setting and authorization." :
+                "Blocked setting change: verify the setting and attribution to this run.";
+        }
+        return "Process-start evidence only; not proof of ASR enforcement.";
     }
 }

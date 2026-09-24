@@ -9,12 +9,15 @@ Use only in an authorized test environment.
 
 Control modules:
   wtf.exe defender exclusion ...
+  wtf.exe defender asr status|exclusion|rule|verify ...
   wtf.exe firewall rule add|check|remove ...
   wtf.exe firewall profiles ...
 
-Defender exclusions and Firewall rules are independent modules. They share
-CLI conventions, console presentation, telemetry lifecycle and evidence
-parsing. Firewall requests are not passed through Defender exclusion APIs.
+Defender exclusions, Attack Surface Reduction (ASR) and Firewall rules are
+independent modules. They share CLI conventions, console presentation,
+telemetry lifecycle and evidence parsing. Firewall requests are not passed
+through Defender exclusion APIs, and ASR requests are a separate module from
+Defender exclusions even though both target MSFT_MpPreference.
 No Firewall Off, profile changes, WFP filter/callout manipulation, privilege
 escalation, or protection bypass is implemented.
 
@@ -72,6 +75,161 @@ The tool preserves existing exclusions and reads every requested value back.
 A missing WMI return code is a warning, not silent success. Known nonzero
 codes remain failures. Pre-existing values are not new changes.
 Batch changes are not transactional and no automatic cleanup occurs.
+
+Defender Attack Surface Reduction (ASR)
+---------------------------------------
+  wtf.exe defender asr status
+  wtf.exe defender asr exclusion [--check] -Path VALUE [VALUE ...]
+  wtf.exe defender asr rule --check -RuleId GUID
+  wtf.exe defender asr rule -RuleId GUID -Action Block|Audit|Warn|Disabled
+  wtf.exe defender asr verify -RuleId GUID [--check] [-TestCommand PATH -TestArguments "..."]
+
+Only --transport management is implemented (System.Management -> WMI ->
+MSFT_MpPreference); com/native are not implemented for this module and are
+rejected rather than silently falling back.
+
+`status` and every `--check` are read-only and never require elevation.
+`status` lists every rule found in AttackSurfaceReductionRules_Ids/_Actions
+plus a small best-effort set of well-known rule GUIDs shown as NotConfigured
+when absent (unrecognized GUIDs are still fully supported; only the display
+name is best-effort), each rule's policy source, the ASR-only (global)
+exclusion list (AttackSurfaceReductionOnlyExclusions), and a cross-reference
+against ordinary Defender antivirus exclusions, since those also widen the
+effective ASR exception surface. Policy source classifies each rule/exclusion
+list as Local or GroupPolicy by checking the corresponding registry key under
+HKLM\SOFTWARE\{Policies\,}Microsoft\Windows Defender\Windows Defender Exploit
+Guard\ASR; Intune/MDM-applied settings and Windows Security app defaults that
+populate neither key are reported as Unknown, not misclassified as Local.
+
+MSFT_MpPreference hides exclusion-list content (both AttackSurfaceReduction-
+OnlyExclusions and the four ordinary AV exclusion fields) from a
+non-administrator caller by returning a single sentinel string instead of
+real array data; rule configuration itself is not gated this way. The tool
+detects that sentinel and reports "could not observe", never a false empty
+or absent result. Re-run elevated for a real reading of exclusion content.
+
+`exclusion` mirrors `defender exclusion`, with one deliberate difference:
+-Path is required for --check too, not only for a real Add. Unlike
+`defender exclusion`, a bare --check here has no distinct "capabilities"
+report of its own, and `status` already gives a full read-only exclusion
+listing, so a --check with no path would only ever produce a content-free
+"passed" that checked nothing. --check reads
+AttackSurfaceReductionOnlyExclusions without writing; otherwise it calls Add
+and verifies by readback. Administrator is required for a real Add. A
+non-administrator's --check that hits Defender's exclusion-visibility
+sentinel (see above) is reported unconfirmed (exit 3), never a false
+CHECK_ONLY success over content it could not actually see. The printed
+cleanup command names only the path(s) that were NOT already present in the
+captured baseline -- a request that mixes a genuinely new path with an
+already-existing (possibly organizational) one never tells the operator to
+remove the pre-existing one -- and gives the exact
+`Remove-MpPreference -AttackSurfaceReductionOnlyExclusions ...` command,
+since this module only ever calls Add and cannot remove an entry itself.
+
+`rule` reads or sets one rule's action via AttackSurfaceReductionRules_Ids/
+_Actions Add; administrator is required for a real Add. The real
+AttackSurfaceReductionRules_Actions property is a UInt8Array, not UInt32 --
+Add-MpPreference's own action values are byte-sized (Disabled=0, Enabled=1,
+AuditMode=2, NotConfigured=5, Warn=6); the tool's WMI property-type check is
+schema-driven per property rather than assuming one numeric width for all of
+them. Mutation is RestorationPolicy.Manual (persistent Defender policy, same
+rationale as Defender exclusions): the printed cleanup command restores the
+captured pre-run action, using the real NotConfigured (5) action value when
+the rule was previously unconfigured, so restoration is always an executable
+`defender asr rule -Action ...` command, never a separate Remove-MpPreference
+step. Whether requesting NotConfigured leaves Defender with an explicit
+(guid, 5) entry or removes it entirely has not been observed either way, so
+readback treats both as an equally valid Confirmed result rather than
+requiring one specific representation -- Microsoft documents both as
+functionally unconfigured.
+
+`verify` is the module's behavioral-verification primitive and does not
+require elevation, since ASR enforcement is not conditioned on the caller's
+privilege. It ships exactly one built-in primitive, explicitly marked
+EXPERIMENTAL in its own output: a benign script marked Internet-zone (a
+Zone.Identifier alternate data stream with ZoneId=3, simulating "downloaded"
+content, written via a direct P/Invoke of CreateFileW because the managed
+File APIs reject alternate-data-stream paths under this build's legacy path
+handling) and run via wscript.exe //B, whose only effect is launching
+notepad.exe, targeting the "Block JavaScript or VBScript from launching
+downloaded executable content" rule (D3E037E1-3EB8-44C8-A917-57927947596D).
+Whether this specific primitive actually triggers that rule (Block ->
+observed event 1121) has not been confirmed in any environment; a Mismatch
+result may mean the primitive simply never engages the rule, not that
+protection failed, and the tool says so in its own Mismatch output rather
+than only in --help. Any other rule requires an authorized -TestCommand (and
+optional -TestArguments) supplied by the caller; the tool does not fabricate
+additional attack-shaped payloads.
+
+It captures the rule's action as a baseline, runs the primitive, and checks
+whether a child process appeared, identified by Windows' own ParentProcessId
+(not merely "some process with the same name started recently", which could
+belong to the user or an unrelated task) and, for the enforcement decision
+specifically, matched to the expected image name; a candidate must also have
+been created no earlier than the launcher itself. This check is read-only (a
+WMI query): `verify` never terminates a process during Verify, only during
+Restore. Local process-presence evidence can only ever support one
+unambiguous conclusion: the primitive's payload ran despite an action
+(Block, or Warn's default block-with-bypass-option behavior) that should
+have stopped it, reported Mismatch. Every other combination -- including
+absence (ambiguous: WSH disabled, AppLocker/WDAC, a script error, the
+primitive not engaging the rule at all, and an actual block are all
+indistinguishable this way), Audit (real evidence is event 1122, not process
+presence), and Disabled/NotConfigured (presence is simply expected) -- is
+reported Unavailable (exit 3); `verify` never reports Confirmed, and directs
+the operator to --telemetry etw|eventlog and the correlated 1121/1122
+evidence for actual confirmation. A custom -TestCommand has no known
+expected child-process signature at all, so its enforcement outcome is
+always Unavailable.
+
+Some Windows builds redirect notepad.exe launches to a packaged app via
+Image File Execution Options (HKLM\...\Image File Execution Options\
+notepad.exe, UseFilter=1, with per-path AppExecutionAliasRedirect=1
+subkeys); `verify` detects this and warns explicitly, because the real
+launched process may then not appear as a child of the launcher at all --
+neither a missing observation nor a reported successful cleanup can be
+trusted on such a host, and VerifyRestored reports Unavailable rather than a
+false Confirmed whenever this is detected. This still exits 1 like any other
+unconfirmed restoration, but the printed outcome is the distinct
+CLEANUP_UNVERIFIABLE rather than a generic OPERATION_ERROR, since the
+primitive itself ran fine and this is specifically about not being able to
+confirm the process tree it may have spawned was fully cleaned up. The same
+CLEANUP_UNVERIFIABLE/Unavailable result is also reported whenever the
+Win32_Process query itself fails (some hosts restrict WMI process queries);
+that query never returning an empty result as a stand-in for "could not ask"
+is exactly the "unobserved is not absent" rule this module applies
+everywhere else (the exclusion-visibility sentinel, elevation-gated reads).
+VerifyRestored also independently re-confirms the launcher process itself
+has actually exited (not just that no owned child was found), since a
+swallowed exception from a failed Kill could otherwise leave a live launcher
+process while still reporting a clean Restoration.
+
+For cleanup, `verify` re-queries for any DIRECT child process of the launcher
+(not filtered by expected name -- this also covers a custom -TestCommand's
+otherwise-untracked children -- but still only one level deep: a grandchild,
+e.g. a launcher that runs cmd.exe which itself runs the real payload, is not
+discovered) independently in both Restore and VerifyRestored, rather than
+reusing whatever Verify found, so cleanup stays correct even on a path where
+Verify never ran. Restore kills the launcher itself before enumerating and
+killing its children, not after: were the launcher killed last, it could
+still spawn a new, unaccounted-for child in the gap between listing children
+and terminating it. Before actually terminating a discovered child, it
+re-opens the process handle, forces that one native handle to be cached
+(touching .Handle) so the same handle is used for the StartTime read, the
+identity check and the eventual Kill/WaitForExit, and requires that handle's
+own StartTime to match the CreationDate WMI reported when the candidate was
+found: killing by a bare PID races with PID reuse (the target can exit and
+its PID be reused by an unrelated process between the query and
+the kill). Pinning one handle up front and reusing it throughout closes that
+window, rather than merely narrowing it -- reading StartTime through a
+short-lived, separately-opened handle (the default if .Handle is never
+touched) would not. `verify` is this codebase's first real
+(non-synthetic) use of RestorationPolicy.Automatic: artifact ownership is
+recorded before either write that could still fail, so Restore can always
+find and delete whatever was created under
+%LOCALAPPDATA%\WinTraceForge\AsrTests\<run-id>\. RestorationStatus reflects
+that artifact/process cleanup, not the Defender rule/exclusion state, which
+`exclusion`/`rule` still report as ManualRequired when mutated.
 
 Windows Firewall / Rules
 ------------------------
@@ -216,20 +374,28 @@ lookback plus the configured publication wait. At most the newest 200
 filtered events per channel are scanned; truncation and read failures are
 explicit. EventData and UserData are parsed from XML with DTDs disabled.
 
-Defender module:
+Defender exclusion module:
   Microsoft-Windows-Windows Defender/Operational: 5007 / 5013
+  Microsoft-Windows-WMI-Activity/Operational: 5857..5861
+Defender ASR module:
+  Microsoft-Windows-Windows Defender/Operational: 1121 (rule blocked --
+    Block and Warn both raise this by default) / 1122 (rule audited,
+    AuditMode only: allowed and logged, not blocked) / 5007 / 5013
   Microsoft-Windows-WMI-Activity/Operational: 5857..5861
 Firewall modules:
   Microsoft-Windows-Windows Firewall With Advanced Security/Firewall:
     2004 rule added, 2005 rule modified, 2006 rule deleted
   Security: 4946 rule added, 4947 modified, 4948 deleted
-Both also inspect Security 4688 and Sysmon Operational 1 when available.
+All three also inspect Security 4688 and Sysmon Operational 1 when available.
 Security audit events require the appropriate policy and permissions.
 
 Firewall rule correlation requires an exact requested rule name in the event.
 It is not enough for an event to mention "Firewall" or a name substring.
+ASR correlation matches on the requested rule GUID or exclusion path
+substring within an event's fields; an ASR block/audit event that does not
+mention the requested value is reported time-only, not a match.
 Process-start evidence is separate from rule-change evidence.
-Defender exclusion evidence and Firewall evidence are not interchangeable.
+Defender exclusion, ASR and Firewall evidence are not interchangeable.
 Missing events do not prove no detection; event delivery, access, auditing,
 retention and existing state all affect observations.
 
@@ -242,7 +408,8 @@ This is raw ETW collection, not Event Log scraping and not live console
 streaming. No kernel trace or WFP filters/callouts are installed.
 
 Provider selection follows the module:
-  Defender exclusions:
+  Defender exclusions and Defender ASR (each module owns its own profile
+  instance, but both use these same two provider GUIDs):
     Microsoft-Windows-WMI-Activity
       {1418ef04-b0b4-4623-bf7e-d74ab47bbdaa}
     Microsoft-Windows-Windows Defender
@@ -360,3 +527,5 @@ https://learn.microsoft.com/en-us/windows/win32/api/netfw/nn-netfw-inetfwpolicy2
 https://learn.microsoft.com/en-us/windows/win32/api/netfw/nn-netfw-inetfwrule
 https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4946
 https://learn.microsoft.com/en-us/defender-endpoint/troubleshoot-microsoft-defender-antivirus
+https://learn.microsoft.com/en-us/defender-endpoint/attack-surface-reduction-rules-reference
+https://learn.microsoft.com/en-us/defender-endpoint/attack-surface-reduction-rules-deployment-test

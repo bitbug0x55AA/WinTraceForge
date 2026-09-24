@@ -2,7 +2,7 @@
 
 > **Same change. Different paths. Interesting silence.**
 
-WinTraceForge—WTF—is a small Windows x64 defense-control test harness. It makes the same kind of narrowly scoped Microsoft Defender Antivirus or Windows Firewall change through different execution paths, captures the local telemetry, and gives you a repeatable window in which to check whether your EDR/SIEM noticed.
+WinTraceForge—WTF—is a small Windows x64 defense-control test harness. It makes the same kind of narrowly scoped Microsoft Defender Antivirus, Attack Surface Reduction, or Windows Firewall change through different execution paths, captures the local telemetry, and gives you a repeatable window in which to check whether your EDR/SIEM noticed.
 
 > [!WARNING]
 > Run WinTraceForge only in an environment where you are authorized to change security controls. Defender exclusion changes are not removed automatically. Firewall rules must be removed with the printed cleanup command and test ID.
@@ -38,6 +38,10 @@ wtf.exe <module> <command> [options]
 | Module | Command | Behavior |
 | --- | --- | --- |
 | `defender` | `exclusion` | Check or add Defender Antivirus exclusions through management, COM, or native WMI routes. |
+| `defender` | `asr status` | Read-only: ASR rule actions, policy source, and global/AV exclusion exposure. |
+| `defender` | `asr exclusion` | Check or add ASR-only (global) exclusions. |
+| `defender` | `asr rule` | Read or set a single ASR rule's action (Block/Audit/Warn/Disabled). |
+| `defender` | `asr verify` | Run a controlled behavioral test primitive against one ASR rule and observe enforcement + telemetry. |
 | `firewall` | `rule add\|check\|remove` | Manage only uniquely marked test rules through COM or native Windows Firewall interfaces. |
 | `firewall` | `profiles` | Read active profile state and exposed policy settings without changing them. |
 
@@ -84,6 +88,7 @@ Show the command tree:
 ```powershell
 .\wtf.exe --help
 .\wtf.exe defender exclusion --help
+.\wtf.exe defender asr --help
 .\wtf.exe firewall --help
 ```
 
@@ -91,6 +96,7 @@ Run read-only checks first:
 
 ```powershell
 .\wtf.exe defender exclusion --check -ExclusionPath "C:\Lab Data"
+.\wtf.exe defender asr status
 .\wtf.exe firewall profiles
 .\wtf.exe firewall rule check --id <GUID>
 ```
@@ -114,6 +120,17 @@ Add a Defender exclusion only when the test plan requires it:
 ```
 
 This operation requires elevation, preserves existing exclusions, verifies requested values by readback, and does not automatically clean up the new exclusion.
+
+Explore Attack Surface Reduction posture, then run a controlled behavioral test:
+
+```powershell
+.\wtf.exe defender asr status
+.\wtf.exe defender asr rule --check -RuleId D3E037E1-3EB8-44C8-A917-57927947596D
+.\wtf.exe defender asr rule -RuleId D3E037E1-3EB8-44C8-A917-57927947596D -Action Block
+.\wtf.exe defender asr verify -RuleId D3E037E1-3EB8-44C8-A917-57927947596D
+```
+
+`status` and every `--check` are read-only and never require elevation. `verify` runs exactly one built-in primitive (a benign script marked as downloaded, targeting that rule) and cleans its own test artifact up automatically — its own output marks it EXPERIMENTAL, since whether it actually engages this specific rule has never been confirmed in any environment. Local process observation alone can never prove enforcement, so `verify` never reports a confirmed result: it flags the one unambiguous case (the primitive ran despite Block/Warn) and otherwise reports the outcome as unconfirmed — which may just as easily mean the primitive doesn't trigger the rule at all as it could mean protection failed — pointing you at `--telemetry` for real evidence. On a host where Windows redirects the primitive's target process to a packaged app, cleanup confirmation is itself unavailable, and `verify` says so explicitly.
 
 ## Telemetry and the missing alert
 
@@ -167,12 +184,14 @@ Integration results depend on local policy, installed services, event-channel ac
 - Configuration readback is not proof of packet enforcement, prevention, compliance, SIEM ingestion, alerting, analyst triage, or response.
 - Firewall ownership markers prevent accidental cleanup of unrelated rules; they are not a security boundary or authorization mechanism.
 - Abrupt termination can leave an ETW session or a partially completed control change. Preserve the printed run ID and cleanup details.
+- ASR rule/exclusion changes are persistent Defender policy and are not removed automatically; use the printed cleanup command. `defender asr verify` is the exception: it automatically removes the test artifact it creates.
+- The ASR rule-name table is best-effort; unrecognized rule GUIDs are still fully supported, only the display name is missing.
 
 See [docs/technical-reference.md](docs/technical-reference.md) for transport mappings, event providers, evidence bounds, exit codes, and detailed cleanup behavior.
 
 ## Repository contents
 
-- `src/managed/` — C# sources grouped into `app/`, `lifecycle/`, `defender/`, `firewall/`, and `telemetry/`
+- `src/managed/` — C# sources grouped into `app/`, `lifecycle/`, `defender/`, `asr/`, `firewall/`, and `telemetry/`
 - `src/native/` — C++ sources grouped into `defender/`, `firewall/`, and `telemetry/`
 - `tests/` — regression and non-mutating integration runners
 - `.github/workflows/build.yml` — Windows CI build and regression workflow

@@ -116,7 +116,15 @@ function Invoke-ManagedBuild([string] $EntryPoint, [string] $OutputName, [string
 }
 
 function Invoke-TestBinary([string] $Name, [string[]] $Arguments = @()) {
-    & (Join-Path $OutputDirectory $Name) @Arguments
+    # Regression tests intentionally exercise negative paths and print expected "[FAIL] ..." lines to
+    # stderr. Under PowerShell-native stream redirection (e.g. `*>&1`), Windows PowerShell 5.1 wraps
+    # each such native-process stderr line as a NativeCommandError; with the script-wide
+    # $ErrorActionPreference = 'Stop' above, that would abort the build on an entirely expected line,
+    # even though the test binary goes on to exit 0. Pass/fail here must come from $LASTEXITCODE alone.
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { & (Join-Path $OutputDirectory $Name) @Arguments }
+    finally { $ErrorActionPreference = $previousErrorActionPreference }
     if ($LASTEXITCODE -ne 0) { throw "Test failed: $Name ($LASTEXITCODE)." }
 }
 
@@ -142,6 +150,7 @@ try {
     }
     if ($Integration) {
         Write-Host 'Windows integration: read-only policy checks, detached rule preparation and bounded private ETW only.'
+        Invoke-TestBinary 'Control.RegressionTests.exe' @('--asr-read-only')
         Invoke-ManagedBuild 'FirewallNativeRegressionTests' 'Firewall.Native.RegressionTests.exe' 'Firewall.Native.RegressionTests.cs'
         Invoke-TestBinary 'Firewall.Native.RegressionTests.exe'
         Invoke-TestBinary 'Firewall.Native.CppTests.exe'

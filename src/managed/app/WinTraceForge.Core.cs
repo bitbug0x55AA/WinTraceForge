@@ -12,7 +12,11 @@ internal enum ControlKind
 {
     DefenderExclusion,
     FirewallRule,
-    FirewallProfiles
+    FirewallProfiles,
+    DefenderAsrStatus,
+    DefenderAsrExclusion,
+    DefenderAsrRule,
+    DefenderAsrVerify
 }
 
 internal abstract class ControlOptions
