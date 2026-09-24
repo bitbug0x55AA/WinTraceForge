@@ -1,0 +1,26 @@
+# This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0.
+# If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+name: Windows build and non-mutating regressions
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build x64 and run fake-backend regressions
+        shell: powershell
+        run: .\Build.ps1 -Test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WinTraceForge-x64
+          path: |
+            build/wtf.exe
+            build/WinTraceForge.Native.dll

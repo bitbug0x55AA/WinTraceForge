@@ -1,0 +1,60 @@
+# This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0.
+# If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build x64 and run non-mutating regressions
+        shell: powershell
+        run: .\Build.ps1 -Test
+
+      - name: Package release
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = '${{ github.ref_name }}'
+          $packageName = "WinTraceForge-$tag-win-x64"
+          $staging = Join-Path $env:RUNNER_TEMP $packageName
+          New-Item -ItemType Directory -Path $staging -Force | Out-Null
+          Copy-Item -LiteralPath .\build\wtf.exe -Destination $staging
+          Copy-Item -LiteralPath .\build\WinTraceForge.Native.dll -Destination $staging
+          Copy-Item -LiteralPath .\README.md -Destination $staging
+          Copy-Item -LiteralPath .\LICENSE -Destination $staging
+          Copy-Item -LiteralPath .\docs\technical-reference.md -Destination $staging
+          $archive = Join-Path $PWD "$packageName.zip"
+          Compress-Archive -Path (Join-Path $staging '*') -DestinationPath $archive -Force
+          $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $packageName.zip" | Set-Content -LiteralPath "$packageName.sha256" -Encoding ascii -NoNewline
+
+      - name: Create GitHub release and upload assets
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = '${{ github.ref_name }}'
+          $packageName = "WinTraceForge-$tag-win-x64"
+          gh release view $tag --repo '${{ github.repository }}' *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag "$packageName.zip" "$packageName.sha256" `
+              --repo '${{ github.repository }}' --clobber
+          }
+          else {
+            gh release create $tag "$packageName.zip" "$packageName.sha256" `
+              --repo '${{ github.repository }}' --verify-tag `
+              --title "WinTraceForge $tag" --generate-notes
+          }
+          if ($LASTEXITCODE -ne 0) { throw "GitHub release command failed with exit code $LASTEXITCODE." }

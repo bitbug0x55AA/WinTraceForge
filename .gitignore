@@ -1,0 +1,28 @@
+# Build outputs
+/build/
+/bin/
+/obj/
+/*.exe
+/*.dll
+*.pdb
+*.obj
+*.lib
+*.exp
+*.ilk
+
+# Visual Studio and local tooling
+/.vs/
+*.user
+*.suo
+*.VC.db
+*.VC.VC.opendb
+
+# Runtime evidence and test scratch data
+*.etl
+/tests/native-dependency-test/
+/tests/firewall-native-dependency-test/
+
+# OS metadata
+Thumbs.db
+Desktop.ini
+.DS_Store
