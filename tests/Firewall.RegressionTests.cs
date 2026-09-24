@@ -4,6 +4,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Reflection;
 using System.Runtime.InteropServices;
 
 // Compile with /main:FirewallRegressionTests alongside the firewall, Core and ConsoleUi sources.
@@ -131,6 +132,8 @@ internal static class FirewallRegressionTests
                 RemovalRaces();
                 ReadOnly();
                 Assessment();
+                NullVersusEmptyCodec();
+                AddFailureAttribution();
 #if FIREWALL_TEST_STUBS
                 EtwFailure();
 #endif
@@ -556,6 +559,83 @@ internal static class FirewallRegressionTests
         evidence = new FirewallRunEvidence();
         FirewallModule.Assess(AddOptions(), evidence, 4);
         Assert(!evidence.MutationAttempted && evidence.Outcome.Contains("ETW setup failed"), "ETW assessment no mutation");
+    }
+
+    // Shared ABI contract with Firewall.Native.RegressionTests.cpp NullVersusEmpty: identical bytes.
+    // NULL BSTR and allocated empty BSTR are distinct states; no helper may collapse them.
+    private static readonly byte[] NullThenEmpty = { 0x4e, 0x57, 0x46, 0x31, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00 };
+
+    private static object Private(string method, object target, params object[] arguments)
+    {
+        const BindingFlags flags = BindingFlags.Static | BindingFlags.Instance | BindingFlags.NonPublic;
+        Type type = target == null ? typeof(NativeFirewallBackend) : target.GetType();
+        try { return type.GetMethod(method, flags).Invoke(target, arguments); }
+        catch (TargetInvocationException error) { throw error.InnerException; }
+    }
+
+    private static IDisposable NativeReader(byte[] packet)
+    {
+        Type reader = typeof(NativeFirewallBackend).GetNestedType("PacketReader", BindingFlags.NonPublic);
+        try { return (IDisposable)Activator.CreateInstance(reader, BindingFlags.Instance | BindingFlags.NonPublic, null, new object[] { packet }, null); }
+        catch (TargetInvocationException error) { throw error.InnerException; }
+    }
+
+    private static void NullVersusEmptyCodec()
+    {
+        using (MemoryStream stream = new MemoryStream())
+        using (BinaryWriter writer = new BinaryWriter(stream))
+        {
+            writer.Write(BitConverter.ToUInt32(NullThenEmpty, 0));
+            Private("WriteString", null, writer, null);
+            Private("WriteString", null, writer, "");
+            writer.Flush();
+            byte[] encoded = stream.ToArray();
+            Assert(encoded.Length == NullThenEmpty.Length, "managed NULL/empty packet length");
+            for (int i = 0; i < encoded.Length; ++i) { Assert(encoded[i] == NullThenEmpty[i], "managed NULL -1 / empty 0 encoding byte " + i); }
+        }
+        using (IDisposable reader = NativeReader(NullThenEmpty))
+        {
+            Assert(Private("String", reader) == null, "native -1 decodes to managed null");
+            Assert((string)Private("String", reader) == "", "native zero length decodes to managed empty, not null");
+            Private("End", reader);
+        }
+        foreach (bool applicationNull in new bool[] { true, false })
+        {
+            FirewallRuleData rule = FirewallModule.ExpectedRule(AddOptions(), 1);
+            rule.ApplicationName = applicationNull ? null : "";
+            rule.ServiceName = applicationNull ? "" : null;
+            rule.Description = null;
+            rule.LocalUserOwner = "";
+            using (IDisposable reader = NativeReader((byte[])Private("RulePacket", null, rule)))
+            {
+                FirewallRuleData copy = (FirewallRuleData)Private("Rule", reader);
+                Private("End", reader);
+                Assert(applicationNull ? copy.ApplicationName == null : copy.ApplicationName == "", "ApplicationName NULL/empty state survives codec");
+                Assert(applicationNull ? copy.ServiceName == "" : copy.ServiceName == null, "ServiceName NULL/empty state survives codec");
+                Assert(copy.Description == null && copy.LocalUserOwner == "", "other optional strings keep NULL/empty state");
+            }
+        }
+    }
+
+    private static void AddFailureAttribution()
+    {
+        const int invalidArgument = unchecked((int)0x80070057);
+        Assert((string)Private("OperationName", null, (uint)7) == "INetFwRules::Add", "operation 7 failure names INetFwRules::Add");
+        Assert(((string)Private("OperationName", null, (uint)5)).Contains("preparation"), "operation 5 failure names preparation");
+        COMException thrown = null;
+        try { Private("Throw", null, invalidArgument, "INetFwRules::Add"); }
+        catch (COMException error) { thrown = error; }
+        Assert(thrown != null && thrown.HResult == invalidArgument && thrown.Message.Contains("INetFwRules::Add"),
+            "native Add status becomes COMException with the exact HRESULT");
+        FakeBackend backend = new FakeBackend { AddError = thrown };
+        FirewallRunEvidence evidence;
+        Assert(Run(AddOptions(), backend, out evidence) == 1 && backend.Adds == 1 && backend.Removes == 0, "Add E_INVALIDARG is an operation error");
+        Assert(string.Join(",", backend.Calls) == "read,profiles,modify-state,prepare,read,add,dispose", "no readback after failed Add");
+        Assert(evidence.MutationAttempted && !evidence.MutationReturned && !evidence.ReadbackConfirmed, "Add failure mutation evidence");
+        Assert(evidence.Outcome.StartsWith("Firewall Add: ", StringComparison.Ordinal) &&
+            evidence.Outcome.Contains("HRESULT 0x80070057"), "Add failure keeps stage and exact HRESULT");
+        Assert(evidence.Outcome.IndexOf("preparation", StringComparison.OrdinalIgnoreCase) < 0 &&
+            evidence.Outcome.IndexOf("readback", StringComparison.OrdinalIgnoreCase) < 0, "Add failure not reported as preparation/readback");
     }
 
 #if FIREWALL_TEST_STUBS

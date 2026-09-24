@@ -11,6 +11,7 @@ All notable changes to WinTraceForge are recorded here. The project follows [Sem
 - SemVer metadata in `wtf.exe` and `WinTraceForge.Native.dll`.
 - `wtf.exe --version` and `wtf.exe -v`.
 - Automated ZIP packaging, SHA-256 generation and GitHub Release publication for version tags.
+- CI regression coverage for the native Firewall `INetFwRules::Add` boundary: unspecified program/service stay NULL BSTRs, NULL and empty strings stay distinct across the managed/native codec, and Add HRESULTs propagate unchanged.
 
 ### Changed
 

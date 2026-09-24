@@ -131,16 +131,18 @@ try {
     if ($Test -or $Integration) {
         Invoke-ManagedBuild 'RegressionTests' 'Control.RegressionTests.exe' 'AddDefenderExclusion.RegressionTests.cs'
         Invoke-ManagedBuild 'FirewallRegressionTests' 'Firewall.RegressionTests.exe' 'Firewall.RegressionTests.cs'
+        Invoke-NativeBuild ('/I"' + $nativeSourceDirectory + '" "' +
+            (Join-Path $testDirectory 'Firewall.Native.RegressionTests.cpp') +
+            '" /Fe:Firewall.Native.CppTests.exe /link ole32.lib oleaut32.lib advapi32.lib')
         Invoke-TestBinary 'Control.RegressionTests.exe'
         Invoke-TestBinary 'Firewall.RegressionTests.exe'
+        # Detached rules submitted to a probe INetFwRules; never opens or writes firewall policy.
+        Invoke-TestBinary 'Firewall.Native.CppTests.exe' @('--deterministic')
     }
     if ($Integration) {
         Write-Host 'Windows integration: read-only policy checks, detached rule preparation and bounded private ETW only.'
         Invoke-ManagedBuild 'FirewallNativeRegressionTests' 'Firewall.Native.RegressionTests.exe' 'Firewall.Native.RegressionTests.cs'
         Invoke-TestBinary 'Firewall.Native.RegressionTests.exe'
-        Invoke-NativeBuild ('/I"' + $nativeSourceDirectory + '" "' +
-            (Join-Path $testDirectory 'Firewall.Native.RegressionTests.cpp') +
-            '" /Fe:Firewall.Native.CppTests.exe /link ole32.lib oleaut32.lib advapi32.lib')
         Invoke-TestBinary 'Firewall.Native.CppTests.exe'
         Invoke-TestBinary 'Firewall.RegressionTests.exe' @('--native-read-only')
         Invoke-TestBinary 'Firewall.RegressionTests.exe' @('--native-detached-preflight')

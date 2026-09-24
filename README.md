@@ -150,7 +150,7 @@ build\wtf.exe
 build\WinTraceForge.Native.dll
 ```
 
-`-Test` builds optimized x64 binaries with warnings treated as errors and runs fake-backend regression tests. The broader integration suite performs real read-only Windows checks and a private ETW round trip, but does not invoke persistent Defender Add or Firewall Add/Remove operations:
+`-Test` builds optimized x64 binaries with warnings treated as errors and runs fake-backend regression tests, including native Firewall Add-boundary tests that submit detached rules to a probe `INetFwRules` collection without opening firewall policy. The broader integration suite performs real read-only Windows checks and a private ETW round trip, but does not invoke persistent Defender Add or Firewall Add/Remove operations:
 
 ```powershell
 .\Build.ps1 -Integration

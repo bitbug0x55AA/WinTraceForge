@@ -96,8 +96,11 @@ Optional-property construction:
   Explicit program paths and port restrictions are still set and read back.
 These rules apply equally to com and native. Detached setter/readback
 success does not guarantee that INetFwRules::Add will accept/persist a rule.
-A reported native Add E_INVALIDARG prompted this correction; the regression
+A reported native Add E_INVALIDARG prompted this correction; the -Test (CI)
 suite covers preservation of unspecified NULL defaults at the Add boundary.
+NULL BSTR, allocated empty BSTR, a default value and a never-assigned property
+are treated as distinct until the target API demonstrates otherwise. Readback
+comparison may normalize NULL and "", but rule construction must not.
 Detached tests do not establish live Add acceptance, and an E_INVALIDARG result
 must not be attributed to that difference without separate evidence.
 Failure output identifies INetFwRules::Add/Remove and reports the original
@@ -316,8 +319,10 @@ Reproducible build/test entrypoint (included source, no downloads):
 The script finds Visual Studio x64 C++ tools with vswhere, or accepts
 -VcVarsPath, and builds into .\build (override with -OutputDirectory).
 -Test runs managed parser, ownership/race/readback and telemetry regressions
-using fake backends. -Integration also runs actual read-only Windows checks,
-detached COM rule preparation, native ABI tests and a private ETW roundtrip.
+using fake backends, plus native codec and Firewall Add-boundary tests
+(Firewall.Native.CppTests.exe --deterministic) that never open firewall policy.
+-Integration also runs actual read-only Windows checks, detached COM rule
+preparation, the remaining native ABI tests and a private ETW roundtrip.
 Neither mode invokes persistent Defender Add or Firewall Add/Remove.
 Non-admin refusal checks are skipped under an elevated token. Event channel
 access/ETW permissions can affect integration observations; they are reported.
@@ -330,8 +335,14 @@ Validation limits
 The regression suite builds optimized x64 managed and native binaries with
 warnings treated as errors. Mutation workflows use fake backends for ownership,
 collision, readback and cleanup behavior. Add-boundary tests inject a fake
-INetFwRules collection around a detached rule, checking NULL defaults, ports
-and HRESULT propagation without writing to the persistent Windows collection.
+INetFwRules collection around a detached rule and snapshot the exact object
+Add receives: NULL ApplicationName/ServiceName, explicit program/service,
+NULL versus empty Description, protocol, ports, addresses, direction, action,
+profiles, enabled and edge state, and exact propagation of injected Add
+HRESULTs. A negative control confirms the probe still sees an allocated empty
+BSTR, so the NULL assertions cannot pass vacuously on a future Windows build.
+Managed and native codec tests share golden bytes for NULL (-1) versus empty
+(0) strings. None of this writes to the persistent Windows collection.
 
 Integration checks exercise actual read-only Defender and Firewall routes,
 detached TCP/UDP rule preparation, native ABI/codec behavior, and a private ETW
