@@ -8,6 +8,11 @@ internal static class WinTraceForge
 {
     private static int Main(string[] args)
     {
+        if (args.Length == 1 && (Same(args[0], "--version") || Same(args[0], "-v")))
+        {
+            Console.WriteLine("WinTraceForge " + WinTraceForgeBuildInfo.Version);
+            return 0;
+        }
         if (args.Length == 0 || IsRootHelp(args))
         {
             bool noColor = Array.Exists(args, delegate(string value)
@@ -73,6 +78,7 @@ internal static class WinTraceForge
         ConsoleUi.Row("--telemetry-wait", "0..30 seconds  (default: 3)");
         ConsoleUi.Row("--verbose", "Expand diagnostics and Detection & Response guidance.");
         ConsoleUi.Row("--no-color", "Plain text; redirected output is always color-free.");
+        ConsoleUi.Row("--version", "Print the WinTraceForge build version.");
         ConsoleUi.Section("Boundaries");
         ConsoleUi.Text("Firewall uses INetFwPolicy2 / INetFwRule COM rule management, not WFP filters or callouts.");
         ConsoleUi.Text("No Firewall Off, no profile mutation, no automatic deletion of business rules.");

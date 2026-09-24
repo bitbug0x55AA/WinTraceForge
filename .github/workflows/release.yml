@@ -10,28 +10,36 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
+  artifact-metadata: write
 
 jobs:
   release:
     runs-on: windows-latest
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Build x64 and run non-mutating regressions
         shell: powershell
-        run: .\Build.ps1 -Test
+        run: |
+          $version = $env:RELEASE_TAG.Substring(1)
+          .\Build.ps1 -Test -Version $version
 
       - name: Package release
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          $tag = '${{ github.ref_name }}'
+          $tag = $env:RELEASE_TAG
           $packageName = "WinTraceForge-$tag-win-x64"
           $staging = Join-Path $env:RUNNER_TEMP $packageName
           New-Item -ItemType Directory -Path $staging -Force | Out-Null
           Copy-Item -LiteralPath .\build\wtf.exe -Destination $staging
           Copy-Item -LiteralPath .\build\WinTraceForge.Native.dll -Destination $staging
           Copy-Item -LiteralPath .\README.md -Destination $staging
+          Copy-Item -LiteralPath .\CHANGELOG.md -Destination $staging
           Copy-Item -LiteralPath .\LICENSE -Destination $staging
           Copy-Item -LiteralPath .\docs\technical-reference.md -Destination $staging
           $archive = Join-Path $PWD "$packageName.zip"
@@ -39,13 +47,22 @@ jobs:
           $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  $packageName.zip" | Set-Content -LiteralPath "$packageName.sha256" -Encoding ascii -NoNewline
 
+      - name: Attest release build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            WinTraceForge-*-win-x64.zip
+            WinTraceForge-*-win-x64.sha256
+            build/wtf.exe
+            build/WinTraceForge.Native.dll
+
       - name: Create GitHub release and upload assets
         shell: powershell
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $tag = '${{ github.ref_name }}'
+          $tag = $env:RELEASE_TAG
           $packageName = "WinTraceForge-$tag-win-x64"
           gh release view $tag --repo '${{ github.repository }}' *> $null
           if ($LASTEXITCODE -eq 0) {

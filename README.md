@@ -59,6 +59,24 @@ Keep `wtf.exe` and `WinTraceForge.Native.dll` in the same directory. The native 
 
 Download the `WinTraceForge-<version>-win-x64.zip` asset from the corresponding GitHub Release, verify it against the accompanying `.sha256` file, and extract both binaries to the same directory. Generated binaries are not committed to the source branch.
 
+Check the embedded version metadata:
+
+```powershell
+.\wtf.exe --version
+(Get-Item .\wtf.exe).VersionInfo | Select-Object FileVersion, ProductVersion
+(Get-Item .\WinTraceForge.Native.dll).VersionInfo | Select-Object FileVersion, ProductVersion
+```
+
+Verify the downloaded ZIP checksum and GitHub build provenance:
+
+```powershell
+Get-FileHash .\WinTraceForge-v0.1.0-win-x64.zip -Algorithm SHA256
+gh attestation verify .\WinTraceForge-v0.1.0-win-x64.zip `
+  --repo bitbug0x55AA/WinTraceForge
+```
+
+The checksum must match the release `.sha256` file. The attestation binds the artifact digest to the GitHub repository, workflow and source commit that built it.
+
 ## Start asking WTF
 
 Show the command tree:
@@ -122,7 +140,7 @@ The build has no package-download step. From PowerShell:
 
 ```powershell
 .\Build.ps1
-.\Build.ps1 -Test
+.\Build.ps1 -Test -Version 0.1.0-dev
 ```
 
 Outputs are written to `build\` by default:
@@ -159,12 +177,13 @@ See [docs/technical-reference.md](docs/technical-reference.md) for transport map
 - `tests/` — regression and non-mutating integration runners
 - `.github/workflows/build.yml` — Windows CI build and regression workflow
 - `Build.ps1` — reproducible local build/test entry point
+- `CHANGELOG.md` — project change history
 
 Generated executables, DLLs, symbols, ETL files, and build directories are intentionally excluded from source control. Release binaries should be published as GitHub Release assets rather than committed to the source tree.
 
 ## Publishing a release
 
-Pushing a semantic version tag automatically builds and tests the project on a GitHub-hosted Windows runner, creates a ZIP package and SHA-256 checksum, and publishes both as GitHub Release assets:
+Pushing a semantic version tag automatically injects that version into the EXE and native DLL, builds and tests the project on a GitHub-hosted Windows runner, creates a ZIP package and SHA-256 checksum, generates signed build-provenance attestations, and publishes the release assets:
 
 ```powershell
 git tag v0.1.0
@@ -172,6 +191,8 @@ git push origin v0.1.0
 ```
 
 The release workflow is idempotent: rerunning it replaces the assets on an existing release for the same tag. No `bin/` directory or compiled binary needs to be committed.
+
+See [CHANGELOG.md](CHANGELOG.md) for the change history.
 
 ## License
 

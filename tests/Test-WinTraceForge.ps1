@@ -1,7 +1,10 @@
 # This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0.
 # If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-param([Parameter(Mandatory = $true)][string] $Executable)
+param(
+    [Parameter(Mandatory = $true)][string] $Executable,
+    [string] $ExpectedVersion = '0.1.0-dev'
+)
 
 $ErrorActionPreference = 'Stop'
 $passed = 0
@@ -41,6 +44,7 @@ function Test-Command {
 }
 
 Test-Command '--help --no-color' 0 @('WTF // WINTRACEFORGE', 'Interesting silence.', 'defender exclusion', 'firewall rule', 'firewall profiles', 'not WFP') | Out-Null
+Test-Command '--version' 0 @("WinTraceForge $ExpectedVersion") | Out-Null
 Test-Command '' 0 @('CONTROL MODULES') | Out-Null
 $defenderHelp = Test-Command 'defender exclusion --help --no-color' 0 @('ExclusionPath', 'transport')
 $firewallHelp = Test-Command 'firewall rule --help --no-color' 0 @('add', 'check', 'remove', '--id')
