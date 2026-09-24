@@ -121,7 +121,7 @@ jobs:
           $packageName = "WinTraceForge-$tag-win-x64"
           $prereleaseArgs = @()
           if ($env:PRERELEASE -eq 'true') { $prereleaseArgs = @('--prerelease') }
-          gh release view $tag --repo '${{ github.repository }}' *> $null
+          gh release view $tag --repo '${{ github.repository }}' | Out-Null
           if ($LASTEXITCODE -eq 0) {
             gh release upload $tag "$packageName.zip" "$packageName.sha256" `
               --repo '${{ github.repository }}' --clobber
