@@ -54,7 +54,7 @@ function Invoke-Case {
 }
 
 $help = Invoke-Case $Executable '--help' 0 @(
-    'WINTRACEFORGE', 'USAGE', 'OPTIONS', 'EXCLUSION TYPES', 'QUICK START',
+    'WTF // WINTRACEFORGE', 'Interesting silence.', 'USAGE', 'OPTIONS', 'EXCLUSION TYPES', 'QUICK START',
     'management|com|native', 'Detection & Response', 'No arguments: usage error'
 )
 $plainHelp = Invoke-Case $Executable '--help --no-color' 0 @('--no-color', '--verbose')

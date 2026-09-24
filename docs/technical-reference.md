@@ -1,5 +1,5 @@
-WinTraceForge technical reference
-=================================
+WinTraceForge (WTF) technical reference
+=======================================
 
 Requirements and scope
 ----------------------

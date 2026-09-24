@@ -23,8 +23,8 @@ internal static class ConsoleUi
     internal static void Banner()
     {
         Console.WriteLine();
-        Write("WINTRACEFORGE", "  ", "  ", ConsoleColor.Cyan, false);
-        Write("Configuration controls / Windows x64", "  ", "  ", ConsoleColor.Gray, false);
+        Write("WTF // WINTRACEFORGE", "  ", "  ", ConsoleColor.Cyan, false);
+        Write("Same change. Different paths. Interesting silence.", "  ", "  ", ConsoleColor.Gray, false);
     }
 
     internal static void Section(string title)

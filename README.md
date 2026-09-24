@@ -1,11 +1,33 @@
-# WinTraceForge
+# WinTraceForge (WTF)
 
-WinTraceForge is a Windows x64 security-control validation harness. It exercises narrowly scoped Microsoft Defender Antivirus exclusion and Windows Firewall management paths, captures local telemetry, and reports what was observed without claiming that a configuration readback proves enforcement or detection.
+> **Same change. Different paths. Interesting silence.**
+
+WinTraceForge—WTF—is a small Windows x64 defense-control test harness. It makes the same kind of narrowly scoped Microsoft Defender Antivirus or Windows Firewall change through different execution paths, captures the local telemetry, and gives you a repeatable window in which to check whether your EDR/SIEM noticed.
 
 > [!WARNING]
 > Run WinTraceForge only in an environment where you are authorized to change security controls. Defender exclusion changes are not removed automatically. Firewall rules must be removed with the printed cleanup command and test ID.
 
-## Scope
+## Why WTF?
+
+The acronym is intentional. During manual testing in the author's internal environment, many successful control changes produced little useful detection and often no EDR alert. Those observations are environment-specific; run the test, compare the evidence with your alerting stack, and interpret the name yourself.
+
+WTF turns that reaction into a reproducible test:
+
+```text
+choose an execution path
+        ↓
+change or inspect a Windows-native defense control
+        ↓
+collect Event Log or raw ETW evidence
+        ↓
+compare the evidence window with EDR/SIEM telemetry and alerts
+        ↓
+ask WTF happened — with a run ID, timestamps and cleanup data
+```
+
+No alert is an observation, not a bypass claim. It can mean missing telemetry, weak correlation, disabled auditing, ingestion delay, policy differences, access limitations, or a detection gap. WinTraceForge deliberately keeps those conclusions separate.
+
+## What WTF actually does
 
 The command-line format is:
 
@@ -19,7 +41,9 @@ wtf.exe <module> <command> [options]
 | `firewall` | `rule add\|check\|remove` | Manage only uniquely marked test rules through COM or native Windows Firewall interfaces. |
 | `firewall` | `profiles` | Read active profile state and exposed policy settings without changing them. |
 
-WinTraceForge does not disable Windows Firewall, change firewall profiles, install WFP filters or callouts, bypass privileges, generate test traffic, or query a SIEM/EDR backend.
+The execution paths are the point: managed WMI, COM Automation, native C++ WMI, managed Firewall COM and native Firewall COM can request equivalent control changes while producing different observable footprints.
+
+WinTraceForge does not disable Windows Firewall, change firewall profiles, install WFP filters or callouts, bypass privileges, generate test traffic, or query a SIEM/EDR backend. It collects host-side evidence; you compare that evidence with the alerting stack you are evaluating.
 
 ## Requirements
 
@@ -35,7 +59,7 @@ Keep `wtf.exe` and `WinTraceForge.Native.dll` in the same directory. The native 
 
 Download the `WinTraceForge-<version>-win-x64.zip` asset from the corresponding GitHub Release, verify it against the accompanying `.sha256` file, and extract both binaries to the same directory. Generated binaries are not committed to the source branch.
 
-## Quick start
+## Start asking WTF
 
 Show the command tree:
 
@@ -73,7 +97,7 @@ Add a Defender exclusion only when the test plan requires it:
 
 This operation requires elevation, preserves existing exclusions, verifies requested values by readback, and does not automatically clean up the new exclusion.
 
-## Telemetry
+## Telemetry and the missing alert
 
 All modules accept:
 
@@ -90,7 +114,7 @@ All modules accept:
 %LOCALAPPDATA%\WinTraceForge\Traces\<run-id>\capture.etl
 ```
 
-ETL files may contain unrelated activity from the selected providers and should be handled as sensitive evidence. Missing events do not prove that no detection occurred.
+ETL files may contain unrelated activity from the selected providers and should be handled as sensitive evidence. Missing local events do not prove that nothing happened, and a missing EDR alert does not by itself prove a detection bypass.
 
 ## Build and test
 
@@ -116,7 +140,7 @@ build\WinTraceForge.Native.dll
 
 Integration results depend on local policy, installed services, event-channel access, elevation, and ETW permissions. GitHub Actions runs the non-mutating `-Test` suite.
 
-## Safety model and limits
+## Safety, because WTF is not a rollback plan
 
 - No transport fallback is performed. A missing or incompatible native DLL is an explicit failure.
 - Firewall add refuses an existing deterministic rule name instead of overwriting it.
