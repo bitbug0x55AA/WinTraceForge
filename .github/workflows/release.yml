@@ -7,6 +7,19 @@ on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (format: vX.Y.Z)'
+        required: true
+      prerelease:
+        description: 'Mark as pre-release?'
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-${{ github.event.inputs.version || github.ref_name }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -17,19 +30,59 @@ permissions:
 jobs:
   release:
     runs-on: windows-latest
-    env:
-      RELEASE_TAG: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Resolve and validate release tag
+        id: release_tag
+        shell: powershell
+        env:
+          DISPATCH_VERSION: ${{ github.event.inputs.version }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if ($env:DISPATCH_VERSION) {
+            if ($env:GITHUB_REF_NAME -ne $env:DEFAULT_BRANCH) {
+              throw "Releases must be dispatched from '$env:DEFAULT_BRANCH' (got '$env:GITHUB_REF_NAME')"
+            }
+            if ($env:DISPATCH_VERSION -notmatch '^v\d+\.\d+\.\d+$') {
+              throw "Release version input must look like 'vX.Y.Z' (got '$env:DISPATCH_VERSION')"
+            }
+
+            $tag = $env:DISPATCH_VERSION
+            $existingTag = git tag --list $tag
+            if ($existingTag) {
+              $tagCommit = git rev-list -n 1 $tag
+              if ($tagCommit -ne $env:GITHUB_SHA) {
+                throw "Existing tag $tag points to $tagCommit, not workflow commit $env:GITHUB_SHA"
+              }
+            }
+            else {
+              git tag $tag $env:GITHUB_SHA
+              git push origin $tag
+            }
+          }
+          else {
+            $tag = $env:GITHUB_REF_NAME
+          }
+
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: Build x64 and run non-mutating regressions
         shell: powershell
+        env:
+          RELEASE_TAG: ${{ steps.release_tag.outputs.tag }}
         run: |
           $version = $env:RELEASE_TAG.Substring(1)
           .\Build.ps1 -Test -Version $version
 
       - name: Package release
         shell: powershell
+        env:
+          RELEASE_TAG: ${{ steps.release_tag.outputs.tag }}
         run: |
           $ErrorActionPreference = 'Stop'
           $tag = $env:RELEASE_TAG
@@ -60,10 +113,14 @@ jobs:
         shell: powershell
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release_tag.outputs.tag }}
+          PRERELEASE: ${{ github.event.inputs.prerelease }}
         run: |
           $ErrorActionPreference = 'Stop'
           $tag = $env:RELEASE_TAG
           $packageName = "WinTraceForge-$tag-win-x64"
+          $prereleaseArgs = @()
+          if ($env:PRERELEASE -eq 'true') { $prereleaseArgs = @('--prerelease') }
           gh release view $tag --repo '${{ github.repository }}' *> $null
           if ($LASTEXITCODE -eq 0) {
             gh release upload $tag "$packageName.zip" "$packageName.sha256" `
@@ -72,6 +129,6 @@ jobs:
           else {
             gh release create $tag "$packageName.zip" "$packageName.sha256" `
               --repo '${{ github.repository }}' --verify-tag `
-              --title "WinTraceForge $tag" --generate-notes
+              --title "WinTraceForge $tag" --generate-notes @prereleaseArgs
           }
           if ($LASTEXITCODE -ne 0) { throw "GitHub release command failed with exit code $LASTEXITCODE." }
