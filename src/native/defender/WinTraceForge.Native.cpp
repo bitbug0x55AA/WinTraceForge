@@ -52,7 +52,18 @@ namespace
         return name && (wcscmp(name, L"ExclusionPath") == 0 ||
             wcscmp(name, L"ExclusionExtension") == 0 ||
             wcscmp(name, L"ExclusionProcess") == 0 ||
-            wcscmp(name, L"ExclusionIpAddress") == 0);
+            wcscmp(name, L"ExclusionIpAddress") == 0 ||
+            wcscmp(name, L"AttackSurfaceReductionOnlyExclusions") == 0 ||
+            wcscmp(name, L"AttackSurfaceReductionRules_Ids") == 0 ||
+            wcscmp(name, L"AttackSurfaceReductionRules_Actions") == 0);
+    }
+
+    // Every allowed property is a CIM array; only AttackSurfaceReductionRules_Actions is a UInt8
+    // array (Add-MpPreference's own action enum is byte-sized) -- every other one is a string array.
+    CIMTYPE ExpectedArrayType(const wchar_t* name)
+    {
+        return wcscmp(name, L"AttackSurfaceReductionRules_Actions") == 0 ?
+            (CIM_UINT8 | CIM_FLAG_ARRAY) : (CIM_STRING | CIM_FLAG_ARRAY);
     }
 
     HRESULT SetSecurity(IUnknown* proxy)
@@ -137,16 +148,21 @@ extern "C" __declspec(dllexport) HRESULT __cdecl NativeSupports(
     hr = session->definition->Get(name, 0, nullptr, &outputType, nullptr);
     if (hr == WBEM_E_NOT_FOUND) { return S_OK; }
     if (FAILED(hr)) { return hr; }
-    *supported = inputType == (CIM_STRING | CIM_FLAG_ARRAY) &&
-        outputType == (CIM_STRING | CIM_FLAG_ARRAY);
+    CIMTYPE expected = ExpectedArrayType(name);
+    *supported = inputType == expected && outputType == expected;
     return S_OK;
 }
 
 extern "C" __declspec(dllexport) HRESULT __cdecl NativeSetValues(
     void* handle, const wchar_t* name, const wchar_t* const* values, int count) noexcept
 {
+    // Name/type validity is independent of session state, so it is checked first: a caller
+    // mistakenly routing the byte-sized Actions property through the string setter (or vice versa)
+    // must fail fast here rather than let WMI's own VARIANT coercion silently decide.
+    if (!Allowed(name) || !values || count <= 0) { return E_INVALIDARG; }
+    if (ExpectedArrayType(name) != (CIM_STRING | CIM_FLAG_ARRAY)) { return WBEM_E_TYPE_MISMATCH; }
     Session* session = static_cast<Session*>(handle);
-    if (!session || !session->input || !Allowed(name) || !values || count <= 0) { return E_INVALIDARG; }
+    if (!session || !session->input) { return E_INVALIDARG; }
     Variant input;
     input.value.vt = VT_ARRAY | VT_BSTR;
     input.value.parray = SafeArrayCreateVector(VT_BSTR, 0, static_cast<ULONG>(count));
@@ -157,6 +173,25 @@ extern "C" __declspec(dllexport) HRESULT __cdecl NativeSetValues(
         BStr value(values[i]);
         if (!value.value) { return E_OUTOFMEMORY; }
         HRESULT hr = SafeArrayPutElement(input.value.parray, &i, value.value);
+        if (FAILED(hr)) { return hr; }
+    }
+    return session->input->Put(name, 0, &input.value, 0);
+}
+
+extern "C" __declspec(dllexport) HRESULT __cdecl NativeSetByteValues(
+    void* handle, const wchar_t* name, const unsigned char* values, int count) noexcept
+{
+    if (!Allowed(name) || !values || count <= 0) { return E_INVALIDARG; }
+    if (ExpectedArrayType(name) != (CIM_UINT8 | CIM_FLAG_ARRAY)) { return WBEM_E_TYPE_MISMATCH; }
+    Session* session = static_cast<Session*>(handle);
+    if (!session || !session->input) { return E_INVALIDARG; }
+    Variant input;
+    input.value.vt = VT_ARRAY | VT_UI1;
+    input.value.parray = SafeArrayCreateVector(VT_UI1, 0, static_cast<ULONG>(count));
+    if (!input.value.parray) { return E_OUTOFMEMORY; }
+    for (LONG i = 0; i < count; i++)
+    {
+        HRESULT hr = SafeArrayPutElement(input.value.parray, &i, const_cast<unsigned char*>(&values[i]));
         if (FAILED(hr)) { return hr; }
     }
     return session->input->Put(name, 0, &input.value, 0);
@@ -210,6 +245,58 @@ extern "C" __declspec(dllexport) HRESULT __cdecl NativeRead(
         if (returned != 1 || !record) { return WBEM_E_NOT_FOUND; }
         hr = record->Get(name, 0, values, nullptr, nullptr);
         if (FAILED(hr)) { return hr; }
+        // Drain the singleton query to avoid cancellation telemetry from an abandoned enumerator.
+        record.Reset();
+        returned = 0;
+        hr = results->Next(30000, 1, record.GetAddressOf(), &returned);
+        if (hr == WBEM_S_TIMEDOUT) { return HRESULT_FROM_WIN32(ERROR_TIMEOUT); }
+        if (FAILED(hr)) { return hr; }
+        return returned == 0 ? S_OK : WBEM_E_PROVIDER_FAILURE;
+    }
+    catch (const std::bad_alloc&)
+    {
+        return E_OUTOFMEMORY;
+    }
+}
+
+// Reads two named properties from the same single MSFT_MpPreference instance in one ExecQuery,
+// so a caller pairing two arrays positionally (e.g. AttackSurfaceReductionRules_Ids/_Actions)
+// gets both from one atomic snapshot instead of two independent NativeRead calls that could
+// observe a policy change (GP/MDM push) landing in between them.
+extern "C" __declspec(dllexport) HRESULT __cdecl NativeReadPair(
+    void* handle, const wchar_t* firstName, const wchar_t* secondName, VARIANT* firstValues, VARIANT* secondValues) noexcept
+{
+    if (!firstValues || !secondValues) { return E_POINTER; }
+    VariantInit(firstValues);
+    VariantInit(secondValues);
+    Session* session = static_cast<Session*>(handle);
+    if (!session || !session->services || !Allowed(firstName) || !Allowed(secondName)) { return E_INVALIDARG; }
+    try
+    {
+        std::wstring query = L"SELECT ";
+        query += firstName;
+        query += L", ";
+        query += secondName;
+        query += L" FROM MSFT_MpPreference";
+        BStr wql(L"WQL");
+        BStr text(query.c_str());
+        if (!wql.value || !text.value) { return E_OUTOFMEMORY; }
+        ComPtr<IEnumWbemClassObject> results;
+        HRESULT hr = session->services->ExecQuery(wql.value, text.value,
+            WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, nullptr, results.GetAddressOf());
+        if (FAILED(hr)) { return hr; }
+        hr = SetSecurity(results.Get());
+        if (FAILED(hr)) { return hr; }
+        ComPtr<IWbemClassObject> record;
+        ULONG returned = 0;
+        hr = results->Next(30000, 1, record.GetAddressOf(), &returned);
+        if (hr == WBEM_S_TIMEDOUT) { return HRESULT_FROM_WIN32(ERROR_TIMEOUT); }
+        if (FAILED(hr)) { return hr; }
+        if (returned != 1 || !record) { return WBEM_E_NOT_FOUND; }
+        hr = record->Get(firstName, 0, firstValues, nullptr, nullptr);
+        if (FAILED(hr)) { return hr; }
+        hr = record->Get(secondName, 0, secondValues, nullptr, nullptr);
+        if (FAILED(hr)) { VariantClear(firstValues); return hr; }
         // Drain the singleton query to avoid cancellation telemetry from an abandoned enumerator.
         record.Reset();
         returned = 0;

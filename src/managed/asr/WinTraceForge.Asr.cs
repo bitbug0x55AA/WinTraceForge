@@ -268,6 +268,15 @@ internal static partial class AsrModule
         catch (SecurityException ex) { return ReportError("Security error: " + ex.Message); }
         catch (InvalidOperationException ex) { return ReportError(ex.Message); }
         catch (Win32Exception ex) { return ReportError("Test primitive launch failed: " + ex.Message); }
+        catch (MissingMemberException ex) { return ReportError("WMI COM Automation interface mismatch: " + ex.Message); }
+        catch (NotSupportedException ex) { return ReportError("The selected transport is unavailable: " + ex.Message); }
+        catch (DllNotFoundException ex)
+        {
+            return ReportError("Native backend DLL is missing or could not be loaded. Keep the matching DLL beside the EXE. " + ex.Message);
+        }
+        catch (BadImageFormatException ex)
+        { return ReportError("Native backend architecture mismatch. Use the matching x64 EXE and DLL. " + ex.Message); }
+        catch (EntryPointNotFoundException ex) { return ReportError("Native backend DLL version mismatch: " + ex.Message); }
     }
 
     private static int Run(AsrOptions options, AsrRunEvidence evidence)
@@ -284,6 +293,17 @@ internal static partial class AsrModule
             ConsoleUi.Row("Host / PID", Environment.MachineName + " / " + process.Id);
         }
         ConsoleUi.Row("Transport", options.Transport);
+        // Only 'exclusion'/'rule' without --check ever reach MSFT_MpPreference.Add; every other
+        // sub-command (status, every --check, verify) only ever calls ExecQuery/Get -- the Route
+        // line must not claim a write path it did not take.
+        bool willInvokeAdd = !options.CheckOnly &&
+            (options.Kind == ControlKind.DefenderAsrExclusion || options.Kind == ControlKind.DefenderAsrRule);
+        string endpoint = willInvokeAdd ? "MSFT_MpPreference.Add" : "MSFT_MpPreference (read-only ExecQuery/Get)";
+        ConsoleUi.Detail("Route: " + (options.Transport == "native" ?
+            "P/Invoke -> native C++ IWbemLocator/IWbemServices -> WMI -> " + endpoint :
+            options.Transport == "com" ?
+            ".NET COM interop -> SWbemLocator/SWbemServices -> WMI -> " + endpoint :
+            "System.Management -> WMI -> " + endpoint));
 
         bool isAdministrator;
         using (WindowsIdentity identity = WindowsIdentity.GetCurrent())
@@ -312,6 +332,8 @@ internal static partial class AsrModule
         switch (transport)
         {
             case "management": return new ManagementAsrBackend();
+            case "com": return new ComAsrBackend();
+            case "native": return new NativeAsrBackend();
             default: throw new InvalidOperationException("Unknown ASR transport; no fallback.");
         }
     }
@@ -395,10 +417,10 @@ internal static partial class AsrModule
 
             if (key == "--transport")
             {
-                if (i + 1 >= args.Length) { throw new ArgumentException("--transport requires management."); }
+                if (i + 1 >= args.Length) { throw new ArgumentException("Specify --transport once, followed by management, com, or native."); }
                 options.Transport = args[++i].ToLowerInvariant();
-                if (options.Transport != "management")
-                { throw new ArgumentException("ASR transports: management. No fallback; com/native are not implemented."); }
+                if (options.Transport != "management" && options.Transport != "com" && options.Transport != "native")
+                { throw new ArgumentException("Unknown transport. Supported values: management, com, native."); }
                 continue;
             }
             if (key == "--check")
@@ -512,7 +534,7 @@ internal static partial class AsrModule
         ConsoleUi.Row("rule", "Read or set one rule's action (AttackSurfaceReductionRules_Ids/_Actions).");
         ConsoleUi.Row("verify", "Run a controlled test primitive; observe local enforcement + telemetry.");
         ConsoleUi.Section("Options");
-        ConsoleUi.Row("--transport", "management (default; only transport implemented)");
+        ConsoleUi.Row("--transport", "management|com|native  (default: management)");
         ConsoleUi.Row("--check", "Read-only for exclusion/rule/verify; never mutates Defender settings.");
         ConsoleUi.Row("-Path", "One or more file/folder paths for the 'exclusion' sub-command.");
         ConsoleUi.Row("-RuleId", "ASR rule GUID, for 'rule' and 'verify'.");
@@ -521,6 +543,12 @@ internal static partial class AsrModule
             "script, point this at its interpreter (e.g. wscript.exe) and pass the script path via -TestArguments.");
         ConsoleUi.Row("-TestArguments", "Arguments passed to -TestCommand.");
         ConsoleUi.HelpOptions();
+        ConsoleUi.Section("Routes");
+        ConsoleUi.Row("management", "System.Management -> WMI");
+        ConsoleUi.Row("com", "SWbemServices COM Automation -> WMI");
+        ConsoleUi.Row("native", "C++ IWbemServices::ExecQuery/ExecMethod -> WMI");
+        ConsoleUi.Text("All routes target MSFT_MpPreference; ExecMethod only for a mutating Add, ExecQuery/Get " +
+            "for every read (status, every --check, verify). No fallback or privilege bypass.");
         ConsoleUi.Section("Quick start");
         ConsoleUi.Text("Read-only posture:");
         ConsoleUi.Text("  .\\wtf.exe defender asr status");
@@ -543,8 +571,10 @@ internal static partial class AsrModule
             "Unavailable; use --telemetry etw or eventlog and inspect the correlated 1121/1122 evidence directly.");
         ConsoleUi.HelpExitCodes();
         ConsoleUi.Status("WARN", "ASR rule/exclusion changes reduce protection. Authorized testing only.");
+        ConsoleUi.Text("Native transport requires WinTraceForge.Native.dll beside the EXE.");
         if (!ConsoleUi.Verbose) { return; }
         ConsoleUi.Section("Extended notes");
+        ConsoleUi.Text("All transports target the same MSFT_MpPreference class and share identical read/write semantics; none elevates privileges.");
         ConsoleUi.Text("The rule name table is best-effort and may not match your Defender build; unrecognized GUIDs still work.");
         ConsoleUi.Text("Policy source classifies Local vs GroupPolicy registry keys only; Intune/MDM and Security Center " +
             "defaults that do not populate either key are reported as Unknown, not misclassified as Local.");
@@ -607,11 +637,123 @@ internal static partial class AsrModule
         ConsoleUi.Text("Reference: https://learn.microsoft.com/en-us/defender-endpoint/attack-surface-reduction-rules-reference");
     }
 
+    // Shared by every transport: all three back the same MSFT_MpPreference class, so the AV
+    // exclusion field list, the elevation-hiding sentinel, the array decoders and the snapshot
+    // assembly logic are identical -- only how each transport fetches one named field differs.
+    // internal (not private): exercised directly by deterministic regression tests, since the
+    // snapshot this builds is the sole evidence behind every rule/exclusion Confirmed verdict and
+    // every printed manual-restoration command.
+    internal static readonly string[] AvExclusionTypes =
+        { "ExclusionPath", "ExclusionExtension", "ExclusionProcess", "ExclusionIpAddress" };
+
+    // MSFT_MpPreference returns this single-element sentinel array instead of real exclusion
+    // content when the caller is not an administrator; it must never be read as literal data.
+    internal static bool IsElevationPlaceholder(string[] values)
+    {
+        return values.Length == 1 && values[0] != null &&
+            values[0].StartsWith("N/A:", StringComparison.OrdinalIgnoreCase);
+    }
+
+    internal static string[] DecodeStringArray(object raw)
+    {
+        if (raw == null || raw == DBNull.Value) { return new string[0]; }
+        Array values = raw as Array;
+        if (values == null) { throw new InvalidOperationException("Unexpected readback type for a string array."); }
+        var result = new List<string>();
+        foreach (object value in values)
+        {
+            if (value != null && !(value is string))
+            { throw new InvalidOperationException("Unexpected array element for a string array."); }
+            result.Add((string)value);
+        }
+        return result.ToArray();
+    }
+
+    internal static uint[] DecodeUInt32Array(object raw)
+    {
+        if (raw == null || raw == DBNull.Value) { return new uint[0]; }
+        Array values = raw as Array;
+        if (values == null) { throw new InvalidOperationException("Unexpected readback type for an action array."); }
+        var result = new uint[values.Length];
+        for (int i = 0; i < values.Length; i++)
+        { result[i] = Convert.ToUInt32(values.GetValue(i), CultureInfo.InvariantCulture); }
+        return result;
+    }
+
+    // A rule's Ids and Actions arrays are positionally paired by the provider; a length mismatch
+    // (e.g. a native transport's two independent queries racing a concurrent GP/MDM policy push)
+    // means the pairing cannot be trusted, so this fails loudly rather than defaulting whatever
+    // Action is missing to Disabled -- silently fabricating a rule state no one actually observed.
+    internal static Dictionary<string, AsrAction> BuildRuleActions(object rawIds, object rawActions)
+    {
+        string[] ids = DecodeStringArray(rawIds);
+        uint[] actions = DecodeUInt32Array(rawActions);
+        if (ids.Length != actions.Length)
+        {
+            throw new InvalidOperationException("AttackSurfaceReductionRules_Ids/_Actions length mismatch (" +
+                ids.Length + " vs " + actions.Length + "); rule action readback cannot be trusted.");
+        }
+        var rules = new Dictionary<string, AsrAction>(StringComparer.OrdinalIgnoreCase);
+        for (int i = 0; i < ids.Length; i++) { rules[ids[i]] = (AsrAction)actions[i]; }
+        return rules;
+    }
+
+    // MSFT_MpPreference is a singleton class; every transport must see exactly one instance for a
+    // readback to mean anything. Zero or multiple instances is an unobserved/ambiguous provider
+    // state, not "nothing configured" -- so it must fail, never be read as an empty snapshot.
+    internal static void RequireSingleInstance(int count)
+    {
+        if (count != 1)
+        {
+            throw new InvalidOperationException("MSFT_MpPreference returned " + count +
+                " instance(s); expected exactly one. ASR posture cannot be trusted.");
+        }
+    }
+
+    // Shared snapshot assembly: callers must first establish that exactly one
+    // MSFT_MpPreference instance supplied the fields. Management/COM use ReadSnapshot for
+    // that guard; native reads enforce singleton results in the native DLL.
+    internal static AsrSnapshot BuildSnapshot(Func<string, object> field)
+    {
+        Dictionary<string, AsrAction> rules = BuildRuleActions(
+            field("AttackSurfaceReductionRules_Ids"), field("AttackSurfaceReductionRules_Actions"));
+
+        bool globalElevationRequired = false;
+        var globalExclusions = new List<string>();
+        string[] global = DecodeStringArray(field("AttackSurfaceReductionOnlyExclusions"));
+        if (IsElevationPlaceholder(global)) { globalElevationRequired = true; }
+        else { globalExclusions.AddRange(global); }
+
+        bool avElevationRequired = false;
+        var avExclusions = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        foreach (string type in AvExclusionTypes)
+        {
+            string[] values = DecodeStringArray(field(type));
+            if (IsElevationPlaceholder(values)) { avElevationRequired = true; avExclusions.Add(type, new List<string>()); }
+            else { avExclusions.Add(type, new List<string>(values)); }
+        }
+        return new AsrSnapshot(rules, globalExclusions, avExclusions, globalElevationRequired, avElevationRequired);
+    }
+
+    // Convention for the query-then-enumerate transports (management, COM): their Read()
+    // implementations pass raw per-instance field lookups here, so the singleton check
+    // precedes snapshot assembly. BuildSnapshot is internal and can be called separately;
+    // tests cover this entry point as well as the two constituent helpers.
+    internal static AsrSnapshot ReadSnapshot(IEnumerable<Func<string, object>> records)
+    {
+        Func<string, object> only = null;
+        int count = 0;
+        foreach (Func<string, object> record in records)
+        {
+            count++;
+            if (only == null) { only = record; }
+        }
+        RequireSingleInstance(count);
+        return BuildSnapshot(only);
+    }
+
     private sealed class ManagementAsrBackend : IAsrBackend
     {
-        private static readonly string[] AvExclusionTypes =
-            { "ExclusionPath", "ExclusionExtension", "ExclusionProcess", "ExclusionIpAddress" };
-
         private readonly ManagementScope scope = new ManagementScope(@"\\.\root\Microsoft\Windows\Defender");
         private ManagementClass preferenceClass;
         private ManagementBaseObject input;
@@ -674,13 +816,6 @@ internal static partial class AsrModule
 
         public AsrSnapshot Read()
         {
-            var rules = new Dictionary<string, AsrAction>(StringComparer.OrdinalIgnoreCase);
-            var globalExclusions = new List<string>();
-            var avExclusions = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
-            foreach (string type in AvExclusionTypes) { avExclusions.Add(type, new List<string>()); }
-            bool globalElevationRequired = false;
-            bool avElevationRequired = false;
-
             var fields = new List<string>
             {
                 "AttackSurfaceReductionRules_Ids", "AttackSurfaceReductionRules_Actions",
@@ -692,38 +827,20 @@ internal static partial class AsrModule
                 new ObjectQuery("SELECT " + string.Join(", ", fields) + " FROM MSFT_MpPreference")))
             using (ManagementObjectCollection results = searcher.Get())
             {
-                foreach (ManagementObject preference in results)
+                var instances = new List<ManagementObject>();
+                try
                 {
-                    using (preference)
+                    var records = new List<Func<string, object>>();
+                    foreach (ManagementObject candidate in results)
                     {
-                        string[] ids = DecodeStringArray(preference["AttackSurfaceReductionRules_Ids"]);
-                        uint[] actions = DecodeUInt32Array(preference["AttackSurfaceReductionRules_Actions"]);
-                        for (int i = 0; i < ids.Length; i++)
-                        {
-                            AsrAction action = i < actions.Length ? (AsrAction)actions[i] : AsrAction.Disabled;
-                            rules[ids[i]] = action;
-                        }
-                        string[] global = DecodeStringArray(preference["AttackSurfaceReductionOnlyExclusions"]);
-                        if (IsElevationPlaceholder(global)) { globalElevationRequired = true; }
-                        else { globalExclusions.AddRange(global); }
-                        foreach (string type in AvExclusionTypes)
-                        {
-                            string[] values = DecodeStringArray(preference[type]);
-                            if (IsElevationPlaceholder(values)) { avElevationRequired = true; }
-                            else { avExclusions[type].AddRange(values); }
-                        }
+                        instances.Add(candidate);
+                        ManagementObject captured = candidate;
+                        records.Add(name => captured[name]);
                     }
+                    return ReadSnapshot(records);
                 }
+                finally { foreach (ManagementObject instance in instances) { instance.Dispose(); } }
             }
-            return new AsrSnapshot(rules, globalExclusions, avExclusions, globalElevationRequired, avElevationRequired);
-        }
-
-        // MSFT_MpPreference returns this single-element sentinel array instead of real exclusion
-        // content when the caller is not an administrator; it must never be read as literal data.
-        private static bool IsElevationPlaceholder(string[] values)
-        {
-            return values.Length == 1 && values[0] != null &&
-                values[0].StartsWith("N/A:", StringComparison.OrdinalIgnoreCase);
         }
 
         public Dictionary<string, AsrPolicySourceKind> ReadPolicySource(IEnumerable<string> keys)
@@ -736,24 +853,267 @@ internal static partial class AsrModule
             if (input != null) { input.Dispose(); }
             if (preferenceClass != null) { preferenceClass.Dispose(); }
         }
+    }
 
-        private static string[] DecodeStringArray(object raw)
+    // Disciplined IDispatch access to the official WbemScripting.SWbemLocator/SWbemServices COM
+    // Automation objects, reusing DefenderModule's ComObjects RCW bookkeeping since both backends
+    // talk to the same root\Microsoft\Windows\Defender namespace and MSFT_MpPreference class.
+    private sealed class ComAsrBackend : IAsrBackend
+    {
+        private readonly DefenderModule.ComObjects objects = new DefenderModule.ComObjects();
+        private object services;
+        private object input;
+        private Dictionary<string, object> inputProperties;
+        private Dictionary<string, object> classProperties;
+
+        public void Connect()
         {
-            if (raw == null || raw == DBNull.Value) { return new string[0]; }
-            string[] values = raw as string[];
-            if (values == null) { throw new InvalidOperationException("Unexpected WMI readback type for a string array."); }
-            return values;
+            Type locatorType = Type.GetTypeFromProgID("WbemScripting.SWbemLocator");
+            if (locatorType == null)
+            {
+                throw new NotSupportedException("WbemScripting.SWbemLocator is not registered.");
+            }
+            object locator = objects.Own(Activator.CreateInstance(locatorType));
+            services = objects.Call(locator, "ConnectServer", ".", @"root\Microsoft\Windows\Defender",
+                "", "", "", "", 128, new DispatchWrapper(null));
+            object security = objects.Get(services, "Security_");
+            objects.Set(security, "ImpersonationLevel", 3);
         }
 
-        private static uint[] DecodeUInt32Array(object raw)
+        public void Prepare(AsrMutationRequest request)
         {
-            if (raw == null || raw == DBNull.Value) { return new uint[0]; }
-            Array values = raw as Array;
-            if (values == null) { throw new InvalidOperationException("Unexpected WMI readback type for an action array."); }
-            var result = new uint[values.Length];
-            for (int i = 0; i < values.Length; i++)
-            { result[i] = Convert.ToUInt32(values.GetValue(i), CultureInfo.InvariantCulture); }
-            return result;
+            object preferenceClass = objects.Call(services, "Get", "MSFT_MpPreference", 0, new DispatchWrapper(null));
+            object methods = objects.Get(preferenceClass, "Methods_");
+            object add = objects.Call(methods, "Item", "Add", 0);
+            object definition = objects.Get(add, "InParameters");
+            if (definition == null)
+            {
+                throw new InvalidOperationException("Defender COM Add parameter metadata is unavailable.");
+            }
+            input = objects.Call(definition, "SpawnInstance_", 0);
+            inputProperties = objects.Properties(input);
+            classProperties = objects.Properties(preferenceClass);
+            if (request.Kind == AsrRequestKind.GlobalExclusion)
+            {
+                if (!Supports("AttackSurfaceReductionOnlyExclusions"))
+                { throw new InvalidOperationException("Unsupported property: AttackSurfaceReductionOnlyExclusions"); }
+                objects.Set(inputProperties["AttackSurfaceReductionOnlyExclusions"], "Value", request.ExclusionPaths.ToArray());
+            }
+            else
+            {
+                if (!Supports("AttackSurfaceReductionRules_Ids") || !Supports("AttackSurfaceReductionRules_Actions"))
+                { throw new InvalidOperationException("Unsupported property: AttackSurfaceReductionRules_Ids/Actions"); }
+                objects.Set(inputProperties["AttackSurfaceReductionRules_Ids"], "Value", new[] { request.RuleId });
+                objects.Set(inputProperties["AttackSurfaceReductionRules_Actions"], "Value", new[] { (byte)request.Action });
+            }
         }
+
+        public bool Supports(string name)
+        {
+            CimType expected = AsrPropertySchema.ExpectedType(name);
+            return IsArrayOfType(inputProperties, name, expected) && IsArrayOfType(classProperties, name, expected);
+        }
+
+        private bool IsArrayOfType(Dictionary<string, object> properties, string name, CimType expected)
+        {
+            object property;
+            return properties.TryGetValue(name, out property) &&
+                Convert.ToInt32(objects.Get(property, "CIMType"), CultureInfo.InvariantCulture) == (int)expected &&
+                Convert.ToBoolean(objects.Get(property, "IsArray"), CultureInfo.InvariantCulture);
+        }
+
+        public object Add()
+        {
+            object result = objects.Call(services, "ExecMethod", "MSFT_MpPreference", "Add", input, 0, new DispatchWrapper(null));
+            if (result == null) { return null; }
+            object property;
+            return objects.Properties(result).TryGetValue("ReturnValue", out property) ?
+                objects.Get(property, "Value") : null;
+        }
+
+        public AsrSnapshot Read()
+        {
+            var fields = new List<string>
+            {
+                "AttackSurfaceReductionRules_Ids", "AttackSurfaceReductionRules_Actions",
+                "AttackSurfaceReductionOnlyExclusions"
+            };
+            fields.AddRange(AvExclusionTypes);
+
+            object results = objects.Call(services, "ExecQuery",
+                "SELECT " + string.Join(", ", fields) + " FROM MSFT_MpPreference", "WQL", 0, new DispatchWrapper(null));
+            int count = Convert.ToInt32(objects.Get(results, "Count"), CultureInfo.InvariantCulture);
+            var records = new List<Func<string, object>>();
+            for (int i = 0; i < count; i++)
+            {
+                object record = objects.Call(results, "ItemIndex", i);
+                Dictionary<string, object> properties = objects.Properties(record);
+                records.Add(name => FieldValue(properties, name));
+            }
+            return ReadSnapshot(records);
+        }
+
+        private object FieldValue(Dictionary<string, object> properties, string name)
+        {
+            object property;
+            if (!properties.TryGetValue(name, out property))
+            { throw new InvalidOperationException("Missing COM readback field: " + name); }
+            return objects.Get(property, "Value");
+        }
+
+        public Dictionary<string, AsrPolicySourceKind> ReadPolicySource(IEnumerable<string> keys)
+        { return AsrRegistry.ReadPolicySource(keys); }
+
+        public bool IsNotepadRedirectionActive() { return AsrRegistry.IsNotepadRedirectionActive(); }
+
+        public void Dispose() { objects.Dispose(); }
+    }
+
+    // P/Invoke bridge to the shared native transport (WinTraceForge.Native.dll): the same
+    // IWbemLocator/IWbemServices ExecMethod session Defender's native backend uses, extended to
+    // set the UInt8 Actions array (NativeSetByteValues) that a rule mutation also needs.
+    private sealed class NativeAsrBackend : IAsrBackend
+    {
+        private IntPtr handle;
+
+        public void Connect()
+        {
+            CheckNative(NativeMethods.NativeOpen(out handle), "IWbemLocator::ConnectServer / proxy security");
+        }
+
+        public void Prepare(AsrMutationRequest request)
+        {
+            CheckNative(NativeMethods.NativePrepare(handle), "GetObject / GetMethod / SpawnInstance");
+            if (request.Kind == AsrRequestKind.GlobalExclusion)
+            {
+                if (!Supports("AttackSurfaceReductionOnlyExclusions"))
+                { throw new InvalidOperationException("Unsupported property: AttackSurfaceReductionOnlyExclusions"); }
+                string[] values = request.ExclusionPaths.ToArray();
+                CheckNative(NativeMethods.NativeSetValues(handle, "AttackSurfaceReductionOnlyExclusions", values, values.Length),
+                    "IWbemClassObject::Put(AttackSurfaceReductionOnlyExclusions)");
+            }
+            else
+            {
+                if (!Supports("AttackSurfaceReductionRules_Ids") || !Supports("AttackSurfaceReductionRules_Actions"))
+                { throw new InvalidOperationException("Unsupported property: AttackSurfaceReductionRules_Ids/Actions"); }
+                string[] ids = { request.RuleId };
+                CheckNative(NativeMethods.NativeSetValues(handle, "AttackSurfaceReductionRules_Ids", ids, ids.Length),
+                    "IWbemClassObject::Put(AttackSurfaceReductionRules_Ids)");
+                byte[] actions = { (byte)request.Action };
+                CheckNative(NativeMethods.NativeSetByteValues(handle, "AttackSurfaceReductionRules_Actions", actions, actions.Length),
+                    "IWbemClassObject::Put(AttackSurfaceReductionRules_Actions)");
+            }
+        }
+
+        public bool Supports(string name)
+        {
+            bool supported;
+            CheckNative(NativeMethods.NativeSupports(handle, name, out supported), "Get parameter metadata: " + name);
+            return supported;
+        }
+
+        public object Add()
+        {
+            object returnValue;
+            CheckNative(NativeMethods.NativeAdd(handle, out returnValue), "IWbemServices::ExecMethod(Add)");
+            return returnValue;
+        }
+
+        // Ids/Actions must be paired from one atomic ExecQuery (NativeReadPair), not two
+        // independent ones: a length-only check cannot catch a same-length reshuffle (e.g. a GP/MDM
+        // push that removes one rule and adds another between two separate queries), only a
+        // length change. Every other field here has no such pairing to protect and stays per-field
+        // (each still fails closed -- WBEM_E_NOT_FOUND / WBEM_E_PROVIDER_FAILURE -- unless exactly
+        // one MSFT_MpPreference instance answers it).
+        public AsrSnapshot Read()
+        {
+            object cachedIds = null, cachedActions = null;
+            bool ruleActionsFetched = false;
+            return BuildSnapshot(delegate(string name)
+            {
+                if (name == "AttackSurfaceReductionRules_Ids" || name == "AttackSurfaceReductionRules_Actions")
+                {
+                    if (!ruleActionsFetched)
+                    {
+                        CheckNative(NativeMethods.NativeReadPair(handle, "AttackSurfaceReductionRules_Ids",
+                            "AttackSurfaceReductionRules_Actions", out cachedIds, out cachedActions),
+                            "ExecQuery / Get: AttackSurfaceReductionRules_Ids + _Actions (paired)");
+                        ruleActionsFetched = true;
+                    }
+                    return name == "AttackSurfaceReductionRules_Ids" ? cachedIds : cachedActions;
+                }
+                object raw;
+                CheckNative(NativeMethods.NativeRead(handle, name, out raw), "ExecQuery / Get: " + name);
+                return raw;
+            });
+        }
+
+        public Dictionary<string, AsrPolicySourceKind> ReadPolicySource(IEnumerable<string> keys)
+        { return AsrRegistry.ReadPolicySource(keys); }
+
+        public bool IsNotepadRedirectionActive() { return AsrRegistry.IsNotepadRedirectionActive(); }
+
+        // RunWithBackend is synchronous; COM initialization and release remain on the same thread.
+        public void Dispose()
+        {
+            if (handle != IntPtr.Zero)
+            {
+                NativeMethods.NativeClose(handle);
+                handle = IntPtr.Zero;
+            }
+        }
+
+        private static void CheckNative(int hresult, string operation)
+        {
+            if (hresult < 0)
+            {
+                throw new COMException("Native " + operation + " failed: " +
+                    Marshal.GetExceptionForHR(hresult).Message, hresult);
+            }
+        }
+    }
+
+    private static class NativeMethods
+    {
+        private const string Library = "WinTraceForge.Native.dll";
+
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.AssemblyDirectory | DllImportSearchPath.System32)]
+        internal static extern int NativeOpen(out IntPtr handle);
+
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.AssemblyDirectory | DllImportSearchPath.System32)]
+        internal static extern int NativePrepare(IntPtr handle);
+
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true, CharSet = CharSet.Unicode)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.AssemblyDirectory | DllImportSearchPath.System32)]
+        internal static extern int NativeSupports(IntPtr handle, string name, [MarshalAs(UnmanagedType.Bool)] out bool supported);
+
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true, CharSet = CharSet.Unicode)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.AssemblyDirectory | DllImportSearchPath.System32)]
+        internal static extern int NativeSetValues(IntPtr handle, string name,
+            [In, MarshalAs(UnmanagedType.LPArray, ArraySubType = UnmanagedType.LPWStr, SizeParamIndex = 3)] string[] values, int count);
+
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true, CharSet = CharSet.Unicode)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.AssemblyDirectory | DllImportSearchPath.System32)]
+        internal static extern int NativeSetByteValues(IntPtr handle, string name,
+            [In, MarshalAs(UnmanagedType.LPArray, ArraySubType = UnmanagedType.U1, SizeParamIndex = 3)] byte[] values, int count);
+
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.AssemblyDirectory | DllImportSearchPath.System32)]
+        internal static extern int NativeAdd(IntPtr handle, [MarshalAs(UnmanagedType.Struct)] out object returnValue);
+
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true, CharSet = CharSet.Unicode)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.AssemblyDirectory | DllImportSearchPath.System32)]
+        internal static extern int NativeRead(IntPtr handle, string name, [MarshalAs(UnmanagedType.Struct)] out object values);
+
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true, CharSet = CharSet.Unicode)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.AssemblyDirectory | DllImportSearchPath.System32)]
+        internal static extern int NativeReadPair(IntPtr handle, string firstName, string secondName,
+            [MarshalAs(UnmanagedType.Struct)] out object firstValues, [MarshalAs(UnmanagedType.Struct)] out object secondValues);
+
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.AssemblyDirectory | DllImportSearchPath.System32)]
+        internal static extern void NativeClose(IntPtr handle);
     }
 }

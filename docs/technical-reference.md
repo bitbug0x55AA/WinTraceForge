@@ -84,9 +84,9 @@ Defender Attack Surface Reduction (ASR)
   wtf.exe defender asr rule -RuleId GUID -Action Block|Audit|Warn|Disabled
   wtf.exe defender asr verify -RuleId GUID [--check] [-TestCommand PATH -TestArguments "..."]
 
-Only --transport management is implemented (System.Management -> WMI ->
-MSFT_MpPreference); com/native are not implemented for this module and are
-rejected rather than silently falling back.
+--transport management|com|native, same as `defender exclusion`: all three
+target MSFT_MpPreference (System.Management, SWbemServices COM Automation, or
+native IWbemServices) with no fallback between them.
 
 `status` and every `--check` are read-only and never require elevation.
 `status` lists every rule found in AttackSurfaceReductionRules_Ids/_Actions

@@ -33,6 +33,8 @@ internal static class RegressionTests
         CheckAsrArguments();
         CheckAsrLifecycle();
         CheckAsrPolicySourceAndCatalog();
+        CheckAsrSnapshotDecoding();
+        CheckNativeSetterTypeGate();
         CheckAsrTelemetry();
         CheckAsrArchitecture();
         CheckAsrBuiltInPrimitive();
@@ -506,23 +508,120 @@ internal static class RegressionTests
             });
     }
 
-    // -Integration only: exercises the real ManagementAsrBackend against live WMI to prove the
-    // CimType gate (B1) actually accepts a real Prepare(RuleAction) call end to end. Add is never
-    // invoked, so no Defender setting is touched; this only proves the request would be accepted.
+    // -Integration only: exercises every real ASR backend against live WMI to prove the CimType
+    // gate (B1) actually accepts a real Prepare(RuleAction) call end to end on each transport. Add
+    // is never invoked, so no Defender setting is touched; this only proves the request would be accepted.
+    // Also reads a real baseline through all three and asserts the snapshots agree as sets (order-
+    // and case-insensitive, not byte-for-byte), so a future BuildSnapshot/decoder regression that
+    // only breaks com or native cannot pass silently.
     private static void RunAsrReadOnlyIntegrationCheck()
     {
-        using (IAsrBackend backend = AsrModule.CreateBackend("management"))
+        AsrSnapshot[] snapshots = new AsrSnapshot[3];
+        string[] transports = { "management", "com", "native" };
+        for (int i = 0; i < transports.Length; i++)
         {
-            backend.Connect();
-            backend.Prepare(new AsrMutationRequest
+            using (IAsrBackend backend = AsrModule.CreateBackend(transports[i]))
             {
-                Kind = AsrRequestKind.RuleAction,
-                RuleId = Guid.NewGuid().ToString("D"),
-                Action = AsrAction.Audit
-            });
-            Console.WriteLine("PASS: real ManagementAsrBackend.Prepare(RuleAction) accepted the UInt8 Actions array " +
-                "against live WMI; Add was not called and no Defender setting was changed.");
+                backend.Connect();
+                backend.Prepare(new AsrMutationRequest
+                {
+                    Kind = AsrRequestKind.RuleAction,
+                    RuleId = Guid.NewGuid().ToString("D"),
+                    Action = AsrAction.Audit
+                });
+                Console.WriteLine("PASS: real " + transports[i] + " ASR backend Prepare(RuleAction) accepted the UInt8 " +
+                    "Actions array against live WMI; Add was not called and no Defender setting was changed.");
+                snapshots[i] = backend.Read();
+            }
         }
+        for (int i = 1; i < transports.Length; i++)
+        {
+            Assert(AsrSnapshotsEqual(snapshots[0], snapshots[i]),
+                "ASR Read() snapshot equal across transports: management vs " + transports[i]);
+        }
+        Console.WriteLine("PASS: real management/com/native ASR Read() produced identical snapshots against live WMI.");
+
+        RunNativeSetterTypeGateIntegrationCheck();
+    }
+
+    [DllImport("WinTraceForge.Native.dll", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    private static extern int NativeOpen(out IntPtr handle);
+
+    [DllImport("WinTraceForge.Native.dll", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    private static extern int NativePrepare(IntPtr handle);
+
+    [DllImport("WinTraceForge.Native.dll", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true, CharSet = CharSet.Unicode)]
+    private static extern int NativeSetValues(IntPtr handle, string name,
+        [In, MarshalAs(UnmanagedType.LPArray, ArraySubType = UnmanagedType.LPWStr, SizeParamIndex = 3)] string[] values, int count);
+
+    [DllImport("WinTraceForge.Native.dll", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true, CharSet = CharSet.Unicode)]
+    private static extern int NativeSetByteValues(IntPtr handle, string name,
+        [In, MarshalAs(UnmanagedType.LPArray, ArraySubType = UnmanagedType.U1, SizeParamIndex = 3)] byte[] values, int count);
+
+    [DllImport("WinTraceForge.Native.dll", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    private static extern void NativeClose(IntPtr handle);
+
+    // -Integration only: check the real prepared-session path as well as the deterministic
+    // null-session gate check in the CI suite. No Add call is made.
+    private static void RunNativeSetterTypeGateIntegrationCheck()
+    {
+        IntPtr handle;
+        int hr = NativeOpen(out handle);
+        if (hr < 0) { throw new InvalidOperationException("NativeOpen failed (0x" + hr.ToString("X8") + ")."); }
+        try
+        {
+            hr = NativePrepare(handle);
+            if (hr < 0) { throw new InvalidOperationException("NativePrepare failed (0x" + hr.ToString("X8") + ")."); }
+
+            // "1" must stay a value WMI's own Put() coercion would otherwise accept for a UInt8
+            // array: WBEM_E_TYPE_MISMATCH (0x80041005) is also what Put() itself returns for a
+            // value it cannot convert, so an inconvertible test string here would pass this
+            // assertion for the wrong reason even if the gate above it were deleted.
+            int crossStringIntoByteField = NativeSetValues(handle, "AttackSurfaceReductionRules_Actions", new[] { "1" }, 1);
+            Assert(crossStringIntoByteField == unchecked((int)0x80041005),
+                "Native string setter rejects a convertible value for the UInt8-typed Actions property at its own gate");
+
+            int crossByteIntoStringField = NativeSetByteValues(handle, "AttackSurfaceReductionRules_Ids", new byte[] { 1 }, 1);
+            Assert(crossByteIntoStringField == unchecked((int)0x80041005),
+                "Native byte setter rejects the string-typed Ids property at its own gate");
+
+            Console.WriteLine("PASS: native NativeSetValues/NativeSetByteValues reject a cross-typed property " +
+                "against a real prepared session; no Defender setting was changed (Add was never called).");
+        }
+        finally { NativeClose(handle); }
+    }
+
+    private static bool AsrSnapshotsEqual(AsrSnapshot a, AsrSnapshot b)
+    {
+        if (a.GlobalExclusionsRequireElevation != b.GlobalExclusionsRequireElevation) { return false; }
+        if (a.AvExclusionsRequireElevation != b.AvExclusionsRequireElevation) { return false; }
+        if (!StringSetsEqual(a.GlobalExclusions, b.GlobalExclusions)) { return false; }
+        if (a.Rules.Count != b.Rules.Count) { return false; }
+        foreach (var rule in a.Rules)
+        {
+            AsrAction otherAction;
+            if (!b.Rules.TryGetValue(rule.Key, out otherAction) || otherAction != rule.Value) { return false; }
+        }
+        if (a.AvExclusions.Count != b.AvExclusions.Count) { return false; }
+        foreach (var exclusion in a.AvExclusions)
+        {
+            List<string> otherValues;
+            if (!b.AvExclusions.TryGetValue(exclusion.Key, out otherValues) ||
+                !StringSetsEqual(exclusion.Value, otherValues)) { return false; }
+        }
+        return true;
+    }
+
+    private static bool StringSetsEqual(List<string> a, List<string> b)
+    {
+        if (a.Count != b.Count) { return false; }
+        var sortedA = new List<string>(a); sortedA.Sort(StringComparer.OrdinalIgnoreCase);
+        var sortedB = new List<string>(b); sortedB.Sort(StringComparer.OrdinalIgnoreCase);
+        for (int i = 0; i < sortedA.Count; i++)
+        {
+            if (!string.Equals(sortedA[i], sortedB[i], StringComparison.OrdinalIgnoreCase)) { return false; }
+        }
+        return true;
     }
 
     private static void CheckAsrArguments()
@@ -535,6 +634,29 @@ internal static class RegressionTests
         AsrOptions check = AsrModule.Parse(new[] { "exclusion", "--check", "-Path", @"C:\Lab" });
         Assert(check.Kind == ControlKind.DefenderAsrExclusion && check.CheckOnly && check.Paths.Count == 1,
             "ASR exclusion check parse");
+        Assert(check.Transport == "management", "ASR default transport preserved");
+
+        foreach (string transport in new[] { "management", "com", "native" })
+        {
+            Assert(AsrModule.Parse(new[] { "exclusion", "--transport", transport, "--check", "-Path", @"C:\Lab" }).Transport == transport,
+                "ASR select transport: " + transport);
+        }
+        Assert(AsrModule.Parse(new[] { "exclusion", "--TRANSPORT", "NATIVE", "--check", "-Path", @"C:\Lab" }).Transport == "native",
+            "ASR transport case insensitive");
+
+        // Construction alone never connects to WMI, so this is safe to assert without -Integration:
+        // catches a transposed case in CreateBackend's switch (e.g. "com" silently mapped to management).
+        var expectedBackendTypes = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            { "management", "ManagementAsrBackend" }, { "com", "ComAsrBackend" }, { "native", "NativeAsrBackend" }
+        };
+        foreach (var expected in expectedBackendTypes)
+        {
+            using (IAsrBackend backend = AsrModule.CreateBackend(expected.Key))
+            {
+                Assert(backend.GetType().Name == expected.Value, "ASR CreateBackend maps " + expected.Key + " to " + expected.Value);
+            }
+        }
 
         AsrOptions add = AsrModule.Parse(new[] { "exclusion", "-Path", @"C:\Lab", @"C:\Lab2" });
         Assert(!add.CheckOnly && add.Paths.Count == 2, "ASR exclusion add parse");
@@ -574,7 +696,8 @@ internal static class RegressionTests
             new[] { "verify" },
             new[] { "verify", "-RuleId", ruleId.ToString("D") },
             new[] { "verify", "-RuleId", ruleId.ToString("D"), "-TestArguments", "/c exit 0" },
-            new[] { "exclusion", "--transport", "com", "-Path", @"C:\Lab" }
+            new[] { "exclusion", "--transport", "unknown", "-Path", @"C:\Lab" },
+            new[] { "exclusion", "--transport", "--check" }
         };
         foreach (string[] arguments in invalid)
         {
@@ -827,6 +950,106 @@ internal static class RegressionTests
             new[] { ruleKey, AsrRegistry.GlobalExclusionsSourceKey });
         Assert(sources.ContainsKey(ruleKey) && sources.ContainsKey(AsrRegistry.GlobalExclusionsSourceKey),
             "ASR registry policy-source lookup returns every requested key without throwing");
+    }
+
+    // Deterministic coverage for the snapshot assembly shared by all three ASR backends: every
+    // transport's raw readback shape (management/native return string[]/byte[]; COM returns
+    // object[] of boxed string/Byte through IDispatch) must decode to the identical AsrSnapshot,
+    // and a length mismatch or a non-singleton instance count must fail loudly, never guess.
+    private static void CheckAsrSnapshotDecoding()
+    {
+        string ruleId = Guid.NewGuid().ToString("D");
+
+        // management/native shape: string[] and a real uint/byte-typed Array.
+        Dictionary<string, AsrAction> viaTyped = AsrModule.BuildRuleActions(
+            new[] { ruleId }, new byte[] { (byte)AsrAction.Block });
+        Assert(viaTyped.Count == 1 && viaTyped[ruleId] == AsrAction.Block, "BuildRuleActions decodes string[]/byte[]");
+
+        // COM shape: SWbem hands back Object[] holding boxed CLR values, not typed arrays.
+        Dictionary<string, AsrAction> viaBoxed = AsrModule.BuildRuleActions(
+            new object[] { ruleId }, new object[] { (byte)AsrAction.Audit });
+        Assert(viaBoxed.Count == 1 && viaBoxed[ruleId] == AsrAction.Audit, "BuildRuleActions decodes boxed object[] (COM shape)");
+
+        Assert(AsrModule.BuildRuleActions(null, null).Count == 0, "BuildRuleActions treats null as empty, not an error");
+        Assert(AsrModule.BuildRuleActions(DBNull.Value, DBNull.Value).Count == 0, "BuildRuleActions treats DBNull as empty");
+
+        bool mismatchRejected = false;
+        try { AsrModule.BuildRuleActions(new[] { ruleId, Guid.NewGuid().ToString("D") }, new byte[] { (byte)AsrAction.Block }); }
+        catch (InvalidOperationException) { mismatchRejected = true; }
+        Assert(mismatchRejected, "BuildRuleActions rejects Ids/Actions length mismatch instead of defaulting to Disabled");
+
+        Assert(AsrModule.IsElevationPlaceholder(new[] { "N/A: elevation required" }), "Elevation sentinel recognized");
+        Assert(!AsrModule.IsElevationPlaceholder(new[] { @"C:\Lab" }), "A real single path is not mistaken for the sentinel");
+        Assert(!AsrModule.IsElevationPlaceholder(new string[0]), "An empty array is not mistaken for the sentinel");
+
+        Assert(string.Join(",", AsrModule.DecodeStringArray(new object[] { ruleId, null })) == ruleId + ",",
+            "DecodeStringArray accepts boxed object[] with a null element");
+        bool badElement = false;
+        try { AsrModule.DecodeStringArray(new object[] { (byte)1 }); }
+        catch (InvalidOperationException) { badElement = true; }
+        Assert(badElement, "DecodeStringArray rejects a non-string element");
+
+        // A field func closing over one fixed record: exercises the shared assembly path every
+        // transport's Read() now goes through, including the elevation-hidden AV branch.
+        var fieldsRead = new List<string>();
+        Func<string, object> field = delegate(string name)
+        {
+            fieldsRead.Add(name);
+            if (name == "AttackSurfaceReductionRules_Ids") { return new[] { ruleId }; }
+            if (name == "AttackSurfaceReductionRules_Actions") { return new byte[] { (byte)AsrAction.Warn }; }
+            if (name == "AttackSurfaceReductionOnlyExclusions") { return new[] { @"C:\Lab" }; }
+            return new[] { "N/A: elevation required" };
+        };
+        AsrSnapshot snapshot = AsrModule.BuildSnapshot(field);
+        Assert(snapshot.Rules[ruleId] == AsrAction.Warn, "BuildSnapshot assembles rule actions");
+        Assert(snapshot.GlobalExclusions.Count == 1 && snapshot.GlobalExclusions[0] == @"C:\Lab" &&
+            !snapshot.GlobalExclusionsRequireElevation, "BuildSnapshot assembles visible global exclusions");
+        Assert(snapshot.AvExclusionsRequireElevation, "BuildSnapshot marks the AV exclusion sentinel as unobservable, not empty");
+        foreach (string type in AsrModule.AvExclusionTypes)
+        { Assert(snapshot.AvExclusions[type].Count == 0, "Elevation-hidden AV exclusion never surfaces the sentinel text: " + type); }
+
+        Assert(!ThrowsInvalidOperation(delegate { AsrModule.RequireSingleInstance(1); }), "Exactly one instance is accepted");
+        Assert(ThrowsInvalidOperation(delegate { AsrModule.RequireSingleInstance(0); }), "Zero instances must not read as absent");
+        Assert(ThrowsInvalidOperation(delegate { AsrModule.RequireSingleInstance(2); }), "Multiple instances must not be silently merged");
+
+        fieldsRead.Clear();
+        bool zeroRejectedWithInstanceMessage = false;
+        try { AsrModule.ReadSnapshot(new Func<string, object>[0]); }
+        catch (InvalidOperationException ex)
+        { zeroRejectedWithInstanceMessage = ex.Message.IndexOf("instance", StringComparison.OrdinalIgnoreCase) >= 0; }
+        Assert(zeroRejectedWithInstanceMessage && fieldsRead.Count == 0,
+            "ReadSnapshot rejects zero instances with a specific error before reading fields");
+
+        AsrSnapshot guarded = AsrModule.ReadSnapshot(new[] { field });
+        Assert(guarded.Rules[ruleId] == AsrAction.Warn && fieldsRead.Count == 3 + AsrModule.AvExclusionTypes.Length,
+            "ReadSnapshot reads and assembles exactly one instance");
+
+        fieldsRead.Clear();
+        Assert(ThrowsInvalidOperation(delegate { AsrModule.ReadSnapshot(new[] { field, field }); }) && fieldsRead.Count == 0,
+            "ReadSnapshot rejects multiple instances before reading any fields");
+    }
+
+    private static void CheckNativeSetterTypeGate()
+    {
+        // The type gate runs before session validation. A cross-typed property must return
+        // WBEM_E_TYPE_MISMATCH; a correctly typed property with no session returns E_INVALIDARG.
+        // Deleting either gate changes its result to E_INVALIDARG, so CI detects the regression.
+        const int typeMismatch = unchecked((int)0x80041005);
+        const int invalidArgument = unchecked((int)0x80070057);
+        Assert(NativeSetValues(IntPtr.Zero, "AttackSurfaceReductionRules_Actions", new[] { "1" }, 1) == typeMismatch,
+            "Native string setter rejects the byte array property before session validation");
+        Assert(NativeSetByteValues(IntPtr.Zero, "AttackSurfaceReductionRules_Ids", new byte[] { 1 }, 1) == typeMismatch,
+            "Native byte setter rejects the string array property before session validation");
+        Assert(NativeSetValues(IntPtr.Zero, "AttackSurfaceReductionRules_Ids", new[] { "id" }, 1) == invalidArgument,
+            "Native string setter accepts the Ids property type and then checks the session");
+        Assert(NativeSetByteValues(IntPtr.Zero, "AttackSurfaceReductionRules_Actions", new byte[] { 1 }, 1) == invalidArgument,
+            "Native byte setter accepts the Actions property type and then checks the session");
+    }
+
+    private static bool ThrowsInvalidOperation(Action action)
+    {
+        try { action(); return false; }
+        catch (InvalidOperationException) { return true; }
     }
 
     private static void CheckAsrTelemetry()

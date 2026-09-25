@@ -700,7 +700,9 @@ internal static class DefenderModule
         public void Dispose() { objects.Dispose(); }
     }
 
-    private sealed class ComObjects : IDisposable
+    // Internal (not private): reused by AsrModule's COM backend, which talks to the same
+    // root\Microsoft\Windows\Defender namespace and needs the identical IDispatch bookkeeping.
+    internal sealed class ComObjects : IDisposable
     {
         private readonly List<object> owned = new List<object>();
 

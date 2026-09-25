@@ -2,6 +2,12 @@
 
 All notable changes to WinTraceForge are recorded here. The project follows [Semantic Versioning](https://semver.org/) for release tags.
 
+## Unreleased
+
+### Added
+
+- `defender asr` now supports `--transport com` and `--transport native` (in addition to the existing `management`), matching `defender exclusion`'s three-transport architecture: all three target the same `MSFT_MpPreference` class through a shared snapshot-assembly and single-instance-readback guard.
+
 ## 0.1.0 — 2026-09-25
 
 Initial public release of WinTraceForge (WTF), a Windows x64 defense-control test harness.
