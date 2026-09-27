@@ -724,7 +724,7 @@ internal static partial class FirewallModule
         ConsoleUi.Text("ETL is saved under LocalAppData\\WinTraceForge\\Traces\\<run-id>; it may contain unrelated activity.");
         ConsoleUi.Text("Compliance and detection/response are not automatically assessed. No SIEM/EDR alerts are queried.");
         ConsoleUi.Text("NO_COLOR is supported. Redirect stdout and stderr together to preserve warnings.");
-        ConsoleUi.Text("See README.md and docs\\technical-reference.md for evidence limits and restoration guidance.");
+        ConsoleUi.Text("See docs\\user\\README.md for evidence limits and restoration guidance.");
     }
 }
 

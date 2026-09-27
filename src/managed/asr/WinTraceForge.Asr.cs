@@ -585,7 +585,7 @@ internal static partial class AsrModule
         ConsoleUi.Text("A 'verify' result reports whether the run matched the *expected* outcome for the rule's current " +
             "action; it is not a general antivirus/EDR verdict, and a benign primitive does not represent real attacker tooling.");
         ConsoleUi.Text("Compliance and detection/response are not automatically assessed.");
-        ConsoleUi.Text("See README.md and docs\\technical-reference.md for evidence limits and restoration guidance.");
+        ConsoleUi.Text("See docs\\user\\README.md for evidence limits and restoration guidance.");
     }
 
     internal static void PrintAssessment(AsrOptions options, AsrRunEvidence evidence, int exitCode)
@@ -600,7 +600,7 @@ internal static partial class AsrModule
         // Only 'verify' can ever produce this (Manual restoration for exclusion/rule never reports
         // Unavailable): the primitive ran and this host's process-tree cleanup could not be confirmed
         // (typically the notepad.exe redirection warning above), not a genuine operation failure. This
-        // still exits 1 like any other unconfirmed restoration -- see docs/technical-reference.md.
+        // still exits 1 like any other unconfirmed restoration -- see docs/user/asr.md.
         else if (evidence.Lifecycle != null && evidence.Lifecycle.Restoration == RestorationStatus.Unavailable)
         { outcome = "CLEANUP_UNVERIFIABLE"; }
         else { outcome = "OPERATION_ERROR"; }

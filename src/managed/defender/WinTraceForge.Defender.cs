@@ -271,7 +271,7 @@ internal static class DefenderModule
         ConsoleUi.Text("Telemetry failures do not change the operation exit code. No SIEM/EDR alerts are queried.");
         ConsoleUi.Text("Compliance and detection/response are not automatically assessed.");
         ConsoleUi.Text("NO_COLOR is supported. Redirect stdout and stderr together to preserve warnings.");
-        ConsoleUi.Text("See README.md and docs\\technical-reference.md for evidence limits and restoration guidance.");
+        ConsoleUi.Text("See docs\\user\\README.md for evidence limits and restoration guidance.");
     }
 
     internal sealed class RunEvidence : ControlRunEvidence
