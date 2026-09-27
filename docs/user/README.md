@@ -1,6 +1,6 @@
 # User docs
 
-These guides are for operators using WinTraceForge to compare Windows defense-control execution paths and their observable evidence.
+These guides are for operators investigating path-dependent Windows security visibility: the same operation or equivalent outcome, different implementation paths, and their observable evidence. Today's supported experiments center on Defender Antivirus, ASR, and Windows Firewall controls/configuration; comparisons across runs and with EDR/SIEM evidence are operator-led.
 
 | Guide | Use it to |
 | --- | --- |

@@ -24,7 +24,7 @@ internal static class ConsoleUi
     {
         Console.WriteLine();
         Write("WTF // WINTRACEFORGE", "  ", "  ", ConsoleColor.Cyan, false);
-        Write("Same change. Different paths. Interesting silence.", "  ", "  ", ConsoleColor.Gray, false);
+        Write("Same action. Different paths. Different visibility.", "  ", "  ", ConsoleColor.Gray, false);
     }
 
     internal static void Section(string title)
@@ -62,7 +62,7 @@ internal static class ConsoleUi
 
     internal static void HelpTelemetry()
     {
-        Text("Append --telemetry eventlog to collect evidence; --verbose for full detail.");
+        Text("Use --telemetry eventlog for path-comparison evidence; --verbose for full detail.");
         Text("Use --telemetry etw for raw ETW capture + ETL + TDH decoding (ETW permissions required).");
     }
 

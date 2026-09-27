@@ -239,7 +239,7 @@ internal static class DefenderModule
         ConsoleUi.Row("management", "System.Management -> WMI");
         ConsoleUi.Row("com", "SWbemServices COM Automation -> WMI");
         ConsoleUi.Row("native", "C++ IWbemServices::ExecMethod -> WMI");
-        ConsoleUi.Text("All routes target MSFT_MpPreference.Add; no fallback or privilege bypass.");
+        ConsoleUi.Text("All routes target Defender preferences; no fallback.");
         ConsoleUi.Section("Quick start");
         ConsoleUi.Text("Read-only check:");
         ConsoleUi.Text("  .\\wtf.exe defender exclusion --check -ExclusionPath \"C:\\Lab Data\"");
@@ -1052,7 +1052,7 @@ internal static class DefenderModule
         }
         else if (exitCode == 0)
         {
-            ConsoleUi.Text("Configuration confirmed, not proof of antivirus/EDR bypass.");
+            ConsoleUi.Text("Configuration confirmed; antivirus enforcement and EDR detection require separate evidence.");
             if (evidence.AllPresentBefore == true)
             {
                 ConsoleUi.Text("All values already existed; no new configuration transition was demonstrated.");
@@ -1121,7 +1121,7 @@ internal static class DefenderModule
     {
         ConsoleUi.Status("FAIL", message, true);
         ConsoleUi.Text("Check permissions/policy. If Add was attempted, inspect settings for partial changes.");
-        ConsoleUi.Detail("This program does not disable or bypass organizational policy or tamper protection.");
+        ConsoleUi.Detail("Organizational policy and tamper protection can restrict the requested change.");
         return 1;
     }
 }

@@ -6,6 +6,8 @@
 wtf.exe <module> <command> [options]
 ```
 
+The commands below are the currently implemented security-control / configuration experiments. Select a supported transport to vary the implementation path for the same operation, collect local evidence, and compare observations across runs. Command success and detection response remain separate results; WTF does not automate the comparison.
+
 | Command | Purpose | Changes host state? |
 | --- | --- | --- |
 | `defender exclusion --check` | Read capabilities and requested AV exclusion values. | No |

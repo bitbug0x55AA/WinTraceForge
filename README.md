@@ -1,20 +1,22 @@
 # WinTraceForge (WTF)
 
-> **Same change. Different paths. Interesting silence.**
+> **Same action. Different paths. Different visibility.**
 
-WinTraceForge is an extensible Windows x64 defense-control test harness for exploring how Windows security controls behave and how their operations appear in telemetry. It provides a repeatable way to inspect configuration, exercise controlled changes through different execution paths, capture local evidence, and compare the results with your EDR/SIEM telemetry and alerts.
+WinTraceForge is a Windows x64 security telemetry differential testing harness / lab focused on **path-dependent security visibility**: when the same security-relevant operation or an equivalent outcome is reached through different Windows implementation paths, do Windows telemetry, EDR/SIEM telemetry, and detection response differ?
 
-Control modules share an operation lifecycle, verification and restoration contracts, and evidence collection. This structure supports adding more control families and execution paths as the project grows.
+The research direction is **same operation / equivalent outcome → different implementation paths → compare observable security evidence**. Implementation paths concern how an operation is carried out, not only how a defense setting is changed. The current implementation centers on security-control / configuration experiments with Defender Antivirus, ASR, and Windows Firewall; it does not provide a general execution-experiment framework or additional behavior families.
+
+The existing control modules share an operation lifecycle, verification and restoration contracts, and local evidence collection. Operators compare individual runs and correlate their evidence with their own detection stack; WTF does not automatically compare runs or query EDR/SIEM backends. Its value is in investigating visibility differences, rather than the number of controls it can modify.
 
 Currently implemented modules:
 
-| Control | What you can do |
+| Current control experiment | What you can do |
 | --- | --- |
 | Defender Antivirus | Check or add exclusions. |
 | Attack Surface Reduction | Inspect posture, check or change exclusions and rule actions, and run an experimental behavioral test. |
 | Windows Firewall | Inspect profiles and add, check, or remove uniquely marked test rules. |
 
-Available execution paths include managed WMI, COM, and native interfaces, depending on the module. Collect existing Event Log records or raw ETW traces, then compare that host-side evidence with your detection stack. A missing alert is an observation, not a bypass claim; configuration readback alone does not prove enforcement or detection.
+Available implementation paths include managed WMI, COM, and native interfaces, depending on the module. These are the paths supported by today's control experiments, not a definition of the project's ultimate research boundary. Collect existing Event Log records or raw ETW traces to investigate observable evidence, including on read-only checks. A missing alert is **an observation under tested conditions, not a bypass claim**; configuration readback alone does not prove enforcement or detection.
 
 > [!WARNING]
 > Run only on systems where you are authorized to test and modify security controls. Tests can change protection settings, affect system behavior, and leave persistent changes or artifacts, including after a failed or interrupted run. Review the selected module's effects and limitations, capture the baseline, and establish a restoration plan before making changes. Do not assume automatic rollback: follow the module's cleanup guidance and verify the resulting state. Treat collected telemetry as sensitive evidence.
@@ -37,9 +39,10 @@ Open PowerShell in the extracted directory and start with read-only checks:
 .\wtf.exe firewall profiles
 ```
 
-Compare execution paths and collect local evidence without changing policy:
+Collect evidence for a read-only operation through different supported paths:
 
 ```powershell
+.\wtf.exe firewall profiles --transport com --telemetry eventlog
 .\wtf.exe firewall profiles --transport native --telemetry eventlog
 ```
 

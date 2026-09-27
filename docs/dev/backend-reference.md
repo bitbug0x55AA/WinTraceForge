@@ -56,7 +56,7 @@ been created no earlier than the launcher itself. This check is read-only (a
 WMI query): `verify` never terminates a process during Verify, only during
 Restore. Local process-presence evidence can only ever support one
 unambiguous conclusion: the primitive's payload ran despite an action
-(Block, or Warn's default block-with-bypass-option behavior) that should
+(Block, or Warn's default block-with-user-override behavior) that should
 have stopped it, reported Mismatch. Every other combination -- including
 absence (ambiguous: WSH disabled, AppLocker/WDAC, a script error, the
 primitive not engaging the rule at all, and an actual block are all
@@ -141,7 +141,7 @@ plus its per-rule MSFT_Net*Filter associations). All three read/write the
 same persisted rule store and share the same ownership schema and readback
 comparison (FirewallModule.Mismatches), so a rule added by one transport can
 be checked/removed with any other. This compares caller implementations, not
-different policy engines. It is not a WFP API test, privilege bypass or proof
+different policy engines. It is not a WFP API test or proof
 of different detection.
 
 MSFT_NetFirewallRule does not expose address/port/program/service scoping as

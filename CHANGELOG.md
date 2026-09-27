@@ -4,6 +4,10 @@ All notable changes to WinTraceForge are recorded here. The project follows [Sem
 
 ## Unreleased
 
+### Changed
+
+- Reframed the project as a Windows security telemetry differential testing harness / lab focused on path-dependent security visibility: same operation or equivalent outcome, different implementation paths, and comparison of observable security evidence. Updated documentation, help wording, and assembly description while retaining current Defender Antivirus, ASR, and Firewall experiments and their existing CLI/lifecycle. No new execution experiments or behavior families are introduced.
+
 ### Added
 
 - `defender asr` now supports `--transport com` and `--transport native` (in addition to the existing `management`), matching `defender exclusion`'s three-transport architecture: all three target the same `MSFT_MpPreference` class through a shared snapshot-assembly and single-instance-readback guard.

@@ -454,7 +454,7 @@ internal static partial class AsrModule
             if (status == VerificationStatus.Mismatch)
             {
                 ConsoleUi.Status("FAIL", "The primitive ran despite an action (" + action + ") that should have stopped " +
-                    "it by default. This is a local observation, not proof of a bypass: it may also mean this " +
+                    "it by default. This is an observation under tested conditions, not a bypass claim: it may also mean this " +
                     "(experimental, unverified) primitive simply does not trigger this rule at all in this environment. " +
                     "Check for exclusions, RTP state, and corroborate with --telemetry evidence (1121/1122).", true);
             }
@@ -674,7 +674,7 @@ internal static partial class AsrModule
     // Pure decision: local process-presence evidence can only ever support two conclusions.
     // Absence is ambiguous (many unrelated causes), so it is never enough for Confirmed.
     // Presence despite an action that should stop the primitive by default (Block, and Warn's
-    // default-block-with-bypass-option behavior) is the one unambiguous signal this primitive
+    // default-block-with-user-override behavior) is the one unambiguous signal this primitive
     // can produce, so that case alone is reported Mismatch. Every other combination -- including
     // Audit (real evidence is event 1122, not process presence) and Disabled/NotConfigured
     // (presence is simply expected and uninformative) -- is Unavailable.
@@ -688,7 +688,7 @@ internal static partial class AsrModule
     // MSFT_MpPreference aside, writing a NTFS alternate data stream (":Zone.Identifier") through
     // File.WriteAllText fails with NotSupportedException under this build's legacy path handling
     // (no app.config / TargetFrameworkAttribute opts into the newer path normalizer). CreateFileW
-    // takes the raw path directly, bypassing that managed validation entirely.
+    // takes the raw path directly, avoiding that managed path validation entirely.
     private static class AlternateDataStream
     {
         private const uint GenericWrite = 0x40000000;

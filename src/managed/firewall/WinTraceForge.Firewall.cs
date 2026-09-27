@@ -701,7 +701,7 @@ internal static partial class FirewallModule
         ConsoleUi.Text("management's Local modify state is read from the WindowsFirewall Group Policy registry keys " +
             "(AllowLocalPolicyMerge/AllowLocalIPsecPolicyMerge), since MSFT_NetFirewallRule/-Profile expose no direct " +
             "equivalent to INetFwPolicy2.LocalPolicyModifyState; it never reports 2 (INBOUND_BLOCKED).");
-        ConsoleUi.Text("Changing COM caller implementation does not prove different enforcement or a monitoring bypass.");
+        ConsoleUi.Text("Changing caller implementation alone does not establish different enforcement or detection; compare evidence.");
         ConsoleUi.Text("Add defaults: all local addresses and no program, service or interface restriction.");
         ConsoleUi.Text("Outbound requires remote port; inbound requires local port. The opposite-side port defaults to all.");
         ConsoleUi.Text("The active profile mask is frozen before add; an invalid/empty mask never falls back to all.");

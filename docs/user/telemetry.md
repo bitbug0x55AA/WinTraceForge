@@ -2,7 +2,11 @@
 
 [User docs](README.md) | [Results and cleanup](results-and-cleanup.md)
 
-All modules accept `--telemetry none|eventlog|etw`, `--telemetry-wait 0..30` (default 3 seconds), and `--verbose`. The default is no telemetry collection. WinTraceForge collects local evidence and does not query your SIEM/EDR backend.
+Comparing observable security evidence across implementation paths is WTF's central research objective. The current modules collect local evidence for security-control / configuration experiments, including read-only operations; collection is opt-in, not conditional on changing a setting. WinTraceForge does not query your SIEM/EDR backend or automatically compare runs.
+
+All modules accept `--telemetry none|eventlog|etw`, `--telemetry-wait 0..30` (default 3 seconds), and `--verbose`. The default is no telemetry collection.
+
+For a comparison, repeat the same operation through the module's supported transports with comparable baselines and capture conditions. Record any differences in outcome, process context, policy, permissions, and auditing; an already-present value can make a later run a no-op. Compare local records, EDR/SIEM ingestion, alerts, and response separately. The paths may share an underlying interface, so a different transport does not guarantee different evidence. See [results and cleanup](results-and-cleanup.md) for the records to retain.
 
 ## Existing Windows Event Log records
 
@@ -65,4 +69,4 @@ logman stop "WinTraceForge-<run-id>" -ets
 
 Replace the placeholder with the recorded run ID. Never stop unrelated sessions.
 
-Missing events can result from auditing, access, timing, retention, or existing state. Neither missing local events nor missing EDR alerts prove that nothing happened or that a protection was bypassed.
+Missing events can result from auditing, access, timing, retention, or existing state. A missing alert is **an observation under tested conditions, not a bypass claim**. Neither missing local events nor missing EDR/SIEM alerts establish that nothing happened; record the tested path, outcome, and capture limits.

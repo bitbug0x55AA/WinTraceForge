@@ -354,7 +354,7 @@ internal static partial class AsrModule
     {
         ConsoleUi.Status("FAIL", message, true);
         ConsoleUi.Text("Check permissions/policy. If a write was attempted, inspect settings for partial changes.");
-        ConsoleUi.Detail("This program does not disable or bypass organizational policy or tamper protection.");
+        ConsoleUi.Detail("Organizational policy and tamper protection can restrict the requested change.");
         return 1;
     }
 
@@ -548,7 +548,7 @@ internal static partial class AsrModule
         ConsoleUi.Row("com", "SWbemServices COM Automation -> WMI");
         ConsoleUi.Row("native", "C++ IWbemServices::ExecQuery/ExecMethod -> WMI");
         ConsoleUi.Text("All routes target MSFT_MpPreference; ExecMethod only for a mutating Add, ExecQuery/Get " +
-            "for every read (status, every --check, verify). No fallback or privilege bypass.");
+            "for every read (status, every --check, verify). No fallback; normal provider permissions apply.");
         ConsoleUi.Section("Quick start");
         ConsoleUi.Text("Read-only posture:");
         ConsoleUi.Text("  .\\wtf.exe defender asr status");
@@ -629,7 +629,7 @@ internal static partial class AsrModule
         ConsoleUi.Section("Detection & Response");
         ConsoleUi.Row("1. Correlate", "Use UTC, host, identity, PID and the rule GUID/exclusion value. Run ID is local, not injected into events.");
         ConsoleUi.Row("2. Defender", "Event 1121: rule blocked (Block and Warn both raise 1121 by default; Warn additionally " +
-            "offers the user a bypass this event alone does not confirm). Event 1122: rule audited (AuditMode only, allowed " +
+            "offers a user override whose use this event alone does not establish). Event 1122: rule audited (AuditMode only, allowed " +
             "and logged). Event 5007/5013: policy configuration change.");
         ConsoleUi.Row("3. Process", "Security 4688 (audit policy required), Sysmon 1, or EDR: correlate parent process, command line and hash.");
         ConsoleUi.Row("4. Validate", "Check collection, ingestion delay, sensor coverage and triage latency separately.");

@@ -144,7 +144,7 @@ internal static class TelemetryPresentation
         "Operation", "ResultCode", "PossibleCause", "ClientMachine", "ProcessGuid");
 }
 
-// Compatibility aliases for existing tests; new families own their profiles in their own files.
+// Compatibility aliases for existing tests; current control modules own their evidence profiles.
 internal static class TelemetryProfiles
 {
     internal static readonly TelemetryProfile DefenderExclusion = DefenderTelemetry.Profile;
@@ -234,7 +234,7 @@ internal static class AsrTelemetry
             if (parsed.Id == 1121)
             {
                 return "ASR rule blocked an operation. Block and Warn both raise this event by default; Warn additionally " +
-                    "offers the user a bypass that this event alone does not confirm was declined. Verify the rule ID and " +
+                    "offers a user override whose use this event alone does not establish. Verify the rule ID and " +
                     "target path/process (ID/Path fields).";
             }
             if (parsed.Id == 1122)

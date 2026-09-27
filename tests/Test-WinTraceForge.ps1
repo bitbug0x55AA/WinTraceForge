@@ -43,7 +43,7 @@ function Test-Command {
     finally { $process.Dispose() }
 }
 
-Test-Command '--help --no-color' 0 @('WTF // WINTRACEFORGE', 'Interesting silence.', 'defender exclusion', 'firewall rule', 'firewall profiles', 'not WFP') | Out-Null
+Test-Command '--help --no-color' 0 @('WTF // WINTRACEFORGE', 'Same action. Different paths. Different visibility.', 'defender exclusion', 'firewall rule', 'firewall profiles', 'not WFP') | Out-Null
 Test-Command '--version' 0 @("WinTraceForge $ExpectedVersion") | Out-Null
 Test-Command '' 0 @('CONTROL MODULES') | Out-Null
 $defenderHelp = Test-Command 'defender exclusion --help --no-color' 0 @('ExclusionPath', 'transport')

@@ -6,7 +6,7 @@
 
 An API return, configuration readback, enforcement, telemetry completeness, compliance, and detection/response are different observations. Readback is a point-in-time configuration observation. Local events do not establish SIEM/EDR ingestion, alerting, analyst triage, or response.
 
-The WTF name reflects environment-specific manual tests where successful changes often produced little useful detection. Treat silence as a question to investigate: telemetry gaps, correlation, auditing, ingestion delay, policy, access, and detection coverage can all matter.
+The comparison question is whether the same operation or equivalent outcome produces different visibility through different implementation paths. Record successful, failed, and unconfirmed outcomes rather than assuming that every path reached an equivalent result. Treat silence as a question to investigate: telemetry gaps, correlation, auditing, ingestion delay, policy, access, and detection coverage can all matter. A missing alert is **an observation under tested conditions, not a bypass claim**.
 
 Preserve the command, selected transport, run/test ID, UTC window, host, user, PID, binary hash, before/after configuration, and event channel/record IDs. Compare them with your approved change record and expected policy. Validate ingestion and response separately. For unauthorized changes, preserve evidence and follow your incident playbook.
 

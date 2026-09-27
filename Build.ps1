@@ -51,7 +51,7 @@ using System.Reflection;
 
 [assembly: AssemblyTitle("WinTraceForge")]
 [assembly: AssemblyProduct("WinTraceForge")]
-[assembly: AssemblyDescription("Windows-native defense-control path and telemetry test harness")]
+[assembly: AssemblyDescription("Windows security telemetry differential testing harness")]
 [assembly: AssemblyVersion("$assemblyVersion")]
 [assembly: AssemblyFileVersion("$assemblyVersion")]
 [assembly: AssemblyInformationalVersion("$Version")]

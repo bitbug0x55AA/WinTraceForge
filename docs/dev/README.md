@@ -1,6 +1,6 @@
 # Developer docs
 
-These guides are for contributors and maintainers changing WinTraceForge. Start with architecture, then the lifecycle contract before extending a control family.
+These guides are for contributors and maintainers changing WinTraceForge's security telemetry differential testing harness. Start with architecture and the existing control lifecycle contract when changing the implemented Defender Antivirus, ASR, or Firewall experiments. These contracts describe today's code; they do not define a general execution-experiment architecture.
 
 | Guide | Covers |
 | --- | --- |

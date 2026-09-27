@@ -67,6 +67,8 @@ internal static class WinTraceForge
 
     private static void PrintHelp()
     {
+        ConsoleUi.Text("Windows security telemetry differential testing harness / lab.");
+        ConsoleUi.Text("Study path-dependent visibility for the same operation or equivalent outcome.");
         ConsoleUi.Section("Control modules");
         ConsoleUi.Row("defender exclusion", "Add/check Defender antivirus exclusions.");
         ConsoleUi.Row("defender asr status", "Read ASR rule state, policy source and exclusion exposure.");
@@ -87,15 +89,17 @@ internal static class WinTraceForge
         ConsoleUi.Row("--verbose", "Expand diagnostics and Detection & Response guidance.");
         ConsoleUi.Row("--no-color", "Plain text; redirected output is always color-free.");
         ConsoleUi.Row("--version", "Print the WinTraceForge build version.");
+        ConsoleUi.Text("Compare individual runs across supported paths; no automatic comparison or EDR/SIEM queries.");
+        ConsoleUi.Text("A missing alert is an observation under tested conditions, not a bypass claim.");
         ConsoleUi.Section("Boundaries");
-        ConsoleUi.Text("Firewall uses INetFwPolicy2 / INetFwRule COM rule management, not WFP filters or callouts.");
+        ConsoleUi.Text("Firewall uses COM rule management or the WMI Firewall provider, not WFP filters or callouts.");
         ConsoleUi.Text("No Firewall Off, no profile mutation, no automatic deletion of business rules.");
         ConsoleUi.Text("Configuration readback is not proof of packet blocking/allowing or EDR detection.");
         ConsoleUi.Text("Legacy exclusion arguments now belong after 'defender exclusion'.");
         if (ConsoleUi.Verbose)
         {
             ConsoleUi.Section("Operational notes");
-            ConsoleUi.Text("WinTraceForge.Native.dll is required for raw ETW and both modules' native transports.");
+            ConsoleUi.Text("WinTraceForge.Native.dll is required for raw ETW and all modules' native transports.");
             ConsoleUi.Text("Eventlog reads existing channels. ETW creates a bounded session and retains ETL evidence.");
             ConsoleUi.Text("Module-specific --help describes permissions, defaults, exit codes and cleanup.");
             ConsoleUi.Text("Ownership markers prevent accidental cleanup of foreign rules; they are not an authorization boundary.");
