@@ -6,6 +6,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Management;
 using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
@@ -105,9 +106,21 @@ internal interface IFirewallWriter
     void Remove(string name);
 }
 
-internal sealed class FirewallRefusalException : InvalidOperationException
+internal class FirewallRefusalException : InvalidOperationException
 {
     internal FirewallRefusalException(string message) : base(message) { }
+}
+
+// A precise, catchable subtype for a readback limitation this transport documents as deliberate
+// (a rule shape -- interface-alias/interface-type restriction, or an unsupported Action value --
+// that ReadRule/RuleActionFromRaw refuse to decode), distinct from a plain FirewallRefusalException
+// that signals something is actually broken. Lets callers (the regression test's real-rule candidate
+// loop) distinguish "skip, known unsupported shape" from "this must never silently pass" by type
+// rather than by matching exact message wording, which would silently stop working if a message
+// were reworded.
+internal sealed class FirewallReadbackUnsupportedException : FirewallRefusalException
+{
+    internal FirewallReadbackUnsupportedException(string message) : base(message) { }
 }
 
 internal static partial class FirewallModule
@@ -146,6 +159,7 @@ internal static partial class FirewallModule
         {
             case "com": return new ComFirewallBackend();
             case "native": return new NativeFirewallBackend();
+            case "management": return new ManagementFirewallBackend();
             default: throw new FirewallRefusalException("Unknown Firewall transport; no fallback.");
         }
     }
@@ -195,11 +209,11 @@ internal static partial class FirewallModule
             if (CommonArguments.TryParse(args, ref i, options, seen)) { continue; }
             if (key == "--transport")
             {
-                if (i + 1 >= args.Length) { throw new ArgumentException("--transport requires com or native."); }
+                if (i + 1 >= args.Length) { throw new ArgumentException("--transport requires com, native, or management."); }
                 options.Transport = args[++i].ToLowerInvariant();
-                if (options.Transport != "com" && options.Transport != "native")
+                if (options.Transport != "com" && options.Transport != "native" && options.Transport != "management")
                 {
-                    throw new ArgumentException("Firewall transports: com, native. No fallback; CIM/WMI is not implemented.");
+                    throw new ArgumentException("Firewall transports: com, native, management. No fallback.");
                 }
                 continue;
             }
@@ -368,9 +382,7 @@ internal static partial class FirewallModule
             ConsoleUi.Row("Control", options.Kind == ControlKind.FirewallProfiles ? "Windows Firewall / Profiles" : "Windows Firewall / Rules");
             ConsoleUi.Row("Operation", options.Operation);
             ConsoleUi.Row("Transport", options.Transport);
-            ConsoleUi.Row("Route", options.Transport == "native" ?
-                "P/Invoke -> C++ INetFwPolicy2 / INetFwRule3 -> Windows Firewall" :
-                "C# COM interop -> INetFwPolicy2 / INetFwRule3 -> Windows Firewall");
+            ConsoleUi.Row("Route", RouteDescription(options));
             ConsoleUi.Row("Run ID", evidence.RunId);
             ConsoleUi.Row("Start UTC", evidence.StartUtc.ToString("O", CultureInfo.InvariantCulture));
             ConsoleUi.Row("Host / PID", Environment.MachineName + " / " + evidence.ProcessId);
@@ -400,6 +412,7 @@ internal static partial class FirewallModule
         }
         catch (FirewallRefusalException error) { return Failure(evidence, error); }
         catch (COMException error) { return Failure(evidence, error); }
+        catch (ManagementException error) { return Failure(evidence, error); }
         catch (UnauthorizedAccessException error) { return Failure(evidence, error); }
         catch (SecurityException error) { return Failure(evidence, error); }
         catch (InvalidCastException error) { return Failure(evidence, error); }
@@ -408,6 +421,22 @@ internal static partial class FirewallModule
         catch (DllNotFoundException error) { return NativeLoadFailure(evidence, error); }
         catch (BadImageFormatException error) { return NativeLoadFailure(evidence, error); }
         catch (EntryPointNotFoundException error) { return NativeLoadFailure(evidence, error); }
+    }
+
+    // management touches different WMI classes for profiles (MSFT_NetFirewallProfile /
+    // MSFT_NetConnectionProfile) than for rule add/check/remove (MSFT_NetFirewallRule and its
+    // MSFT_Net*Filter associations); naming MSFT_NetFirewallRule unconditionally would overclaim
+    // which boundary a profiles run actually crossed.
+    private static string RouteDescription(FirewallOptions options)
+    {
+        if (options.Transport == "native") { return "P/Invoke -> C++ INetFwPolicy2 / INetFwRule3 -> Windows Firewall"; }
+        if (options.Transport == "management")
+        {
+            return options.Kind == ControlKind.FirewallProfiles ?
+                "System.Management -> WMI root\\StandardCimv2 MSFT_NetFirewallProfile / MSFT_NetConnectionProfile -> Windows Firewall" :
+                "System.Management -> WMI root\\StandardCimv2 MSFT_NetFirewallRule -> Windows Firewall";
+        }
+        return "C# COM interop -> INetFwPolicy2 / INetFwRule3 -> Windows Firewall";
     }
 
     private static int NativeLoadFailure(FirewallRunEvidence evidence, Exception error)
@@ -620,7 +649,7 @@ internal static partial class FirewallModule
         ConsoleUi.Section("Usage");
         ConsoleUi.Text("wtf.exe firewall <command> [options]");
         ConsoleUi.Section("Options");
-        ConsoleUi.Row("--transport", "com|native  (default: com; no automatic fallback)");
+        ConsoleUi.Row("--transport", "com|native|management  (default: com; no automatic fallback)");
         ConsoleUi.Row("--id", "Test GUID: generated for add; required for check/remove.");
         ConsoleUi.Row("--remote-address", "One literal IPv4/IPv6 address  (required for add)");
         ConsoleUi.Row("--remote-port", "1..65535  (required outbound; optional inbound, default: all)");
@@ -639,7 +668,10 @@ internal static partial class FirewallModule
         ConsoleUi.Section("Routes");
         ConsoleUi.Row("com", "C# COM interop -> INetFwPolicy2 / INetFwRule3");
         ConsoleUi.Row("native", "P/Invoke -> C++ INetFwPolicy2 / INetFwRule3");
-        ConsoleUi.Text("Both target Windows Firewall COM; not WFP or CIM/WMI rule management.");
+        ConsoleUi.Row("management", "System.Management -> WMI MSFT_NetFirewallRule (root\\StandardCimv2)");
+        ConsoleUi.Text("com/native target Windows Firewall COM (netfw); management targets the WMI Firewall " +
+            "provider that PowerShell's New-NetFirewallRule uses. All three read/write the same persisted " +
+            "rule store, not WFP filters; a rule added with one transport can be checked/removed with another.");
         ConsoleUi.Section("Quick start");
         ConsoleUi.Text("Add a test rule (administrator required; retain the printed ID):");
         ConsoleUi.Text("  .\\wtf.exe firewall rule add --remote-address 192.0.2.10 --remote-port 44443");
@@ -660,6 +692,15 @@ internal static partial class FirewallModule
         ConsoleUi.Text("Both transports share the same ownership schema; either can inspect/clean up the same marked ID.");
         ConsoleUi.Text("Cleanup commands preserve the selected transport. No failure triggers automatic transport switching.");
         ConsoleUi.Text("Native requires this release's x64 DLL beside the EXE; older Defender-only DLLs are incompatible.");
+        ConsoleUi.Text("management scopes address/port/program via the WMI Firewall provider's call-context " +
+            "(\"Extended Syntax\"), not flat rule properties; PrepareAdd can only pre-validate the rule's direct " +
+            "properties (name/group/description/enabled/direction/action/profiles) before Add persists it. Full " +
+            "attribute verification, including address/port/program, still happens in the shared post-Add readback.");
+        ConsoleUi.Text("management always creates rules with no interface, local/remote-user, or remote-machine " +
+            "restriction and edge traversal Block, matching the fixed defaults com/native also use.");
+        ConsoleUi.Text("management's Local modify state is read from the WindowsFirewall Group Policy registry keys " +
+            "(AllowLocalPolicyMerge/AllowLocalIPsecPolicyMerge), since MSFT_NetFirewallRule/-Profile expose no direct " +
+            "equivalent to INetFwPolicy2.LocalPolicyModifyState; it never reports 2 (INBOUND_BLOCKED).");
         ConsoleUi.Text("Changing COM caller implementation does not prove different enforcement or a monitoring bypass.");
         ConsoleUi.Text("Add defaults: all local addresses and no program, service or interface restriction.");
         ConsoleUi.Text("Outbound requires remote port; inbound requires local port. The opposite-side port defaults to all.");

@@ -42,10 +42,10 @@ wtf.exe <module> <command> [options]
 | `defender` | `asr exclusion` | Check or add ASR-only (global) exclusions. |
 | `defender` | `asr rule` | Read or set a single ASR rule's action (Block/Audit/Warn/Disabled). |
 | `defender` | `asr verify` | Run a controlled behavioral test primitive against one ASR rule and observe enforcement + telemetry. |
-| `firewall` | `rule add\|check\|remove` | Manage only uniquely marked test rules through COM or native Windows Firewall interfaces. |
+| `firewall` | `rule add\|check\|remove` | Manage only uniquely marked test rules through COM, native, or WMI Windows Firewall interfaces. |
 | `firewall` | `profiles` | Read active profile state and exposed policy settings without changing them. |
 
-The execution paths are the point: managed WMI, COM Automation, native C++ WMI, managed Firewall COM and native Firewall COM can request equivalent control changes while producing different observable footprints.
+The execution paths are the point: managed WMI, COM Automation, native C++ WMI, managed Firewall COM, native Firewall COM and managed Firewall WMI can request equivalent control changes while producing different observable footprints.
 
 WinTraceForge does not disable Windows Firewall, change firewall profiles, install WFP filters or callouts, bypass privileges, generate test traffic, or query a SIEM/EDR backend. It collects host-side evidence; you compare that evidence with the alerting stack you are evaluating.
 

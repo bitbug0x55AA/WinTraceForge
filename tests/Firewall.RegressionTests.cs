@@ -4,12 +4,15 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Management;
 using System.Reflection;
 using System.Runtime.InteropServices;
 
 // Compile with /main:FirewallRegressionTests alongside the firewall, Core and ConsoleUi sources.
 // Define FIREWALL_TEST_STUBS to replace only telemetry dependencies when testing in isolation.
-// The default test run never constructs the native backend or mutates Windows Firewall.
+// The default test run never constructs the native or management backend, or mutates Windows
+// Firewall. --native-* and --management-read-only opt into real (never-mutating) construction and
+// are only invoked under Build.ps1 -Integration, never the default -Test run or CI.
 internal static class FirewallRegressionTests
 {
     private const string Id = "a365896e-f623-440e-8c31-cb817b35d674";
@@ -77,44 +80,9 @@ internal static class FirewallRegressionTests
 
     private static int Main(string[] args)
     {
-        if (args.Length == 1 && args[0] == "--native-detached-preflight")
-        {
-            foreach (int protocol in new int[] { 6, 17 })
-            {
-                FirewallOptions options = AddOptions();
-                options.Id = Guid.NewGuid();
-                options.Protocol = protocol;
-                options.RemoteAddress = protocol == 6 ? "192.0.2.15" : "2001:db8::1";
-                options.Direction = protocol == 6 ? 2 : 1;
-                options.Action = protocol == 6 ? 0 : 1;
-                options.LocalPort = protocol == 6 ? 0 : 12345;
-                options.RemotePort = protocol == 6 ? 443 : 0;
-                options.Program = protocol == 6 ? "" : @"C:\Windows\System32\notepad.exe";
-                using (IFirewallBackend backend = new ComFirewallBackend())
-                {
-                    Assert(backend.FindByName(options.RuleName).Count == 0, "detached name initially absent");
-                    backend.PrepareAdd(FirewallModule.ExpectedRule(options, 1));
-                    Assert(backend.FindByName(options.RuleName).Count == 0, "detached preparation never persists");
-                }
-            }
-            Console.WriteLine("Detached TCP/UDP rule preparation verified; Rules.Add/Remove were never called.");
-            return 0;
-        }
-        if (args.Length == 1 && args[0] == "--native-read-only")
-        {
-            ConsoleUi.Configure(false, true);
-            using (IFirewallBackend backend = new ComFirewallBackend())
-            {
-                Assert(backend.FindByName(FirewallModule.NameFor(Guid.NewGuid())).Count == 0, "native absent enumeration");
-                string existingName = FirstNativeTcpUdpName();
-                if (existingName != null)
-                {
-                    Assert(backend.FindByName(existingName).Count > 0, "native full restriction snapshot");
-                    Console.WriteLine("Existing TCP/UDP rule: all restriction properties read successfully.");
-                }
-            }
-            return FirewallModule.Main(new string[] { "profiles", "--no-color" });
-        }
+        if (args.Length == 1 && args[0] == "--native-detached-preflight") { return RunGatedMode(NativeDetachedPreflight); }
+        if (args.Length == 1 && args[0] == "--native-read-only") { return RunGatedMode(NativeReadOnly); }
+        if (args.Length == 1 && args[0] == "--management-read-only") { return RunGatedMode(ManagementReadOnly); }
 
         TextWriter original = Console.Out;
         using (StringWriter output = new StringWriter())
@@ -134,6 +102,9 @@ internal static class FirewallRegressionTests
                 Assessment();
                 NullVersusEmptyCodec();
                 AddFailureAttribution();
+                ManagementActionCodec();
+                ManagementReadbackClassification();
+                ManagementEscapeWql();
 #if FIREWALL_TEST_STUBS
                 EtwFailure();
 #endif
@@ -142,8 +113,114 @@ internal static class FirewallRegressionTests
                 Console.WriteLine("Firewall regression tests passed: " + assertions + " assertions; no native mutations.");
                 return 0;
             }
+            catch (Exception error)
+            {
+                // Without this, a failing Assert's InvalidOperationException propagates out of Main
+                // uncaught: the CLR prints only a raw exit code, and Build.ps1 reports just
+                // "Test failed: Firewall.RegressionTests.exe (<code>)" with no assertion name -- the
+                // same unreadable-crash problem RunGatedMode fixes for the -Integration-only modes,
+                // but for the default -Test suite everyone actually runs. Print what was buffered
+                // (this suite's own console output up to the failure point) plus the assertion name.
+                Console.Error.WriteLine(output.ToString());
+                Console.Error.WriteLine("FAILED (" + error.GetType().Name + "): " + error.Message);
+                return 1;
+            }
             finally { Console.SetOut(original); }
         }
+    }
+
+    // -Integration gated modes below construct a real com/native/management backend and can fail
+    // for reasons other than a plain Assert (a genuine WMI/COM error, a thrown FirewallRefusalException,
+    // etc.). Run them through this wrapper so a failure prints what actually went wrong instead of the
+    // bare CLR crash dump ("Exception.ToString() failed", exit 0xE0434352, no diagnostic text) these
+    // standalone-exe entry points would otherwise produce.
+    private static int RunGatedMode(Func<int> mode)
+    {
+        try { return mode(); }
+        catch (Exception error)
+        {
+            Console.Error.WriteLine("FAILED (" + error.GetType().Name + "): " + error.Message);
+            return 1;
+        }
+    }
+
+    private static int NativeDetachedPreflight()
+    {
+        foreach (int protocol in new int[] { 6, 17 })
+        {
+            FirewallOptions options = AddOptions();
+            options.Id = Guid.NewGuid();
+            options.Protocol = protocol;
+            options.RemoteAddress = protocol == 6 ? "192.0.2.15" : "2001:db8::1";
+            options.Direction = protocol == 6 ? 2 : 1;
+            options.Action = protocol == 6 ? 0 : 1;
+            options.LocalPort = protocol == 6 ? 0 : 12345;
+            options.RemotePort = protocol == 6 ? 443 : 0;
+            options.Program = protocol == 6 ? "" : @"C:\Windows\System32\notepad.exe";
+            using (IFirewallBackend backend = new ComFirewallBackend())
+            {
+                Assert(backend.FindByName(options.RuleName).Count == 0, "detached name initially absent");
+                backend.PrepareAdd(FirewallModule.ExpectedRule(options, 1));
+                Assert(backend.FindByName(options.RuleName).Count == 0, "detached preparation never persists");
+            }
+        }
+        Console.WriteLine("Detached TCP/UDP rule preparation verified; Rules.Add/Remove were never called.");
+        return 0;
+    }
+
+    private static int NativeReadOnly()
+    {
+        ConsoleUi.Configure(false, true);
+        using (IFirewallBackend backend = new ComFirewallBackend())
+        {
+            Assert(backend.FindByName(FirewallModule.NameFor(Guid.NewGuid())).Count == 0, "native absent enumeration");
+            string existingName = FirstNativeTcpUdpName();
+            if (existingName != null)
+            {
+                Assert(backend.FindByName(existingName).Count > 0, "native full restriction snapshot");
+                Console.WriteLine("Existing TCP/UDP rule: all restriction properties read successfully.");
+            }
+        }
+        return FirewallModule.Main(new string[] { "profiles", "--no-color" });
+    }
+
+    private static int ManagementReadOnly()
+    {
+        ConsoleUi.Configure(false, true);
+        using (IFirewallBackend backend = new ManagementFirewallBackend())
+        {
+            Assert(backend.FindByName(FirewallModule.NameFor(Guid.NewGuid())).Count == 0, "management absent enumeration");
+            bool verified = false;
+            foreach (string existingName in CandidateRealRuleElementNames(25))
+            {
+                IList<FirewallRuleData> matches;
+                try { matches = backend.FindByName(existingName); }
+                catch (FirewallReadbackUnsupportedException)
+                {
+                    // A rule shape this transport's readback deliberately refuses to decode
+                    // (e.g. an interface-alias/interface-type/action-value restriction) -- try
+                    // the next candidate rather than letting enumeration order make this test
+                    // flaky. Anything else (including a plain FirewallRefusalException) is not
+                    // caught here and fails the test loudly.
+                    continue;
+                }
+                // existingName was just read from this exact MSFT_NetFirewallRule.ElementName, so
+                // a lookup by that same name returning zero rows can only mean the ElementName-
+                // keyed lookup itself is broken (e.g. a regression back to querying by
+                // InstanceID) -- this must never be treated as "try the next candidate".
+                Assert(matches.Count > 0, "management full restriction snapshot via ElementName: " + existingName);
+                Console.WriteLine("Existing rule: ElementName-keyed lookup and full filter-association readback succeeded.");
+                verified = true;
+                break;
+            }
+            if (!verified)
+            {
+                Console.WriteLine("No readable pre-existing rule found among the first candidates " +
+                    "(all were unsupported shapes); management full snapshot probe skipped.");
+            }
+        }
+        ManagementIdentityKey();
+        return FirewallModule.Main(new string[] { "profiles", "--transport", "management", "--no-color" });
     }
 
     private static string FirstNativeTcpUdpName()
@@ -196,6 +273,60 @@ internal static class FirewallRegressionTests
     private static object NativeGet(object target, string name)
     {
         return target.GetType().InvokeMember(name, System.Reflection.BindingFlags.GetProperty, null, target, new object[0]);
+    }
+
+    // WQL enumeration order is not guaranteed stable across hosts/OS builds, and some pre-existing
+    // rules (e.g. from third-party VPN/security software) can carry an interface-type or interface-
+    // alias restriction ReadRule() deliberately refuses to decode (see its "Unsupported ... restriction"
+    // refusals). Returns several candidate names rather than just the first, so the caller can skip
+    // past rule shapes this transport doesn't support without the test becoming host-dependent.
+    private static IList<string> CandidateRealRuleElementNames(int limit)
+    {
+        List<string> names = new List<string>();
+        ManagementScope scope = new ManagementScope(@"\\.\root\StandardCimv2");
+        scope.Connect();
+        using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(scope,
+            new ObjectQuery("SELECT ElementName FROM MSFT_NetFirewallRule")))
+        using (ManagementObjectCollection results = searcher.Get())
+        {
+            foreach (ManagementObject rule in results)
+            {
+                using (rule)
+                {
+                    string name = (string)rule["ElementName"];
+                    if (!string.IsNullOrEmpty(name)) { names.Add(name); }
+                }
+                if (names.Count >= limit) { break; }
+            }
+        }
+        return names;
+    }
+
+    // Pins the exact bug found in live cross-transport testing: a rule created outside management's
+    // own Add() (e.g. com/native's HNetCfg.FWRule) gets an opaque provider-generated InstanceID, with
+    // its real ownership name only ever in ElementName. ReadDirectProperties/ReadRule must key off
+    // ElementName, never InstanceID -- otherwise FindByName/Remove silently miss such rules, and
+    // Remove misreports "already absent" without ever deleting the live rule. Builds a detached
+    // (never-Put) instance so this never touches persisted state.
+    private static void ManagementIdentityKey()
+    {
+        ManagementScope scope = new ManagementScope(@"\\.\root\StandardCimv2");
+        scope.Connect();
+        using (ManagementClass ruleClass = new ManagementClass(scope, new ManagementPath("MSFT_NetFirewallRule"), null))
+        using (ManagementObject detached = ruleClass.CreateInstance())
+        {
+            detached["InstanceID"] = "decoy-instance-id-must-never-be-read-as-name";
+            detached["ElementName"] = "WinTraceForge.Firewall.identity-key-test";
+            detached["Description"] = "";
+            detached["RuleGroup"] = "";
+            detached["Enabled"] = (ushort)1;
+            detached["Direction"] = (ushort)2;
+            detached["Action"] = (ushort)2;
+            detached["Profiles"] = (ushort)1;
+            FirewallRuleData read = (FirewallRuleData)ManagementPrivate("ReadDirectProperties", detached);
+            Assert(read.Name == "WinTraceForge.Firewall.identity-key-test", "management identity keys off ElementName");
+            Assert(read.Name != "decoy-instance-id-must-never-be-read-as-name", "management never reads InstanceID as Name");
+        }
     }
 
     private static FirewallOptions AddOptions()
@@ -260,7 +391,6 @@ internal static class FirewallRegressionTests
         Bad("profiles", "--unknown");
         Bad("profiles", "--transport");
         Bad("profiles", "--transport", "cim");
-        Bad("profiles", "--transport", "management");
         Bad("profiles", "--transport", "wmi");
         Bad("profiles", "--transport", "native", "--TRANSPORT", "com");
         Bad("rule", "check", "--id", Id, "--transport", "invalid");
@@ -288,7 +418,7 @@ internal static class FirewallRegressionTests
 
     private static void TransportSelection()
     {
-        foreach (string transport in new[] { "com", "native" })
+        foreach (string transport in new[] { "com", "native", "management" })
         {
             FirewallOptions options = FirewallModule.Parse(new[] { "profiles", "--transport", transport.ToUpperInvariant() });
             Assert(options.Transport == transport, "profile transport normalized");
@@ -330,7 +460,7 @@ internal static class FirewallRegressionTests
 
     private static void DirectionalPorts()
     {
-        foreach (string transport in new[] { "com", "native" })
+        foreach (string transport in new[] { "com", "native", "management" })
         {
             foreach (string direction in new[] { "in", "out" })
             {
@@ -636,6 +766,80 @@ internal static class FirewallRegressionTests
             evidence.Outcome.Contains("HRESULT 0x80070057"), "Add failure keeps stage and exact HRESULT");
         Assert(evidence.Outcome.IndexOf("preparation", StringComparison.OrdinalIgnoreCase) < 0 &&
             evidence.Outcome.IndexOf("readback", StringComparison.OrdinalIgnoreCase) < 0, "Add failure not reported as preparation/readback");
+    }
+
+    private static object ManagementPrivate(string method, params object[] arguments)
+    {
+        const BindingFlags flags = BindingFlags.Static | BindingFlags.NonPublic;
+        try { return typeof(ManagementFirewallBackend).GetMethod(method, flags).Invoke(null, arguments); }
+        catch (TargetInvocationException error) { throw error.InnerException; }
+    }
+
+    // Pins the exact accepted/rejected set for MSFT_NetFirewallRule.Action's live ValueMap {2, 3, 4}
+    // (0 is a NetSecurity.Action value that applies only to profile-level default actions, not to a
+    // rule's own Action) so a future edit to this mapping cannot silently regress without a test
+    // noticing. Construction alone; never touches real Windows Firewall state.
+    private static void ManagementActionCodec()
+    {
+        Assert((int)ManagementPrivate("RuleActionFromRaw", 2) == 1, "management Action 2 (Allow) decodes to 1");
+        Assert((int)ManagementPrivate("RuleActionFromRaw", 4) == 0, "management Action 4 (Block) decodes to 0");
+        Assert((int)ManagementPrivate("RuleActionToRaw", 1) == 2, "management Allow(1) encodes to Action 2");
+        Assert((int)ManagementPrivate("RuleActionToRaw", 0) == 4, "management Block(0) encodes to Action 4");
+        // Raw 3 is the one Action value the --management-read-only candidate loop is allowed to skip
+        // past (see FirewallReadbackUnsupportedException; the loop also skips a few other rule shapes
+        // -- interface type, interface alias, protocol, multi-value filters -- pinned separately below
+        // in ManagementReadbackClassification). Pinning Action's exact type here means a future change
+        // that reclassifies any of 0/1/5/999 the same way would be caught here, not silently by that
+        // loop skipping a real rule it should have failed on.
+        AssertThrowsExactType("RuleActionFromRaw", 3, typeof(FirewallReadbackUnsupportedException),
+            "management Action 3 is the readback-unsupported subtype, not a plain refusal");
+        foreach (int raw in new[] { 0, 1, 5, 999 })
+        {
+            AssertThrowsExactType("RuleActionFromRaw", raw, typeof(FirewallRefusalException),
+                "management Action " + raw + " is a plain refusal, not the readback-unsupported subtype");
+        }
+    }
+
+    // Extends the Action pinning above to the other refusal sites the --management-read-only
+    // candidate loop treats as skip-worthy (RuleEnabledFromRaw, ProtocolNumber, FirstOrAny,
+    // ReadStringArray), so a future change that moves a "must fail" refusal to the skippable
+    // subtype -- or vice versa -- is caught here rather than only surfacing as that loop silently
+    // skipping a readback it should have failed on. RequireOne's "Expected exactly one ..." refusal
+    // (the invariant that a rule has exactly one of each MSFT_Net*Filter kind) is deliberately left
+    // unpinned here: it takes a live ManagementObjectCollection with a contrived 0-or-2+-count shape
+    // to exercise, which construction-only testing cannot produce; it must always stay a plain
+    // FirewallRefusalException; never the readback-unsupported subtype, since finding zero or more
+    // than one of a filter kind is a structural anomaly, not a merely-unsupported valid rule shape.
+    private static void ManagementReadbackClassification()
+    {
+        AssertThrowsExactType("RuleEnabledFromRaw", 0, typeof(FirewallRefusalException),
+            "management Enabled=0 is a plain refusal, not the readback-unsupported subtype");
+        AssertThrowsExactType("ReadStringArray", 123, typeof(FirewallRefusalException),
+            "management an unexpected filter array type is a plain refusal, not the readback-unsupported subtype");
+        AssertThrowsExactType("ProtocolNumber", "ICMPv4", typeof(FirewallReadbackUnsupportedException),
+            "management an unrecognized readback protocol is the readback-unsupported subtype");
+        AssertThrowsExactType("FirstOrAny", new[] { "a", "b" }, typeof(FirewallReadbackUnsupportedException),
+            "management a multi-value filter is the readback-unsupported subtype");
+    }
+
+    private static void AssertThrowsExactType(string method, object argument, Type expected, string name)
+    {
+        try { ManagementPrivate(method, argument); }
+        catch (FirewallRefusalException error)
+        {
+            Assert(error.GetType() == expected, name + " (was " + error.GetType().Name + ")");
+            return;
+        }
+        Assert(false, name + " (nothing was thrown)");
+    }
+
+    // Production rule names (WinTraceForge.Firewall.<guid>) never contain \ or ', so this never
+    // affects user-visible behavior; it guards the general-purpose WQL escape --management-read-only's
+    // real-rule candidate loop depends on (some pre-existing rule names, e.g. from firewallapi.dll,
+    // contain \, which WQL treats as an escape character).
+    private static void ManagementEscapeWql()
+    {
+        Assert((string)ManagementPrivate("EscapeWql", "a\\b'c") == "a\\\\b''c", "management WQL escaping handles backslash and quote");
     }
 
 #if FIREWALL_TEST_STUBS

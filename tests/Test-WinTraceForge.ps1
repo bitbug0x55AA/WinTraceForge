@@ -145,16 +145,22 @@ Test-Command 'firewall profiles --telemetry etw --telemetry-wait 0 --no-color' @
     'ETW CAPTURE SETUP', 'Provider: Microsoft-Windows-Windows Firewall With Advanced Security'
 ) | Out-Null
 $profileSnapshots = @{}
-foreach ($transport in @('com', 'native')) {
+foreach ($transport in @('com', 'native', 'management')) {
     $result = Test-Command "firewall profiles --transport $transport --no-color" 0 @(
         "Transport $transport", 'FIREWALL_PROFILES_READ', 'Domain', 'Private', 'Public'
     )
     $start = $result.IndexOf('FIREWALL PROFILES (READ-ONLY)')
     $end = $result.IndexOf('ASSESSMENT', $start)
     $profileSnapshots[$transport] = $result.Substring($start, $end - $start)
-    Test-Command "firewall rule check --id $id --transport $transport --no-color" 3 @(
+    if ($transport -eq 'management' -and $result.Contains('MSFT_NetFirewallRule')) {
+        throw 'management profiles Route overclaims MSFT_NetFirewallRule; profiles never queries that class.'
+    }
+    $checkResult = Test-Command "firewall rule check --id $id --transport $transport --no-color" 3 @(
         "Transport $transport", 'FIREWALL_RULE_UNCONFIRMED', "remove --id $id --transport $transport"
-    ) | Out-Null
+    )
+    if ($transport -eq 'management' -and -not $checkResult.Contains('MSFT_NetFirewallRule')) {
+        throw 'management rule check Route is missing the MSFT_NetFirewallRule class it actually queries.'
+    }
     Test-Command "firewall profiles --transport $transport --telemetry eventlog --telemetry-wait 0 --no-color" 0 @(
         'Microsoft-Windows-Windows Firewall With Advanced Security/Firewall'
     ) | Out-Null
@@ -172,6 +178,9 @@ foreach ($transport in @('com', 'native')) {
 }
 if ($profileSnapshots['com'] -ne $profileSnapshots['native']) {
     throw 'COM/native profile snapshots differ; investigate policy changes or backend mapping.'
+}
+if ($profileSnapshots['com'] -ne $profileSnapshots['management']) {
+    throw 'COM/management profile snapshots differ; investigate policy changes or backend mapping.'
 }
 Test-Command 'firewall profiles --transport native --telemetry etw --telemetry-wait 0 --no-color' @(0,4) @(
     'Provider: Microsoft-Windows-Windows Firewall With Advanced Security', 'Transport native'

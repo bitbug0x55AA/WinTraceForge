@@ -239,11 +239,72 @@ Routes (supported on rule add/check/remove and profiles):
   --transport native
     C# P/Invoke -> native C++ typed SDK INetFwPolicy2 / INetFwRule3
     -> Windows Firewall
+  --transport management
+    System.Management -> WMI root\StandardCimv2 MSFT_NetFirewallRule
+    -> Windows Firewall
 The native DLL performs policy/rule enumeration, property access, detached
 rule preparation and Add/Remove; it does not delegate these to C# reflection.
-Both use the same Windows Firewall COM management interfaces and ownership
-schema. This compares caller implementations, not different policy engines.
-It is not a WFP API test, privilege bypass or proof of different detection.
+com and native use the same Windows Firewall COM management interfaces and
+ownership schema; management targets the separate WMI Firewall provider
+PowerShell's New-NetFirewallRule/NetSecurity module wraps (MSFT_NetFirewallRule
+plus its per-rule MSFT_Net*Filter associations). All three read/write the
+same persisted rule store and share the same ownership schema and readback
+comparison (FirewallModule.Mismatches), so a rule added by one transport can
+be checked/removed with any other. This compares caller implementations, not
+different policy engines. It is not a WFP API test, privilege bypass or proof
+of different detection.
+
+MSFT_NetFirewallRule does not expose address/port/program/service scoping as
+flat instance properties the way INetFwRule3 does; the provider derives the
+per-rule filter associations from named values passed through the WMI call
+context at Put() time (the documented "Firewall WMI Provider Extended
+Syntax"). Because those filter instances do not exist until a real Put()
+persists them, management's PrepareAdd can only pre-validate the rule's
+direct properties (name/group/description/enabled/direction/action/profiles)
+before Add; full attribute verification, including address/port/program,
+relies on the shared post-Add Verify() readback every transport already goes
+through. management always creates rules with no interface, local/remote-user
+or remote-machine restriction and edge traversal Block, matching the fixed
+defaults com/native use, and reports LocalPolicyModifyState from the
+WindowsFirewall Group Policy registry keys (AllowLocalPolicyMerge /
+AllowLocalIPsecPolicyMerge) since MSFT_NetFirewallRule/-Profile expose no
+direct equivalent to INetFwPolicy2.LocalPolicyModifyState; it never reports
+2 (INBOUND_BLOCKED).
+
+management looks a rule up by ElementName, never InstanceID. A rule created
+through com/native's HNetCfg.FWRule gets an opaque, provider-generated
+InstanceID (confirmed live, e.g. {7310AAE3-...}), with the netfw Name property
+surfaced only in ElementName; querying by InstanceID silently finds zero rows
+for such a rule. Add leaves InstanceID unset (matching New-NetFirewallRule's
+own optional-InstanceID behavior) instead of assigning it, so a
+management-created rule's identity behaves like every other rule rather than
+depending on a caller-supplied key being honored. One consequence: Put's
+CreateOnly option only rejects a literal InstanceID collision, so with
+InstanceID left unset it no longer guards against two rules sharing an
+ElementName; duplicate-name protection rests entirely on the same
+non-atomic, application-level baseline/preflight checks com/native already
+use. Verified live in both write directions (management-created rules read
+and removed via com/native, and com/native-created rules read and removed
+via management), with no rule left behind in either direction.
+
+management's rule readback refuses (FirewallReadbackUnsupportedException)
+rather than silently reports a rule whose MSFT_NetNetworkLayerSecurityFilter
+sets Authentication, Encryption, or OverrideBlockRules: this transport never
+sets those when creating a rule (SecureFlags always reads back as 0), so a
+rule that actually requires them would otherwise show a false, unrestricted
+security state on check and could mask a real mismatch after Add.
+
+management's profiles command explicitly queries MSFT_NetFirewallProfile with
+PolicyStore=ActiveStore rather than the default (unspecified) store, which is
+the local/persistent configuration, not the GPO-merged effective policy --
+confirmed live: on a domain-managed host, the default query returned
+DefaultInboundAction/AllowInboundRules as NotConfigured while an explicit
+ActiveStore query resolved the same profile to the real effective values.
+INetFwPolicy2 (com/native) always reports the effective policy; reading the
+default store here would have silently diverged from com/native on any
+GPO-managed host, even though the built-in-default fallback this module still
+carries (for the tri-state values ActiveStore itself should never actually
+return) happened to coincide with an unmanaged host's real values.
 
 Optional-property construction:
   Protocol is set before any explicitly requested port restriction.
@@ -267,14 +328,13 @@ HRESULT once. Never retry a failed mutation through another route implicitly.
 No automatic transport fallback is performed. A missing, wrong-architecture
 or outdated native DLL is an explicit operation failure; com is not tried.
 Keep the matching x64 DLL from this package next to the EXE. Firewall com
-does not require the DLL unless --telemetry etw is selected.
---transport management/cim/wmi is not implemented for Firewall and is rejected.
-CIM requires a separate MSFT_NetFirewallRule/filter/operation-option mapping;
-it is not an alias for either COM route or Defender's WMI implementation.
+and management do not require the DLL unless --telemetry etw is selected.
+--transport cim/wmi are not recognized aliases for management and are rejected.
 
 Read-only comparison:
   wtf.exe firewall profiles --transport com
   wtf.exe firewall profiles --transport native
+  wtf.exe firewall profiles --transport management
 
 Use a unique GUID per authorized test and retain it for cleanup. For example:
   wtf.exe firewall rule add --id 8dd2c54c-d2b2-4b2a-9880-2ae82a9e2bd9 --direction out --action block --protocol tcp --remote-address 192.0.2.10 --remote-port 44443 --profiles private
