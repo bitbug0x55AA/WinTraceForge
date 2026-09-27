@@ -2,7 +2,11 @@
 
 > **Same change. Different paths. Interesting silence.**
 
-WinTraceForge is a Windows x64 defense-control test harness. It checks or makes narrowly scoped Microsoft Defender Antivirus, Attack Surface Reduction (ASR), and Windows Firewall changes through different execution paths, captures local evidence, and gives you a repeatable window to compare with your EDR/SIEM telemetry and alerts.
+WinTraceForge is an extensible Windows x64 defense-control test harness for exploring how Windows security controls behave and how their operations appear in telemetry. It provides a repeatable way to inspect configuration, exercise controlled changes through different execution paths, capture local evidence, and compare the results with your EDR/SIEM telemetry and alerts.
+
+Control modules share an operation lifecycle, verification and restoration contracts, and evidence collection. This structure supports adding more control families and execution paths as the project grows.
+
+Currently implemented modules:
 
 | Control | What you can do |
 | --- | --- |
@@ -10,14 +14,14 @@ WinTraceForge is a Windows x64 defense-control test harness. It checks or makes 
 | Attack Surface Reduction | Inspect posture, check or change exclusions and rule actions, and run an experimental behavioral test. |
 | Windows Firewall | Inspect profiles and add, check, or remove uniquely marked test rules. |
 
-Select managed WMI, COM, or native execution paths and collect existing Event Log records or raw ETW traces. WinTraceForge collects host-side evidence; a missing alert is an observation, not a bypass claim. It does not query your EDR/SIEM, generate test traffic, or disable the firewall.
+Available execution paths include managed WMI, COM, and native interfaces, depending on the module. Collect existing Event Log records or raw ETW traces, then compare that host-side evidence with your detection stack. A missing alert is an observation, not a bypass claim; configuration readback alone does not prove enforcement or detection.
 
 > [!WARNING]
-> Use only in an authorized test environment. Defender and ASR policy changes persist until manually restored. Firewall test rules require removal using the printed cleanup command and test ID. ASR behavioral verification is experimental and cannot confirm enforcement from local process observation alone.
+> Run only on systems where you are authorized to test and modify security controls. Tests can change protection settings, affect system behavior, and leave persistent changes or artifacts, including after a failed or interrupted run. Review the selected module's effects and limitations, capture the baseline, and establish a restoration plan before making changes. Do not assume automatic rollback: follow the module's cleanup guidance and verify the resulting state. Treat collected telemetry as sensitive evidence.
 
 ## Install
 
-Requires Windows x64, .NET Framework 4.8+, and the relevant Defender Antivirus / Windows Firewall services. Policy writes require administrator rights; read-only checks can run without elevation, though some data may be hidden. ETW capture commonly requires elevation.
+Requires Windows x64, .NET Framework 4.8+, and the Windows services/providers used by the selected module. Current policy writes require administrator rights; read-only checks can run without elevation, though some data may be hidden. ETW capture commonly requires elevation. See the [user docs](docs/user/README.md) for module-specific requirements and limitations.
 
 Download the Windows x64 ZIP and accompanying SHA-256 file from [GitHub Releases](https://github.com/bitbug0x55AA/WinTraceForge/releases), verify the checksum, and extract it. Keep `wtf.exe` and the matching `WinTraceForge.Native.dll` together. See [installation and verification](docs/user/installation.md) for the exact verification steps.
 
