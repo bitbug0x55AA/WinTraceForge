@@ -3,10 +3,12 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Management;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Xml;
 using System.Text.RegularExpressions;
 using Microsoft.Win32.SafeHandles;
@@ -40,6 +42,14 @@ internal static class RegressionTests
         CheckAsrBuiltInPrimitive();
         CheckAsrCleanupUnverifiableLabel();
         CheckConsoleLayout();
+        CheckPowerShellTransportChannel();
+        CheckPowerShellReadScriptSemantics();
+        CheckPowerShellModulePathRestriction();
+        CheckPowerShellClassifyAddResult();
+        CheckPowerShellOversizedRequestFailsAtPrepare();
+        CheckPowerShellProcessStartInfoHardening();
+        CheckPowerShellReadScriptIntegerFieldCast();
+        CheckUnpairedSurrogateDetection();
         object[] zeroStatuses = { (uint)0, 0, (long)0, (ulong)0, (short)0,
             (ushort)0, (byte)0, (sbyte)0, "0" };
         foreach (object status in zeroStatuses)
@@ -108,13 +118,35 @@ internal static class RegressionTests
         DefenderModule.Options etw = DefenderModule.ParseArguments(new[] { "--check", "--telemetry", "ETW", "--telemetry-wait", "0" });
         Assert(etw.CollectEtw && !etw.CollectEventLog, "Raw ETW is a distinct backend");
         Assert(etw.TelemetryWaitSeconds == 0, "ETW tail can be disabled");
-        foreach (string transport in new[] { "management", "com", "native" })
+        foreach (string transport in new[] { "management", "com", "native", "powershell" })
         {
             Assert(DefenderModule.ParseArguments(new[] { "--transport", transport, "--check" }).Transport == transport,
                 "Select transport: " + transport);
             Assert(DefenderModule.ParseArguments(new[] { "-ExclusionPath", "C:\\Lab", "--transport", transport }).Transport == transport,
                 "Select transport after values: " + transport);
         }
+
+        // Construction alone never connects to WMI, so this is safe to assert without -Integration:
+        // catches a transposed case in CreateBackend's switch (e.g. "com" silently mapped to
+        // management), the same check ASR's expectedBackendTypes already performs (N4).
+        var expectedDefenderBackendTypes = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            { "management", "ManagementBackend" }, { "com", "ComBackend" }, { "native", "NativeBackend" },
+            { "powershell", "PowerShellBackend" }
+        };
+        foreach (var expected in expectedDefenderBackendTypes)
+        {
+            using (DefenderModule.IPreferenceBackend backend = DefenderModule.CreateBackend(expected.Key))
+            {
+                Assert(backend.GetType().Name == expected.Value,
+                    "Defender CreateBackend maps " + expected.Key + " to " + expected.Value);
+            }
+        }
+        bool rejectedUnknownTransport = false;
+        try { DefenderModule.CreateBackend("unknown"); }
+        catch (InvalidOperationException) { rejectedUnknownTransport = true; }
+        Assert(rejectedUnknownTransport, "Defender CreateBackend has no silent fallback for an unrecognized transport");
+
         Assert(DefenderModule.ParseArguments(new[] { "--TRANSPORT", "NATIVE", "--check" }).Transport == "native",
             "Transport case insensitive");
 
@@ -508,16 +540,17 @@ internal static class RegressionTests
             });
     }
 
-    // -Integration only: exercises every real ASR backend against live WMI to prove the CimType
-    // gate (B1) actually accepts a real Prepare(RuleAction) call end to end on each transport. Add
-    // is never invoked, so no Defender setting is touched; this only proves the request would be accepted.
-    // Also reads a real baseline through all three and asserts the snapshots agree as sets (order-
-    // and case-insensitive, not byte-for-byte), so a future BuildSnapshot/decoder regression that
-    // only breaks com or native cannot pass silently.
+    // -Integration only: exercises every real ASR backend against live WMI (or, for powershell,
+    // against Add-MpPreference/Get-MpPreference) to prove the CimType gate (B1) actually accepts a
+    // real Prepare(RuleAction) call end to end on each transport. Add is never invoked, so no
+    // Defender setting is touched; this only proves the request would be accepted. Also reads a real
+    // baseline through all four and asserts the snapshots agree as sets (order- and case-insensitive,
+    // not byte-for-byte), so a future BuildSnapshot/decoder regression that only breaks one transport
+    // cannot pass silently.
     private static void RunAsrReadOnlyIntegrationCheck()
     {
-        AsrSnapshot[] snapshots = new AsrSnapshot[3];
-        string[] transports = { "management", "com", "native" };
+        AsrSnapshot[] snapshots = new AsrSnapshot[4];
+        string[] transports = { "management", "com", "native", "powershell" };
         for (int i = 0; i < transports.Length; i++)
         {
             using (IAsrBackend backend = AsrModule.CreateBackend(transports[i]))
@@ -539,7 +572,7 @@ internal static class RegressionTests
             Assert(AsrSnapshotsEqual(snapshots[0], snapshots[i]),
                 "ASR Read() snapshot equal across transports: management vs " + transports[i]);
         }
-        Console.WriteLine("PASS: real management/com/native ASR Read() produced identical snapshots against live WMI.");
+        Console.WriteLine("PASS: real management/com/native/powershell ASR Read() produced identical snapshots.");
 
         RunNativeSetterTypeGateIntegrationCheck();
     }
@@ -636,7 +669,7 @@ internal static class RegressionTests
             "ASR exclusion check parse");
         Assert(check.Transport == "management", "ASR default transport preserved");
 
-        foreach (string transport in new[] { "management", "com", "native" })
+        foreach (string transport in new[] { "management", "com", "native", "powershell" })
         {
             Assert(AsrModule.Parse(new[] { "exclusion", "--transport", transport, "--check", "-Path", @"C:\Lab" }).Transport == transport,
                 "ASR select transport: " + transport);
@@ -648,7 +681,8 @@ internal static class RegressionTests
         // catches a transposed case in CreateBackend's switch (e.g. "com" silently mapped to management).
         var expectedBackendTypes = new Dictionary<string, string>(StringComparer.Ordinal)
         {
-            { "management", "ManagementAsrBackend" }, { "com", "ComAsrBackend" }, { "native", "NativeAsrBackend" }
+            { "management", "ManagementAsrBackend" }, { "com", "ComAsrBackend" }, { "native", "NativeAsrBackend" },
+            { "powershell", "PowerShellAsrBackend" }
         };
         foreach (var expected in expectedBackendTypes)
         {
@@ -1445,7 +1479,7 @@ internal static class RegressionTests
             {
                 Console.SetOut(output);
                 Console.SetError(error);
-                foreach (string transport in new[] { "management", "com", "native" })
+                foreach (string transport in new[] { "management", "com", "native", "powershell" })
                 {
                     DefenderModule.Options options = DefenderModule.ParseArguments(new[]
                     {
@@ -1681,6 +1715,344 @@ internal static class RegressionTests
                 Console.SetError(originalError);
             }
         }
+    }
+
+    // Exercises the powershell transport's shared plumbing (DefenderModule.PowerShellRunner) against
+    // a real powershell.exe, but never touches Defender/MSFT_MpPreference: every script here is
+    // self-contained. This runs unconditionally (no -Integration/-asr-read-only gate needed) and is
+    // the required regression for: B1 (a value crossing the Base64 channel corrupted or split into
+    // multiple values), B3 (a bare "powershell.exe" name instead of an absolute path), and N1 (a bare
+    // nonzero exit code must not itself be treated as failure).
+    private static void CheckPowerShellTransportChannel()
+    {
+        Assert(string.Equals(DefenderModule.PowerShellRunner.PowerShellExecutablePath,
+            Path.Combine(Environment.SystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe"),
+            StringComparison.OrdinalIgnoreCase) && Path.IsPathRooted(DefenderModule.PowerShellRunner.PowerShellExecutablePath),
+            "PowerShell transport resolves an absolute System32 path, not a bare 'powershell.exe' name (B3)");
+
+        string marker = Guid.NewGuid().ToString("N");
+        // Real exclusion values can never actually be empty (AddValue/-Path reject empty and
+        // whitespace-only input), so an empty string is intentionally not included here.
+        var trickyValues = new List<string>
+        {
+            "C:\\Lab\\\u4e2d\u6587\\caf\u00e9", "it's", "a$test", "  leading and trailing space  ",
+            "line1\r\nline2", "embedded\u0000null"
+        };
+        var roundTripScript = new StringBuilder();
+        roundTripScript.Append("$values = " + DefenderModule.PowerShellRunner.EncodeValuesExpression(trickyValues) + "\r\n");
+        roundTripScript.Append("Write-Output ('WTF_BEGIN_" + marker + ":Values')\r\n");
+        roundTripScript.Append("foreach ($v in $values) { Write-Output ([Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($v))) }\r\n");
+        roundTripScript.Append("Write-Output ('WTF_END_" + marker + ":Values')\r\n");
+        roundTripScript.Append("Write-Output 'WTF_TEST_OK'\r\n");
+
+        DefenderModule.PowerShellRunner.Result roundTripResult = DefenderModule.PowerShellRunner.RunScript(roundTripScript.ToString());
+        Assert(roundTripResult.ExitCode == 0, "PowerShell value round-trip script exits 0");
+        Assert(DefenderModule.PowerShellRunner.ContainsMarker(roundTripResult.Stdout, "WTF_TEST_OK"),
+            "PowerShell value round-trip script reaches its own success marker");
+        List<string> roundTripped = DefenderModule.PowerShellRunner.ParseFields(
+            roundTripResult.Stdout, marker, new[] { "Values" })["Values"];
+        Assert(roundTripped.Count == trickyValues.Count,
+            "PowerShell value channel preserves value count (a value with an embedded \\r\\n must not split into extra entries)");
+        for (int i = 0; i < trickyValues.Count && i < roundTripped.Count; i++)
+        {
+            Assert(roundTripped[i] == trickyValues[i],
+                "PowerShell value channel round-trips value " + i + " byte-for-byte (Unicode/quote/$/embedded-newline safe)");
+        }
+
+        // A script that never reaches its own success marker (whether it exits non-zero after an
+        // explicit throw, or exits non-zero with no marker at all, simulating an external process
+        // kill) must be distinguishable from one that never even got that far cleanly -- RunScript
+        // itself must not throw in either case, since callers (Add vs. Read/Connect) each decide
+        // differently what an unmarked failure means.
+        var explicitFailureScript = new StringBuilder();
+        explicitFailureScript.Append("$ErrorActionPreference = 'Stop'\r\n");
+        explicitFailureScript.Append("try {\r\n");
+        explicitFailureScript.Append("    throw 'simulated failure'\r\n");
+        explicitFailureScript.Append("    Write-Output 'WTF_TEST_OK'\r\n");
+        explicitFailureScript.Append("} catch {\r\n");
+        explicitFailureScript.Append(DefenderModule.PowerShellRunner.EmitErrorMarkerStatement("WTF_TEST_ERROR:"));
+        explicitFailureScript.Append("    exit 1\r\n");
+        explicitFailureScript.Append("}\r\n");
+        DefenderModule.PowerShellRunner.Result explicitFailureResult =
+            DefenderModule.PowerShellRunner.RunScript(explicitFailureScript.ToString());
+        Assert(explicitFailureResult.ExitCode == 1, "A script that explicitly throws exits non-zero");
+        Assert(!DefenderModule.PowerShellRunner.ContainsMarker(explicitFailureResult.Stdout, "WTF_TEST_OK"),
+            "A script that explicitly throws never reaches its success marker");
+        Assert(DefenderModule.PowerShellRunner.FindMarkerMessage(explicitFailureResult.Stdout, "WTF_TEST_ERROR:") == "simulated failure",
+            "RunScript/FindMarkerMessage recovers the exact (Base64-carried) exception message");
+
+        DefenderModule.PowerShellRunner.Result ambiguousResult = DefenderModule.PowerShellRunner.RunScript("exit 17\r\n");
+        Assert(ambiguousResult.ExitCode == 17, "RunScript reports a bare nonzero exit code without throwing (N1)");
+        Assert(!DefenderModule.PowerShellRunner.ContainsMarker(ambiguousResult.Stdout, "WTF_TEST_OK") &&
+            DefenderModule.PowerShellRunner.FindMarkerMessage(ambiguousResult.Stdout, "WTF_TEST_ERROR:") == null,
+            "A bare nonzero exit with no marker at all is distinguishable from an explicit error marker");
+
+        var successScript = new StringBuilder();
+        successScript.Append("$ErrorActionPreference = 'Stop'\r\n");
+        successScript.Append("try { Write-Output 'WTF_TEST_OK' } catch {\r\n");
+        successScript.Append(DefenderModule.PowerShellRunner.EmitErrorMarkerStatement("WTF_TEST_ERROR:"));
+        successScript.Append("    exit 1\r\n");
+        successScript.Append("}\r\n");
+        DefenderModule.PowerShellRunner.Result successResult = DefenderModule.PowerShellRunner.RunScript(successScript.ToString());
+        Assert(successResult.ExitCode == 0 && DefenderModule.PowerShellRunner.ContainsMarker(successResult.Stdout, "WTF_TEST_OK"),
+            "A script that completes normally reaches its success marker with exit 0");
+
+        Console.WriteLine("PASS: PowerShell transport channel (Base64 value round-trip, marker-based fail-loud contract) verified against real powershell.exe.");
+    }
+
+    // Exercises PowerShellRunner.BuildReadScript itself (the exact script text Defender's and ASR's
+    // Read() build and run in production) against literal [pscustomobject] fixtures, not the real
+    // Add-MpPreference/Get-MpPreference cmdlets. This is the required regression for NB1 (a
+    // single-element byte array holding the falsy value 0 -- the real AttackSurfaceReductionRules_Actions
+    // encoding of Disabled -- vanishing under a "if ($pref.Field) { foreach ... }" guard) and closes
+    // N-a (the previous round-trip test above exercised only the shared helpers, never the production
+    // Read() script's own Stop/Count==1/field-existence/WTF_READ_OK logic).
+    private static void CheckPowerShellReadScriptSemantics()
+    {
+        var idAndActionFields = new List<string> { "AttackSurfaceReductionRules_Ids", "AttackSurfaceReductionRules_Actions" };
+        var actionField = new[] { "AttackSurfaceReductionRules_Actions" };
+        const string ruleId = "11111111-1111-1111-1111-111111111111";
+
+        // NB1: a single rule configured as Disabled (the real ASRRuleActionType byte value 0) must
+        // not be dropped. Before the fix, "if ($pref.AttackSurfaceReductionRules_Actions) { foreach ... }"
+        // emitted zero Actions values here (PowerShell's truthiness of a one-element array is the
+        // truthiness of its one element), so AsrModule.BuildRuleActions saw a 1-vs-0 length mismatch
+        // and threw -- this exact scenario is what a freshly Add()-ed Disabled rule on a test machine
+        // with no other ASR rules configured hits on every subsequent status/--check/verify read.
+        string disabledSource = "[pscustomobject]@{ AttackSurfaceReductionRules_Ids = @('" + ruleId + "'); " +
+            "AttackSurfaceReductionRules_Actions = [byte[]]@(0) }";
+        string marker = Guid.NewGuid().ToString("N");
+        DefenderModule.PowerShellRunner.Result disabledResult = DefenderModule.PowerShellRunner.RunScript(
+            DefenderModule.PowerShellRunner.BuildReadScript(disabledSource, idAndActionFields, marker, actionField));
+        Assert(DefenderModule.PowerShellRunner.ContainsMarker(disabledResult.Stdout, "WTF_READ_OK"),
+            "BuildReadScript completes for a single rule whose action is the falsy byte 0 (NB1)");
+        Dictionary<string, List<string>> disabledFields =
+            DefenderModule.PowerShellRunner.ParseFields(disabledResult.Stdout, marker, idAndActionFields);
+        Assert(disabledFields["AttackSurfaceReductionRules_Ids"].Count == 1 && disabledFields["AttackSurfaceReductionRules_Actions"].Count == 1,
+            "A single Disabled (byte 0) rule action is emitted, not silently dropped (NB1)");
+        Dictionary<string, AsrAction> rules = AsrModule.BuildRuleActions(
+            disabledFields["AttackSurfaceReductionRules_Ids"].ToArray(), disabledFields["AttackSurfaceReductionRules_Actions"].ToArray());
+        Assert(rules.ContainsKey(ruleId) && rules[ruleId] == AsrAction.Disabled,
+            "BuildRuleActions decodes the surviving Disabled entry correctly, with no Ids/Actions length mismatch (NB1)");
+
+        // Control: a non-Disabled (truthy) action was never affected by the bug, but is included so a
+        // future regression that breaks the general (non-zero) case as a side effect is also caught.
+        string blockSource = "[pscustomobject]@{ AttackSurfaceReductionRules_Ids = @('" + ruleId + "'); " +
+            "AttackSurfaceReductionRules_Actions = [byte[]]@(1) }";
+        marker = Guid.NewGuid().ToString("N");
+        DefenderModule.PowerShellRunner.Result blockResult = DefenderModule.PowerShellRunner.RunScript(
+            DefenderModule.PowerShellRunner.BuildReadScript(blockSource, idAndActionFields, marker, actionField));
+        Dictionary<string, List<string>> blockFields =
+            DefenderModule.PowerShellRunner.ParseFields(blockResult.Stdout, marker, idAndActionFields);
+        Assert(blockFields["AttackSurfaceReductionRules_Actions"].Count == 1 && blockFields["AttackSurfaceReductionRules_Actions"][0] == "1",
+            "A Block (byte 1) rule action still round-trips correctly");
+
+        // N-a: the production Stop/try-catch/WTF_READ_ERROR path itself, not just the shared helpers.
+        marker = Guid.NewGuid().ToString("N");
+        DefenderModule.PowerShellRunner.Result throwingResult = DefenderModule.PowerShellRunner.RunScript(
+            DefenderModule.PowerShellRunner.BuildReadScript(
+                "(& { throw 'simulated Get-MpPreference failure' })", idAndActionFields, marker, actionField));
+        string throwingMessage = DefenderModule.PowerShellRunner.FindMarkerMessage(throwingResult.Stdout, "WTF_READ_ERROR:");
+        Assert(throwingMessage != null && throwingMessage.Contains("simulated Get-MpPreference failure") &&
+            !DefenderModule.PowerShellRunner.ContainsMarker(throwingResult.Stdout, "WTF_READ_OK"),
+            "BuildReadScript surfaces a failing data source as WTF_READ_ERROR, never WTF_READ_OK (N-a / B2)");
+
+        // N-a: zero instances (e.g. Get-MpPreference legitimately returning nothing) is rejected, not
+        // silently treated as an empty snapshot.
+        marker = Guid.NewGuid().ToString("N");
+        DefenderModule.PowerShellRunner.Result zeroInstancesResult = DefenderModule.PowerShellRunner.RunScript(
+            DefenderModule.PowerShellRunner.BuildReadScript("@()", idAndActionFields, marker, actionField));
+        Assert(!DefenderModule.PowerShellRunner.ContainsMarker(zeroInstancesResult.Stdout, "WTF_READ_OK") &&
+            DefenderModule.PowerShellRunner.FindMarkerMessage(zeroInstancesResult.Stdout, "WTF_READ_ERROR:") != null,
+            "BuildReadScript rejects zero instances rather than reading back an empty snapshot (N-a / B2 single-instance guard)");
+
+        // N-a: more than one instance is equally rejected (ambiguous, not "pick the first one").
+        marker = Guid.NewGuid().ToString("N");
+        string twoInstancesSource = "[pscustomobject]@{ AttackSurfaceReductionRules_Ids = @('" + ruleId + "'); AttackSurfaceReductionRules_Actions = [byte[]]@(0) }, " +
+            "[pscustomobject]@{ AttackSurfaceReductionRules_Ids = @('" + ruleId + "'); AttackSurfaceReductionRules_Actions = [byte[]]@(1) }";
+        DefenderModule.PowerShellRunner.Result twoInstancesResult = DefenderModule.PowerShellRunner.RunScript(
+            DefenderModule.PowerShellRunner.BuildReadScript(twoInstancesSource, idAndActionFields, marker, actionField));
+        Assert(!DefenderModule.PowerShellRunner.ContainsMarker(twoInstancesResult.Stdout, "WTF_READ_OK") &&
+            DefenderModule.PowerShellRunner.FindMarkerMessage(twoInstancesResult.Stdout, "WTF_READ_ERROR:") != null,
+            "BuildReadScript rejects more than one instance as ambiguous (N-a / B2 single-instance guard)");
+
+        // N-a: a field the source object does not actually have is a hard error, never an empty list.
+        marker = Guid.NewGuid().ToString("N");
+        string missingFieldSource = "[pscustomobject]@{ AttackSurfaceReductionRules_Ids = @('" + ruleId + "') }";
+        DefenderModule.PowerShellRunner.Result missingFieldResult = DefenderModule.PowerShellRunner.RunScript(
+            DefenderModule.PowerShellRunner.BuildReadScript(missingFieldSource, idAndActionFields, marker, actionField));
+        string missingFieldMessage = DefenderModule.PowerShellRunner.FindMarkerMessage(missingFieldResult.Stdout, "WTF_READ_ERROR:");
+        Assert(!DefenderModule.PowerShellRunner.ContainsMarker(missingFieldResult.Stdout, "WTF_READ_OK") &&
+            missingFieldMessage != null && missingFieldMessage.Contains("AttackSurfaceReductionRules_Actions"),
+            "BuildReadScript rejects a requested field the source object does not have (N-a / B2 field-existence guard)");
+
+        Console.WriteLine("PASS: PowerShell Read() script semantics (NB1 falsy single-element array, N-a fail-loud production script logic) verified against real powershell.exe.");
+    }
+
+    // NB2a: module-qualifying a call (ConfigDefender\Add-MpPreference) only guards against a
+    // same-named function/alias in the caller's own scope; it does not stop the module itself being
+    // resolved from a different, user-writable PSModulePath entry. This proves RunScript's explicit
+    // PSModulePath override actually takes effect for the child process, using a harmless fixture
+    // module rather than anything Defender-related.
+    private static void CheckPowerShellModulePathRestriction()
+    {
+        string fixtureRoot = Path.Combine(Path.GetTempPath(), "wtf-psmodule-fixture-" + Guid.NewGuid().ToString("N"));
+        string moduleDir = Path.Combine(fixtureRoot, "WtfFixtureModule");
+        Directory.CreateDirectory(moduleDir);
+        File.WriteAllText(Path.Combine(moduleDir, "WtfFixtureModule.psm1"),
+            "function Test-WtfFixtureMarker { 'FIXTURE_LOADED' }\r\nExport-ModuleMember -Function Test-WtfFixtureMarker\r\n");
+        string originalPSModulePath = Environment.GetEnvironmentVariable("PSModulePath");
+        try
+        {
+            Environment.SetEnvironmentVariable("PSModulePath", fixtureRoot + ";" + originalPSModulePath);
+
+            // Sanity control: prove the fixture is real and discoverable by an ordinary child process
+            // that inherits this test process' own (deliberately widened) environment -- otherwise the
+            // regression below would pass for the wrong reason (a broken fixture, not a real restriction).
+            var controlStart = new ProcessStartInfo("powershell.exe",
+                "-NoProfile -NonInteractive -Command \"(Get-Module -ListAvailable -Name WtfFixtureModule) -ne $null\"")
+            { UseShellExecute = false, RedirectStandardOutput = true, CreateNoWindow = true };
+            using (Process control = Process.Start(controlStart))
+            {
+                string controlOutput = control.StandardOutput.ReadToEnd().Trim();
+                control.WaitForExit();
+                Assert(string.Equals(controlOutput, "True", StringComparison.OrdinalIgnoreCase),
+                    "Fixture module is discoverable by a child process that inherits this widened PSModulePath (sanity control)");
+            }
+
+            DefenderModule.PowerShellRunner.Result result = DefenderModule.PowerShellRunner.RunScript(
+                "Write-Output ((Get-Module -ListAvailable -Name WtfFixtureModule) -ne $null)\r\nWrite-Output $env:PSModulePath\r\n");
+            var lines = new List<string>(DefenderModule.PowerShellRunner.SplitLines(result.Stdout));
+            Assert(result.ExitCode == 0 && lines.Count >= 1, "PSModulePath restriction probe script runs cleanly");
+            Assert(string.Equals(lines[0].Trim(), "False", StringComparison.OrdinalIgnoreCase),
+                "RunScript's child process cannot see a module planted on this process' own (widened) PSModulePath (NB2a)");
+            // powershell.exe's own startup widens whatever PSModulePath it is given to also include the
+            // (admin-writable-only) Program Files\WindowsPowerShell\Modules path, so exact equality to
+            // TrustedModulePath is too strict; what matters is that the fixture's user-writable entry
+            // was excluded and the trusted system directory is present.
+            string reportedModulePath = lines.Count >= 2 ? lines[1].Trim() : string.Empty;
+            Assert(reportedModulePath.IndexOf(fixtureRoot, StringComparison.OrdinalIgnoreCase) < 0,
+                "RunScript's child process PSModulePath excludes this process' own (widened) fixture entry (NB2a)");
+            Assert(reportedModulePath.IndexOf(DefenderModule.PowerShellRunner.TrustedModulePath, StringComparison.OrdinalIgnoreCase) >= 0,
+                "RunScript's child process PSModulePath includes the trusted system module directory (NB2a)");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("PSModulePath", originalPSModulePath);
+            try { Directory.Delete(fixtureRoot, true); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+        Console.WriteLine("PASS: PowerShell transport child process cannot see a module planted on a user-writable PSModulePath entry (NB2a).");
+    }
+
+    // N-c: Add()'s classification of a script result (error marker vs. success marker vs. neither)
+    // is a pure function of Result, independent of powershell.exe -- tested directly here rather than
+    // only indirectly through a live process run.
+    private static void CheckPowerShellClassifyAddResult()
+    {
+        string message;
+        var okResult = new DefenderModule.PowerShellRunner.Result(0, "WTF_ADD_OK\r\n", "");
+        Assert(DefenderModule.PowerShellRunner.ClassifyAddResult(okResult, out message) == DefenderModule.PowerShellRunner.AddOutcome.Ok && message == null,
+            "ClassifyAddResult: OK marker present -> Ok, no message");
+
+        var errorResult = new DefenderModule.PowerShellRunner.Result(1,
+            "WTF_ADD_ERROR:" + DefenderModule.PowerShellRunner.EncodeValue("boom") + "\r\n", "");
+        Assert(DefenderModule.PowerShellRunner.ClassifyAddResult(errorResult, out message) == DefenderModule.PowerShellRunner.AddOutcome.Error && message == "boom",
+            "ClassifyAddResult: ERROR marker present -> Error, with the decoded message");
+
+        var unknownResult = new DefenderModule.PowerShellRunner.Result(17, "", "some stderr text");
+        Assert(DefenderModule.PowerShellRunner.ClassifyAddResult(unknownResult, out message) == DefenderModule.PowerShellRunner.AddOutcome.Unknown && message == null,
+            "ClassifyAddResult: neither marker present (e.g. an external process kill) -> Unknown, never Error (N1/N-c)");
+    }
+
+    // F-1: an oversized Add request must be rejected during Prepare() (Probe), not first discovered
+    // inside Add() -- otherwise evidence.AddAttempted is already true by the time the length check
+    // fires, and the lifecycle reports Mutation=ApiFailed/OPERATION_ERROR as if Defender itself had
+    // rejected a request that powershell.exe never got a chance to run. CreateBackend/Prepare() alone
+    // never touch WMI or spawn a process, so this needs no live powershell.exe and is safe without
+    // -Integration (same reasoning as the existing "construction alone never connects" tests).
+    private static void CheckPowerShellOversizedRequestFailsAtPrepare()
+    {
+        var manyValues = new List<string>();
+        for (int i = 0; i < 2000; i++) { manyValues.Add("C:\\Lab\\VeryLongPathSegment" + i.ToString("D6") + "\\file.txt"); }
+        var hugeExclusions = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase) { { "ExclusionPath", manyValues } };
+
+        using (DefenderModule.IPreferenceBackend backend = DefenderModule.CreateBackend("powershell"))
+        {
+            bool threwAtPrepare = false;
+            try { backend.Prepare(hugeExclusions); }
+            catch (InvalidOperationException) { threwAtPrepare = true; }
+            Assert(threwAtPrepare, "Defender powershell backend rejects an oversized Add request in Prepare(), before Connect()/Add() (F-1)");
+        }
+
+        var manyPaths = new List<string>(manyValues);
+        using (IAsrBackend backend = AsrModule.CreateBackend("powershell"))
+        {
+            bool threwAtPrepare = false;
+            try { backend.Prepare(new AsrMutationRequest { Kind = AsrRequestKind.GlobalExclusion, ExclusionPaths = manyPaths }); }
+            catch (InvalidOperationException) { threwAtPrepare = true; }
+            Assert(threwAtPrepare, "ASR powershell backend rejects an oversized global-exclusion Add request in Prepare(), before Connect()/Add() (F-1)");
+        }
+    }
+
+    // F-2b: pins the -EncodedCommand / no-temp-file design down at the ProcessStartInfo level,
+    // independent of any live powershell.exe run. Without this, a future regression back to
+    // "-File %TEMP%\...\script.ps1" (reintroducing the NB2 temp-file race) would leave every other
+    // powershell-transport test still green. Deliberately never touches start.EnvironmentVariables
+    // here (see RunScript's own remarks -- P2): that property's first access unconditionally copies
+    // the whole current-process environment into a case-insensitive StringDictionary, which throws on
+    // a minority of real hosts whose raw environment already has two case-variant entries for the
+    // same variable, and this fast unit test must not reproduce that host-specific crash itself. The
+    // PSModulePath restriction is verified behaviorally, against a real child process, by
+    // CheckPowerShellModulePathRestriction below instead.
+    private static void CheckPowerShellProcessStartInfoHardening()
+    {
+        ProcessStartInfo start = DefenderModule.PowerShellRunner.BuildProcessStartInfo("Write-Output 'hi'\r\n");
+        Assert(string.Equals(start.FileName, DefenderModule.PowerShellRunner.PowerShellExecutablePath, StringComparison.OrdinalIgnoreCase),
+            "BuildProcessStartInfo launches the absolute, trusted powershell.exe path (B3)");
+        Assert(start.Arguments.Contains("-EncodedCommand"), "BuildProcessStartInfo passes the script via -EncodedCommand (NB2b)");
+        Assert(!start.Arguments.Contains("-File"), "BuildProcessStartInfo never passes a script via -File / a temp script path (NB2b)");
+    }
+
+    // F-3: pins the per-field cast BuildReadScript generates. A non-integer field must never be cast
+    // via [int] (it would throw for a string value like a path); AttackSurfaceReductionRules_Actions
+    // specifically must be cast via [int] first, so an enum-backed value (were some Defender build to
+    // ever return one) reads back as its numeric value, not its member name. Pure text-generation
+    // assertions, no process spawn needed.
+    private static void CheckPowerShellReadScriptIntegerFieldCast()
+    {
+        string script = DefenderModule.PowerShellRunner.BuildReadScript("ConfigDefender\\Get-MpPreference",
+            new[] { "AttackSurfaceReductionRules_Actions", "ExclusionPath" }, "testmarker",
+            new[] { "AttackSurfaceReductionRules_Actions" });
+        Assert(script.Contains("[System.Text.Encoding]::UTF8.GetBytes([string][int]$v)"),
+            "BuildReadScript casts an integer field via [int] before [string] (F-3)");
+        Assert(script.Contains("[System.Text.Encoding]::UTF8.GetBytes([string]$v)"),
+            "BuildReadScript casts a non-integer field with a plain [string], never [int] (F-3)");
+    }
+
+    // F-2a: pure parsing tests for the unpaired-surrogate rejection shared by every transport
+    // (CommonArguments.HasUnpairedSurrogate) and wired into both Defender exclusion and ASR -Path
+    // parsing.
+    private static void CheckUnpairedSurrogateDetection()
+    {
+        Assert(CommonArguments.HasUnpairedSurrogate("\uD800"), "A lone high surrogate is detected as unpaired");
+        Assert(CommonArguments.HasUnpairedSurrogate("\uDC00"), "A lone low surrogate is detected as unpaired");
+        Assert(CommonArguments.HasUnpairedSurrogate("\uDC00\uD800"), "A reversed surrogate pair (low then high) is detected as unpaired");
+        Assert(CommonArguments.HasUnpairedSurrogate("prefix\uD800suffix"), "An unpaired high surrogate mid-string is detected");
+        Assert(!CommonArguments.HasUnpairedSurrogate("\uD83D\uDE00"), "A valid surrogate pair (an emoji) is accepted, not flagged");
+        Assert(!CommonArguments.HasUnpairedSurrogate("C:\\Lab Data"), "Ordinary ASCII text has no surrogates to flag");
+        Assert(!CommonArguments.HasUnpairedSurrogate(string.Empty), "An empty string has no surrogates to flag");
+
+        bool rejected = false;
+        try { DefenderModule.ParseArguments(new[] { "-ExclusionPath", "C:\\Lab\uD800Bad" }); }
+        catch (ArgumentException) { rejected = true; }
+        Assert(rejected, "Defender exclusion -ExclusionPath rejects a value with an unpaired surrogate");
+
+        rejected = false;
+        try { AsrModule.Parse(new[] { "exclusion", "-Path", "C:\\Lab\uD800Bad" }); }
+        catch (ArgumentException) { rejected = true; }
+        Assert(rejected, "ASR -Path rejects a value with an unpaired surrogate");
     }
 
     private static void Assert(bool condition, string message)

@@ -20,8 +20,11 @@ Older exclusion commands must now include the `defender exclusion` prefix.
 | `management` (default) | Managed WMI |
 | `com` | COM Automation to WMI |
 | `native` | Native C++ WMI through the matching DLL |
+| `powershell` | Shells to `powershell.exe` and drives `Add-MpPreference`/`Get-MpPreference` |
 
 All target the same Defender preference interface, with no fallback. Supported types are `-ExclusionPath`, `-ExclusionExtension`, `-ExclusionProcess`, and `-ExclusionIpAddress` (subject to provider support).
+
+`powershell` invokes System32's own `powershell.exe` directly (not a `PATH` lookup, and with its module search path restricted to the system module directory) and requires the `ConfigDefender` module. `Add-MpPreference` is a void cmdlet with no WMI return code to report, so this transport always confirms an Add through readback rather than a status code. It also launches its own `powershell.exe` process, which is itself something a detection stack can observe (AMSI, script-block logging, the process image and command line) that the other three transports never produce -- differing telemetry between `powershell` and the others is evidence about this process-launch path, not about `MSFT_MpPreference` itself. A value containing an unpaired UTF-16 surrogate is rejected when parsed, before any transport runs; this is exceedingly unlikely to occur from ordinary path input.
 
 Pass values as separate arguments, not PowerShell comma-separated arrays. Names are case-insensitive and repeated types are supported. Use `-ExclusionTYPE=VALUE` for a value beginning with a dash. No implicit default exclusion is added.
 

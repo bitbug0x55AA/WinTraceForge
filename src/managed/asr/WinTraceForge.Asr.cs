@@ -11,6 +11,7 @@ using System.Management;
 using System.Runtime.InteropServices;
 using System.Security;
 using System.Security.Principal;
+using System.Text;
 using Microsoft.Win32;
 
 // Numeric values match the real ASRRuleActionType enum bound by Add-MpPreference/Set-MpPreference
@@ -299,11 +300,7 @@ internal static partial class AsrModule
         bool willInvokeAdd = !options.CheckOnly &&
             (options.Kind == ControlKind.DefenderAsrExclusion || options.Kind == ControlKind.DefenderAsrRule);
         string endpoint = willInvokeAdd ? "MSFT_MpPreference.Add" : "MSFT_MpPreference (read-only ExecQuery/Get)";
-        ConsoleUi.Detail("Route: " + (options.Transport == "native" ?
-            "P/Invoke -> native C++ IWbemLocator/IWbemServices -> WMI -> " + endpoint :
-            options.Transport == "com" ?
-            ".NET COM interop -> SWbemLocator/SWbemServices -> WMI -> " + endpoint :
-            "System.Management -> WMI -> " + endpoint));
+        ConsoleUi.Detail("Route: " + DescribeRoute(options.Transport, endpoint));
 
         bool isAdministrator;
         using (WindowsIdentity identity = WindowsIdentity.GetCurrent())
@@ -334,7 +331,20 @@ internal static partial class AsrModule
             case "management": return new ManagementAsrBackend();
             case "com": return new ComAsrBackend();
             case "native": return new NativeAsrBackend();
+            case "powershell": return new PowerShellAsrBackend();
             default: throw new InvalidOperationException("Unknown ASR transport; no fallback.");
+        }
+    }
+
+    private static string DescribeRoute(string transport, string endpoint)
+    {
+        switch (transport)
+        {
+            case "native": return "P/Invoke -> native C++ IWbemLocator/IWbemServices -> WMI -> " + endpoint;
+            case "com": return ".NET COM interop -> SWbemLocator/SWbemServices -> WMI -> " + endpoint;
+            case "powershell":
+                return "Process -> powershell.exe -> Add-MpPreference/Get-MpPreference (Defender PowerShell module) -> " + endpoint;
+            default: return "System.Management -> WMI -> " + endpoint;
         }
     }
 
@@ -417,10 +427,11 @@ internal static partial class AsrModule
 
             if (key == "--transport")
             {
-                if (i + 1 >= args.Length) { throw new ArgumentException("Specify --transport once, followed by management, com, or native."); }
+                if (i + 1 >= args.Length) { throw new ArgumentException("Specify --transport once, followed by management, com, native, or powershell."); }
                 options.Transport = args[++i].ToLowerInvariant();
-                if (options.Transport != "management" && options.Transport != "com" && options.Transport != "native")
-                { throw new ArgumentException("Unknown transport. Supported values: management, com, native."); }
+                if (options.Transport != "management" && options.Transport != "com" &&
+                    options.Transport != "native" && options.Transport != "powershell")
+                { throw new ArgumentException("Unknown transport. Supported values: management, com, native, powershell."); }
                 continue;
             }
             if (key == "--check")
@@ -444,6 +455,8 @@ internal static partial class AsrModule
                         {
                             string value = args[++i];
                             if (string.IsNullOrWhiteSpace(value)) { throw new ArgumentException("-Path does not accept empty values."); }
+                            if (CommonArguments.HasUnpairedSurrogate(value))
+                            { throw new ArgumentException("-Path does not accept a value containing an unpaired UTF-16 surrogate."); }
                             if (!options.Paths.Exists(delegate(string existing)
                                 { return string.Equals(existing, value, StringComparison.OrdinalIgnoreCase); }))
                             { options.Paths.Add(value); }
@@ -534,7 +547,7 @@ internal static partial class AsrModule
         ConsoleUi.Row("rule", "Read or set one rule's action (AttackSurfaceReductionRules_Ids/_Actions).");
         ConsoleUi.Row("verify", "Run a controlled test primitive; observe local enforcement + telemetry.");
         ConsoleUi.Section("Options");
-        ConsoleUi.Row("--transport", "management|com|native  (default: management)");
+        ConsoleUi.Row("--transport", "management|com|native|powershell  (default: management)");
         ConsoleUi.Row("--check", "Read-only for exclusion/rule/verify; never mutates Defender settings.");
         ConsoleUi.Row("-Path", "One or more file/folder paths for the 'exclusion' sub-command.");
         ConsoleUi.Row("-RuleId", "ASR rule GUID, for 'rule' and 'verify'.");
@@ -547,6 +560,7 @@ internal static partial class AsrModule
         ConsoleUi.Row("management", "System.Management -> WMI");
         ConsoleUi.Row("com", "SWbemServices COM Automation -> WMI");
         ConsoleUi.Row("native", "C++ IWbemServices::ExecQuery/ExecMethod -> WMI");
+        ConsoleUi.Row("powershell", "powershell.exe -> Add-MpPreference/Get-MpPreference");
         ConsoleUi.Text("All routes target MSFT_MpPreference; ExecMethod only for a mutating Add, ExecQuery/Get " +
             "for every read (status, every --check, verify). No fallback; normal provider permissions apply.");
         ConsoleUi.Section("Quick start");
@@ -572,9 +586,12 @@ internal static partial class AsrModule
         ConsoleUi.HelpExitCodes();
         ConsoleUi.Status("WARN", "ASR rule/exclusion changes reduce protection. Authorized testing only.");
         ConsoleUi.Text("Native transport requires WinTraceForge.Native.dll beside the EXE.");
+        ConsoleUi.Text("powershell transport uses System32's own powershell.exe (no PATH lookup) and needs ConfigDefender.");
         if (!ConsoleUi.Verbose) { return; }
         ConsoleUi.Section("Extended notes");
-        ConsoleUi.Text("All transports target the same MSFT_MpPreference class and share identical read/write semantics; none elevates privileges.");
+        ConsoleUi.Text("All transports target the same MSFT_MpPreference class; none elevates privileges. powershell's Supports() reflects " +
+            "the ConfigDefender module's own Add-MpPreference parameter set rather than the WMI class schema management/com/native inspect " +
+            "directly, so it is a client-side capability check, not identical read/write semantics to the other three.");
         ConsoleUi.Text("The rule name table is best-effort and may not match your Defender build; unrecognized GUIDs still work.");
         ConsoleUi.Text("Policy source classifies Local vs GroupPolicy registry keys only; Intune/MDM and Security Center " +
             "defaults that do not populate either key are reported as Unknown, not misclassified as Local.");
@@ -1115,5 +1132,193 @@ internal static partial class AsrModule
         [DllImport(Library, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         [DefaultDllImportSearchPaths(DllImportSearchPath.AssemblyDirectory | DllImportSearchPath.System32)]
         internal static extern void NativeClose(IntPtr handle);
+    }
+
+    // Shells to powershell.exe and drives Add-MpPreference/Get-MpPreference, reusing
+    // DefenderModule.PowerShellRunner for process/execution plumbing -- the same rationale as
+    // ComAsrBackend reusing DefenderModule.ComObjects: both back the same
+    // root\Microsoft\Windows\Defender MSFT_MpPreference class through the same PowerShell module.
+    // See DefenderModule.PowerShellRunner's own remarks for the full set of hardening measures
+    // (absolute executable path, restricted module path, -EncodedCommand instead of a temp script
+    // file, Base64-encoded values).
+    private sealed class PowerShellAsrBackend : IAsrBackend
+    {
+        private static readonly string[] SupportNames =
+            { "AttackSurfaceReductionOnlyExclusions", "AttackSurfaceReductionRules_Ids", "AttackSurfaceReductionRules_Actions" };
+
+        // All 7 MSFT_MpPreference fields this backend ever reads, unrolled per-field by
+        // PowerShellRunner.BuildReadScript rather than looped script-side -- see that method's own
+        // remarks on why a byte-typed field (AttackSurfaceReductionRules_Actions, whose Disabled
+        // value is the falsy byte 0) must never be foreach-guarded by "if ($pref.<field>)".
+        private static readonly string[] ReadFields = BuildReadFields();
+
+        // AttackSurfaceReductionRules_Actions is documented as a UInt8Array, but if some Defender
+        // build ever surfaces it as an enum-backed type instead of a plain byte, casting straight to
+        // [string] would read back that enum member's *name* rather than its numeric value -- so this
+        // one field, alone, must be cast via [int] first. Every other field here is a plain string.
+        private static readonly string[] IntegerReadFields = { "AttackSurfaceReductionRules_Actions" };
+
+        private static string[] BuildReadFields()
+        {
+            var fields = new List<string>
+            { "AttackSurfaceReductionRules_Ids", "AttackSurfaceReductionRules_Actions", "AttackSurfaceReductionOnlyExclusions" };
+            fields.AddRange(AvExclusionTypes);
+            return fields.ToArray();
+        }
+
+        private Dictionary<string, bool> supportsCache;
+        private string pendingAddScript;
+
+        public void Connect()
+        {
+            var script = new StringBuilder();
+            script.Append("$ErrorActionPreference = 'Stop'\r\n");
+            script.Append("try {\r\n");
+            script.Append("    Get-Command ConfigDefender\\Add-MpPreference | Out-Null\r\n");
+            script.Append("    Get-Command ConfigDefender\\Get-MpPreference | Out-Null\r\n");
+            script.Append("    $cmd = Get-Command ConfigDefender\\Add-MpPreference\r\n");
+            script.Append("    foreach ($n in @(");
+            for (int i = 0; i < SupportNames.Length; i++)
+            {
+                if (i > 0) { script.Append(","); }
+                script.Append("'" + SupportNames[i] + "'");
+            }
+            script.Append(")) {\r\n");
+            script.Append("        Write-Output ($n + '=' + $cmd.Parameters.ContainsKey($n))\r\n");
+            script.Append("    }\r\n");
+            script.Append("    Write-Output 'WTF_CONNECT_OK'\r\n");
+            script.Append("} catch {\r\n");
+            script.Append(DefenderModule.PowerShellRunner.EmitErrorMarkerStatement("WTF_CONNECT_ERROR:"));
+            script.Append("    exit 1\r\n");
+            script.Append("}\r\n");
+
+            DefenderModule.PowerShellRunner.Result result = DefenderModule.PowerShellRunner.RunScript(script.ToString());
+            string errorMessage = DefenderModule.PowerShellRunner.FindMarkerMessage(result.Stdout, "WTF_CONNECT_ERROR:");
+            if (errorMessage != null || !DefenderModule.PowerShellRunner.ContainsMarker(result.Stdout, "WTF_CONNECT_OK"))
+            {
+                throw new NotSupportedException("PowerShell Defender module (Add-MpPreference/Get-MpPreference) is unavailable. " +
+                    (errorMessage ?? DefenderModule.PowerShellRunner.DescribeFailure(result)));
+            }
+            supportsCache = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            foreach (string line in DefenderModule.PowerShellRunner.SplitLines(result.Stdout))
+            {
+                int equals = line.IndexOf('=');
+                if (equals <= 0) { continue; }
+                supportsCache[line.Substring(0, equals)] =
+                    string.Equals(line.Substring(equals + 1), "True", StringComparison.OrdinalIgnoreCase);
+            }
+        }
+
+        public void Prepare(AsrMutationRequest request)
+        {
+            // Built (and length-validated) before the Supports() checks below, not after: an
+            // oversized global-exclusion request must fail here, during Probe, so the lifecycle
+            // reports Mutation=NotAttempted rather than reaching Add() first and being misreported as
+            // MutationStatus.ApiFailed (as if Defender itself had rejected a request that
+            // powershell.exe never even got a chance to run).
+            string script = BuildAddScript(request);
+            if (request.Kind == AsrRequestKind.GlobalExclusion)
+            {
+                if (!Supports("AttackSurfaceReductionOnlyExclusions"))
+                { throw new InvalidOperationException("Unsupported property: AttackSurfaceReductionOnlyExclusions"); }
+            }
+            else
+            {
+                if (!Supports("AttackSurfaceReductionRules_Ids") || !Supports("AttackSurfaceReductionRules_Actions"))
+                { throw new InvalidOperationException("Unsupported property: AttackSurfaceReductionRules_Ids/Actions"); }
+            }
+            pendingAddScript = script;
+        }
+
+        public bool Supports(string name)
+        {
+            bool supported;
+            return supportsCache != null && supportsCache.TryGetValue(name, out supported) && supported;
+        }
+
+        private static string BuildAddScript(AsrMutationRequest request)
+        {
+            var script = new StringBuilder();
+            script.Append("$ErrorActionPreference = 'Stop'\r\n");
+            script.Append("try {\r\n");
+            if (request.Kind == AsrRequestKind.GlobalExclusion)
+            {
+                script.Append("    ConfigDefender\\Add-MpPreference -AttackSurfaceReductionOnlyExclusions " +
+                    DefenderModule.PowerShellRunner.EncodeValuesExpression(request.ExclusionPaths) + "\r\n");
+            }
+            else
+            {
+                script.Append("    ConfigDefender\\Add-MpPreference -AttackSurfaceReductionRules_Ids '" + request.RuleId +
+                    "' -AttackSurfaceReductionRules_Actions " + (int)request.Action + "\r\n");
+            }
+            script.Append("    Write-Output 'WTF_ADD_OK'\r\n");
+            script.Append("} catch {\r\n");
+            script.Append(DefenderModule.PowerShellRunner.EmitErrorMarkerStatement("WTF_ADD_ERROR:"));
+            script.Append("    exit 1\r\n");
+            script.Append("}\r\n");
+            string result = script.ToString();
+            DefenderModule.PowerShellRunner.ValidateScriptLength(result);
+            return result;
+        }
+
+        public object Add()
+        {
+            DefenderModule.PowerShellRunner.Result result = DefenderModule.PowerShellRunner.RunScript(pendingAddScript);
+            string errorMessage;
+            DefenderModule.PowerShellRunner.AddOutcome outcome =
+                DefenderModule.PowerShellRunner.ClassifyAddResult(result, out errorMessage);
+            if (outcome == DefenderModule.PowerShellRunner.AddOutcome.Error)
+            {
+                throw new InvalidOperationException("Add-MpPreference (PowerShell) failed: " + errorMessage);
+            }
+            if (outcome == DefenderModule.PowerShellRunner.AddOutcome.Unknown)
+            {
+                // See DefenderModule.PowerShellRunner.ClassifyAddResult's remarks: a missing marker
+                // (crash, or the process torn down externally after Add-MpPreference may already
+                // have run) is genuinely unknown, not a known failure, so this must not become
+                // MutationStatus.ApiFailed -- only readback can settle it.
+                ConsoleUi.Status("WARN", "powershell.exe ended (exit code " + result.ExitCode +
+                    ") without a clear success/failure marker; verifying configuration by readback.");
+                ConsoleUi.Detail(DefenderModule.PowerShellRunner.DescribeFailure(result));
+            }
+            // No WMI ReturnValue exists for a PowerShell cmdlet call; AsrOperation.MutateAdd treats
+            // null as MutationStatus.ApiUnknown and falls back to readback either way.
+            return null;
+        }
+
+        public AsrSnapshot Read()
+        {
+            string marker = Guid.NewGuid().ToString("N");
+            DefenderModule.PowerShellRunner.Result result = DefenderModule.PowerShellRunner.RunScript(
+                DefenderModule.PowerShellRunner.BuildReadScript("ConfigDefender\\Get-MpPreference", ReadFields, marker, IntegerReadFields));
+            string errorMessage = DefenderModule.PowerShellRunner.FindMarkerMessage(result.Stdout, "WTF_READ_ERROR:");
+            if (errorMessage != null)
+            {
+                throw new InvalidOperationException("Get-MpPreference (PowerShell) readback failed: " + errorMessage);
+            }
+            if (!DefenderModule.PowerShellRunner.ContainsMarker(result.Stdout, "WTF_READ_OK"))
+            {
+                // See DefenderModule.PowerShellBackend.Read()'s identical check: a read has no
+                // "maybe it happened anyway" fallback, so an incomplete script run must never be
+                // read back as an empty (or partial) snapshot.
+                throw new InvalidOperationException("Get-MpPreference (PowerShell) readback did not complete (exit " +
+                    result.ExitCode + "): " + DefenderModule.PowerShellRunner.DescribeFailure(result));
+            }
+            Dictionary<string, List<string>> rawFields = DefenderModule.PowerShellRunner.ParseFields(result.Stdout, marker, ReadFields);
+            return BuildSnapshot(delegate(string name)
+            {
+                List<string> values;
+                if (!rawFields.TryGetValue(name, out values))
+                { throw new InvalidOperationException("Missing PowerShell readback field: " + name); }
+                return values.ToArray();
+            });
+        }
+
+        public Dictionary<string, AsrPolicySourceKind> ReadPolicySource(IEnumerable<string> keys)
+        { return AsrRegistry.ReadPolicySource(keys); }
+
+        public bool IsNotepadRedirectionActive() { return AsrRegistry.IsNotepadRedirectionActive(); }
+
+        public void Dispose() { }
     }
 }

@@ -96,6 +96,32 @@ internal static class CommonArguments
             throw new ArgumentException("--telemetry-wait requires --telemetry eventlog or etw.");
         }
     }
+
+    // A lone (unpaired) UTF-16 surrogate is not representable as valid UTF-8/UTF-16LE text; a
+    // transport that must re-encode a value at some point (UTF-8 for the powershell transport's
+    // Base64 channel; WMI's own BSTR/UTF-16 marshaling is more forgiving but not guaranteed
+    // consistent either) would either replace it with U+FFFD or fail, silently submitting a
+    // different value than the one requested. NTFS paths can technically contain such a code unit,
+    // but only via deliberate construction, never from ordinary path input; rejecting it up front,
+    // identically for every transport, is simpler and safer than trying to make each transport's
+    // encoding path tolerate it consistently.
+    internal static bool HasUnpairedSurrogate(string value)
+    {
+        for (int i = 0; i < value.Length; i++)
+        {
+            char c = value[i];
+            if (char.IsHighSurrogate(c))
+            {
+                if (i + 1 >= value.Length || !char.IsLowSurrogate(value[i + 1])) { return true; }
+                i++;
+            }
+            else if (char.IsLowSurrogate(c))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
 }
 
 internal static class ControlRuntime

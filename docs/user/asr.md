@@ -2,7 +2,7 @@
 
 [User docs](README.md) | [Shared command options](commands.md)
 
-ASR commands support `--transport management|com|native`, defaulting to `management`. Each route targets the same Defender preference class with no fallback.
+ASR commands support `--transport management|com|native|powershell`, defaulting to `management`. Each route targets the same Defender preference class with no fallback. `powershell` invokes System32's own `powershell.exe` directly (its module search path restricted to the system module directory) and drives the `ConfigDefender` module's `Add-MpPreference`/`Get-MpPreference` cmdlets; it always confirms a write through readback since `Add-MpPreference` has no WMI return code to report. It also launches its own `powershell.exe` process, which a detection stack can observe in ways the other three transports never produce -- a telemetry difference between `powershell` and the others is evidence about this process-launch path, not about `MSFT_MpPreference` itself. A `-Path` value containing an unpaired UTF-16 surrogate is rejected when parsed, before any transport runs.
 
 ## Inspect posture
 

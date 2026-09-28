@@ -55,7 +55,7 @@ function Invoke-Case {
 
 $help = Invoke-Case $Executable '--help' 0 @(
     'WTF // WINTRACEFORGE', 'Same action. Different paths. Different visibility.', 'USAGE', 'OPTIONS', 'EXCLUSION TYPES', 'QUICK START',
-    'management|com|native', 'Detection & Response', 'No arguments: usage error'
+    'management|com|native|powershell', 'Detection & Response', 'No arguments: usage error'
 )
 $plainHelp = Invoke-Case $Executable '--help --no-color' 0 @('--no-color', '--verbose')
 if ($help -ne $plainHelp) { throw 'Color flag changed redirected help content.' }
@@ -82,7 +82,7 @@ if ($match.Success) {
     }
 }
 $baselines = @{}
-foreach ($transport in @('management', 'com', 'native')) {
+foreach ($transport in @('management', 'com', 'native', 'powershell')) {
     Invoke-Case $Executable "--transport $transport --check" 0 @(
         "Transport $transport", 'ExclusionPath: supported (string[])',
         'ExclusionExtension: supported (string[])', 'ExclusionProcess: supported (string[])',
@@ -128,7 +128,8 @@ foreach ($transport in @('management', 'com', 'native')) {
         'Collection completeness:', 'No matching evidence is NOT proof'
     ) | Out-Null
 }
-if ($baselines['management'] -ne $baselines['com'] -or $baselines['management'] -ne $baselines['native']) {
+if ($baselines['management'] -ne $baselines['com'] -or $baselines['management'] -ne $baselines['native'] -or
+    $baselines['management'] -ne $baselines['powershell']) {
     throw 'Transport baseline results differ.'
 }
 $script:Passed++
@@ -154,7 +155,7 @@ finally {
     $identity.Dispose()
 }
 if (-not $isAdministrator) {
-    foreach ($transport in @('management', 'com', 'native')) {
+    foreach ($transport in @('management', 'com', 'native', 'powershell')) {
         Invoke-Case $Executable "--transport $transport -ExclusionPath `"C:\Lab Data`"" 1 @(
             'Administrator No', 'Outcome: NOT_ATTEMPTED',
             'Add attempted: False', 'Preflight failed before Add'
@@ -178,6 +179,7 @@ try {
     ) | Out-Null
     Invoke-Case $copy '--transport management --check' 0 @('Outcome: CHECK_ONLY') | Out-Null
     Invoke-Case $copy '--transport com --check' 0 @('Outcome: CHECK_ONLY') | Out-Null
+    Invoke-Case $copy '--transport powershell --check' 0 @('Outcome: CHECK_ONLY') | Out-Null
     Invoke-Case $copy '--check --telemetry etw --telemetry-wait 0' 4 @(
         'ETW native DLL is missing', 'Outcome: NOT_ATTEMPTED', 'Add attempted: False'
     ) | Out-Null

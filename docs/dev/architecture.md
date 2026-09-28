@@ -29,7 +29,7 @@ The runner owns `Probe → Mutate → Verify → Observe → Restore → Complet
 
 Families provide typed request/baseline data, separate reader/writer views, and an explicit telemetry profile. Backends must have no persistent construction side effects. Probe and Verify are read-only. Only Mutate and Restore may cause persistent or destructive host effects. API success must remain separate from configuration verification and observation.
 
-Defender and ASR preference transports target `MSFT_MpPreference` via managed WMI, COM Automation, or native WMI. Firewall COM/native target `INetFwPolicy2` / `INetFwRule3`; management targets `MSFT_NetFirewallRule` in `root\StandardCimv2`. Explicit transport selection never falls back. These transports are current examples of implementation-path variation; the term is not limited to control-setting APIs. See [backend details](backend-reference.md) before changing interop or readback behavior.
+Defender and ASR preference transports target `MSFT_MpPreference` via managed WMI, COM Automation, native WMI, or a PowerShell child process using Defender cmdlets. Firewall COM/native target `INetFwPolicy2` / `INetFwRule3`; management targets `MSFT_NetFirewallRule` in `root\StandardCimv2`. Explicit transport selection never falls back. These transports are current examples of implementation-path variation; the term is not limited to control-setting APIs. See [backend details](backend-reference.md) before changing interop or readback behavior.
 
 Telemetry profiles own channel/provider selection, correlation, interesting fields, and interpretation. Shared collectors and presentation consume the profile; a new family must not inherit another family's providers through a default branch.
 

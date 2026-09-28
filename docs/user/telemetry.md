@@ -27,6 +27,8 @@ All modules also inspect Security 4688 and Sysmon Operational 1 when available. 
 
 Firewall correlation requires the exact requested rule name, not a substring or a generic Firewall mention. ASR correlation matches the requested rule GUID or exclusion path substring within event fields; an event without that value is time-only evidence. Process-start evidence and rule-change evidence are separate. Defender, ASR, and Firewall evidence are not interchangeable.
 
+The Defender/ASR `powershell` transport introduces a child process and possible PowerShell logging surfaces. WTF does not record that child's PID for its PID-based correlation; compare its activity manually using timestamps and command lines. A telemetry difference reflects the tested implementation path, not evidence that the underlying preference interface or enforcement changed.
+
 ## Raw ETW capture
 
 ```powershell

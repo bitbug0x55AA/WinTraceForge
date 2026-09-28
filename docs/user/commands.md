@@ -27,7 +27,7 @@ Place module flags after the module and command, for example `wtf.exe defender e
 
 | Option | Values / default | Meaning |
 | --- | --- | --- |
-| `--transport` | `management`, `com`, `native` | Defender / ASR default to `management`; Firewall defaults to `com`. No automatic fallback. |
+| `--transport` | `management`, `com`, `native`; also `powershell` for Defender / ASR | Defender / ASR default to `management`; Firewall defaults to `com`. No automatic fallback. |
 | `--telemetry` | `none` (default), `eventlog`, `etw` | Select local evidence collection. |
 | `--telemetry-wait` | `0..30`; default `3` seconds | Allow time for events to publish after the operation. |
 | `--verbose` | Flag | Expand evidence, guidance, and help notes. |
