@@ -1280,6 +1280,17 @@ internal static class DefenderModule
             return "    Write-Output ('" + prefix + "' + [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($_.Exception.Message)))\r\n";
         }
 
+        // Scalar counterpart to EncodeValuesExpression, for a single parameter argument rather than an
+        // array (e.g. -DisplayName ([...decode-expression...])) -- reused by FirewallModule's
+        // PowerShellFirewallBackend, whose New-NetFirewallRule invocation takes scalar, not array,
+        // string parameters. Same rationale: Base64's alphabet has no quote character, so the decoded
+        // value never needs script-text escaping even when it may contain caller-supplied content
+        // (e.g. an absolute --program path).
+        internal static string EncodeValueExpression(string value)
+        {
+            return "([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('" + EncodeValue(value) + "')))";
+        }
+
         internal static string EncodeValue(string value)
         {
             return Convert.ToBase64String(Encoding.UTF8.GetBytes(value ?? string.Empty));

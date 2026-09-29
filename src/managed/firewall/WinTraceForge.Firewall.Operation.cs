@@ -140,10 +140,9 @@ internal static partial class FirewallModule
         {
             evidence.Stage = options.Operation == "add" ? "Firewall Add" : "Firewall Remove";
             evidence.MutationAttempted = true;
-            if (options.Operation == "add") { backend.Add(); }
-            else { backend.Remove(options.RuleName); }
+            MutationStatus status = options.Operation == "add" ? backend.Add() : backend.Remove(options.RuleName);
             evidence.MutationReturned = true;
-            return MutationStatus.ApiSucceeded;
+            return status;
         }
 
         public VerificationStatus Verify(FirewallBaseline baseline, IFirewallReader backend)
@@ -199,7 +198,7 @@ internal static partial class FirewallModule
     {
         private readonly IFirewallBackend inner;
         internal FirewallWriter(IFirewallBackend inner) { this.inner = inner; }
-        public void Add() { inner.Add(); }
-        public void Remove(string name) { inner.Remove(name); }
+        public MutationStatus Add() { return inner.Add(); }
+        public MutationStatus Remove(string name) { return inner.Remove(name); }
     }
 }

@@ -157,6 +157,8 @@ try {
         Invoke-TestBinary 'Firewall.RegressionTests.exe' @('--native-read-only')
         Invoke-TestBinary 'Firewall.RegressionTests.exe' @('--native-detached-preflight')
         Invoke-TestBinary 'Firewall.RegressionTests.exe' @('--management-read-only')
+        Invoke-TestBinary 'Firewall.RegressionTests.exe' @('--powershell-read-only')
+        Invoke-TestBinary 'Firewall.RegressionTests.exe' @('--cmd-read-only')
         Invoke-NativeBuild ('/I"' + (Join-Path $nativeSourceDirectory 'telemetry') + '" "' +
             (Join-Path $testDirectory 'Etw.RegressionTests.cpp') + '" /Fe:Etw.RegressionTests.exe /link advapi32.lib tdh.lib ole32.lib')
         $etl = Join-Path $OutputDirectory ('PrivateSelfTest-' + [guid]::NewGuid().ToString('D') + '.etl')

@@ -44,6 +44,8 @@ Collect evidence for a read-only operation through different supported paths:
 ```powershell
 .\wtf.exe firewall profiles --transport com --telemetry eventlog
 .\wtf.exe firewall profiles --transport native --telemetry eventlog
+.\wtf.exe firewall profiles --transport powershell --telemetry eventlog
+.\wtf.exe firewall profiles --transport cmd --telemetry eventlog
 ```
 
 For an authorized firewall test, add a narrowly scoped rule, retain the printed ID, and use the exact printed cleanup command afterward:

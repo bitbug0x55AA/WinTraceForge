@@ -154,19 +154,32 @@ Routes (supported on rule add/check/remove and profiles):
   --transport management
     System.Management -> WMI root\StandardCimv2 MSFT_NetFirewallRule
     -> Windows Firewall
+  --transport powershell
+    Process -> powershell.exe -> New-/Get-/Remove-NetFirewallRule
+    (NetSecurity module) -> WMI root\StandardCimv2 MSFT_NetFirewallRule
+  --transport cmd
+    Process -> cmd.exe -> netsh.exe advfirewall firewall add/show/delete rule
+    -> Windows Firewall
 ```
 
 The native DLL performs policy/rule enumeration, property access, detached
 rule preparation and Add/Remove; it does not delegate these to C# reflection.
 com and native use the same Windows Firewall COM management interfaces and
-ownership schema; management targets the separate WMI Firewall provider
-PowerShell's New-NetFirewallRule/NetSecurity module wraps (MSFT_NetFirewallRule
-plus its per-rule MSFT_Net*Filter associations). All three read/write the
-same persisted rule store and share the same ownership schema and readback
-comparison (FirewallModule.Mismatches), so a rule added by one transport can
-be checked/removed with any other. This compares caller implementations, not
-different policy engines. It is not a WFP API test or proof
-of different detection.
+ownership schema; management and powershell both target the WMI Firewall
+provider (MSFT_NetFirewallRule plus its per-rule MSFT_Net*Filter
+associations), management directly and powershell through the NetSecurity
+module's own cmdlets, which are a thin wrapper over the identical provider
+(confirmed live: casting a filter/rule CIM-enum property to `[int]` yields the
+identical raw WMI value PowerShellFirewallBackend and ManagementFirewallBackend
+both decode). com, native, management and powershell read/write the same
+persisted rule store and share the same ownership schema and readback
+comparison (FirewallModule.Mismatches), so a rule added by one of these four
+transports can be checked/removed with any other. cmd instead shells to
+netsh.exe, the last of the classic text-oriented Windows Firewall surfaces;
+see its own subsection below for the two real limits that make it not fully
+interchangeable with the other four. This compares caller implementations,
+not different policy engines. It is not a WFP API test or proof of different
+detection.
 
 MSFT_NetFirewallRule does not expose address/port/program/service scoping as
 flat instance properties the way INetFwRule3 does; the provider derives the
@@ -220,6 +233,135 @@ GPO-managed host, even though the built-in-default fallback this module still
 carries (for the tri-state values ActiveStore itself should never actually
 return) happened to coincide with an unmanaged host's real values.
 
+powershell reuses ManagementFirewallBackend's raw-value codecs/normalizers
+(AnySentinel, ProtocolNumber/-Name, RuleActionFromRaw/-ToRaw,
+RuleEnabledFromRaw/-ToRaw, ResolveGpoBoolean/-ProfileAction, FirstOrAny,
+NoneIfAny, FilterUnconfiguredSentinel, NetworkCategoryToProfileBit) rather
+than re-deriving them, and DefenderModule.PowerShellRunner's process-execution
+hardening (absolute powershell.exe path, restricted PSModulePath,
+-EncodedCommand, Base64-encoded values) rather than duplicating it -- the same
+reuse pattern PowerShellRunner and ComObjects already establish for
+AsrModule's own PowerShell/COM backends. New-NetFirewallRule has no
+WMI-ReturnValue equivalent to check, so a successful Add always falls through
+to the shared post-Add readback for confirmation, exactly like Defender's
+powershell transport. FindByName pipes each matched rule through
+Get-NetFirewallAddressFilter/-PortFilter/-ApplicationFilter/-ServiceFilter/
+-InterfaceTypeFilter/-InterfaceFilter/-SecurityFilter (the cmdlet equivalent
+of ManagementFirewallBackend.RequireOneRelated's GetRelated calls) and applies
+the identical "exactly one of each filter kind, or refuse" invariant.
+
+cmd shells to netsh.exe's `advfirewall firewall`/`advfirewall` context. Several
+real, verified limits, not implementation shortcuts:
+
+```text
+  netsh advfirewall firewall add rule has no group=/grouping= parameter
+  (checked against Microsoft's own documented parameter list). A cmd-created
+  rule can never carry this tool's Grouping marker the way the other four
+  transports do. FirewallModule.ExpectedGrouping returns "" instead of Group
+  only for --transport cmd, and RequireOwnedUnique/Mismatches compare against
+  that instead -- so a cmd-created rule's ownership rests on Name+Description
+  alone. The other four transports correctly refuse it as a Grouping
+  mismatch, and cmd itself correctly refuses a rule created by any of the
+  other four (it cannot prove a marker it never wrote, in either direction --
+  CrossTransportOwnershipRefusal in the regression suite pins both).
+  add rule also has no "any" keyword documented for program= (unlike
+  localport=/remoteport=, which do document "any"): BuildAddCommand omits
+  program= entirely for an unrestricted rule rather than sending the literal
+  text "any" as a path, matching com/management's own "preserve unspecified
+  defaults" behavior (CmdAddCommandOmitsProgramWhenUnset pins this).
+
+  Readback parses the fixed-column text of "netsh advfirewall firewall show
+  rule ... verbose" and "netsh advfirewall show allprofiles/currentprofile",
+  not a typed API -- inherently more fragile (locale- and Windows-version-
+  sensitive label text) than the other four transports. ParseShowRuleBlocks
+  refuses outright (FirewallReadbackUnsupportedException) on any label it
+  does not have in its known-label set (verified against a live sweep of
+  every one of 380 distinct real rule names on a development host: 229
+  decoded, 46 came back empty by MUI-name mismatch -- see below -- and 81+24
+  hit an already-documented refusal, none an unhandled exception type), and
+  DecodeShowRuleBlock separately refuses a comma-joined ("multi-value")
+  RemoteIP the same way management/powershell's FirstOrAny already does,
+  rather than accepting the raw joined text as a single value.
+
+  ExcludedInterfaces reads back as the literal string "not available (cmd)",
+  not an empty array: netsh exposes no such field via any show command, and
+  ReadProfiles is purely diagnostic display (never compared against an
+  expected value), so this cannot affect ownership/verification.
+  LocalAppPackageId/LocalUserOwner and the three authorized-user/-machine
+  list fields are hard-coded to "" for the same structural reason (no
+  corresponding netsh text field exists at all, not merely an "Any"
+  sentinel) -- correct for this tool's own rules (which never request such a
+  restriction) but means a check via cmd cannot prove the *absence* of one
+  of these restrictions on a third-party rule.
+
+  Confirmed live: netsh advfirewall show store reports "Policy Store: Local"
+  by default, with no netsh command found to select the GPO-merged/
+  ActiveStore equivalent com/native (always effective) and
+  management/powershell (both explicitly request PolicyStore=ActiveStore)
+  read. ReadProfiles's Enabled/BlockAllInbound/DefaultInboundAction/
+  DefaultOutboundAction can therefore diverge from the other four transports
+  on a GPO-managed host -- the same failure mode ManagementFirewallBackend's
+  own ActiveStore fix was written to avoid, but with no netsh-level fix
+  available here. This affects only the read-only `firewall profiles`
+  command; CurrentProfiles (live network-category membership, not a
+  GPO-overridable setting) and add/check/remove are unaffected.
+
+  Confirmed live: a rule with Profiles raw WMI value 0 ("Any"/unset,
+  distinct from an explicit Domain|Private|Public=7) and one with raw value
+  7 are textually indistinguishable in netsh's output (both show
+  "Domain,Private,Public") -- immaterial for this tool's own rules, which
+  always request an explicit nonzero mask and so are never actually stored
+  as the raw-0 sentinel, but a genuine fidelity gap for a third-party rule
+  read through this transport.
+
+  Confirmed live: querying show rule by a built-in rule's raw, unresolved
+  MUI ElementName (e.g. "@FirewallAPI.dll,-32765") both matches and returns
+  the resolved display text ("Network Discovery (UPnP-Out)"); a Program path
+  stored with an environment-variable macro (e.g. "%SystemRoot%\...") is
+  shown already expanded. Neither affects this tool's own rules (Name is
+  always a literal GUID-based string; --program is already required to be
+  an absolute, already-resolved path with no '%').
+
+  Mutation ambiguity: unlike a genuinely confirmed script-side error marker
+  (powershell's WTF_ADD_ERROR/WTF_REMOVE_ERROR, written only by our own
+  try/catch), netsh is an opaque external process whose own nonzero exit or
+  missing "Ok." trailer cannot be trusted as a definite rejection -- an
+  externally-killed cmd.exe/netsh.exe after the rule was already written
+  would look identical. Add()/Remove() therefore return MutationStatus.
+  ApiUnknown (warn, defer to the shared post-mutation Verify() readback) in
+  that case rather than throwing, exactly like powershell's own handling of
+  its "no marker found" case; only a definite invariant violation this
+  transport itself detects (e.g. Remove's own immediate re-check finding
+  other than exactly one match before the name-based delete, since
+  "netsh ... delete rule name=..." has no per-object handle and would
+  otherwise remove every match) still throws.
+```
+
+netsh's `add rule`/`show rule`/`delete rule` are launched as
+`cmd.exe /d /v:off /s /c "<netsh.exe path> <args>"`: `/D` disables AutoRun
+(the cmd.exe analogue of PowerShell's `-NoProfile`/`-ExecutionPolicy
+Bypass`), `/V:OFF` disables delayed variable expansion for this invocation
+regardless of the machine/user `DelayedExpansion` registry default (`/D`
+alone only disables AutoRun; with delayed expansion enabled by that separate
+setting, an unescaped `!` inside an otherwise-safe quoted value would be
+rewritten by cmd.exe before netsh ever saw it), and `/S` is the documented
+modifier that makes cmd.exe strip only the single outer quote pair wrapping
+the whole netsh invocation, leaving netsh's own inner
+`name="..."`/`program="..."` quoting untouched for its own argument parser --
+the identical nested-quoting shape Build.ps1's own `Invoke-VcCommand` already
+uses for `$env:ComSpec /d /s /c`. Every value embedded in that command line
+is additionally checked (CmdFirewallBackend.RequireSafeForCmd) to contain no
+`"`, `%`, `!`, or control character before being concatenated in -- `!` as a
+second, registry-independent layer on top of `/V:OFF` -- on top of the CLI's
+own `--program` validation (FirewallModule.ParseProgram already forbids `"`,
+`%`, `*`, `?`). Redirected output is decoded with the OEM codepage
+(`CultureInfo.CurrentCulture.TextInfo.OEMCodePage`), not .NET's `Encoding.
+Default` (the ANSI codepage): console apps including netsh write redirected
+output in the OEM codepage, which differs from ANSI on many Western Windows
+installs (e.g. 850 vs 1252) and would otherwise garble a non-ASCII
+`--program` path on readback; this tool's own fixed English label text and
+GUID-based Name/Description are pure ASCII and unaffected either way.
+
 Optional-property construction:
 
 ```text
@@ -245,8 +387,9 @@ HRESULT once. Never retry a failed mutation through another route implicitly.
 
 No automatic transport fallback is performed. A missing, wrong-architecture
 or outdated native DLL is an explicit operation failure; com is not tried.
-Keep the matching x64 DLL from this package next to the EXE. Firewall com
-and management do not require the DLL unless --telemetry etw is selected.
+Keep the matching x64 DLL from this package next to the EXE. Firewall com,
+management, powershell and cmd do not require the DLL unless --telemetry etw
+is selected.
 --transport cim/wmi are not recognized aliases for management and are rejected.
 
 ## Telemetry profiles and native ABI

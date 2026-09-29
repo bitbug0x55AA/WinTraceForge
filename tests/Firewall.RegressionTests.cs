@@ -32,6 +32,8 @@ internal static class FirewallRegressionTests
         internal COMException PrepareError;
         internal COMException PolicyError;
         internal FirewallRuleData Prepared;
+        internal MutationStatus AddOutcome = MutationStatus.ApiSucceeded;
+        internal MutationStatus RemoveOutcome = MutationStatus.ApiSucceeded;
         public int CurrentProfiles { get { Calls.Add("profiles"); return Mask; } }
         public int LocalPolicyModifyState { get { Calls.Add("modify-state"); if (PolicyError != null) { throw PolicyError; } return ModifyStateValue; } }
         public IList<FirewallProfileData> ReadProfiles()
@@ -60,7 +62,7 @@ internal static class FirewallRegressionTests
             if (PrepareError != null) { throw PrepareError; }
             Prepared = rule.Copy();
         }
-        public void Add()
+        public MutationStatus Add()
         {
             Calls.Add("add");
             Adds++;
@@ -68,12 +70,14 @@ internal static class FirewallRegressionTests
             FirewallRuleData copy = Prepared.Copy();
             Rules.Add(copy);
             if (AfterAdd != null) { AfterAdd(copy); }
+            return AddOutcome;
         }
-        public void Remove(string name)
+        public MutationStatus Remove(string name)
         {
             Calls.Add("remove");
             Removes++;
             if (!IgnoreRemove) { Rules.RemoveAll(delegate(FirewallRuleData r) { return r.Name == name; }); }
+            return RemoveOutcome;
         }
         public void Dispose() { Calls.Add("dispose"); Disposed = true; }
     }
@@ -83,6 +87,8 @@ internal static class FirewallRegressionTests
         if (args.Length == 1 && args[0] == "--native-detached-preflight") { return RunGatedMode(NativeDetachedPreflight); }
         if (args.Length == 1 && args[0] == "--native-read-only") { return RunGatedMode(NativeReadOnly); }
         if (args.Length == 1 && args[0] == "--management-read-only") { return RunGatedMode(ManagementReadOnly); }
+        if (args.Length == 1 && args[0] == "--powershell-read-only") { return RunGatedMode(PowerShellReadOnly); }
+        if (args.Length == 1 && args[0] == "--cmd-read-only") { return RunGatedMode(CmdReadOnly); }
 
         TextWriter original = Console.Out;
         using (StringWriter output = new StringWriter())
@@ -92,6 +98,9 @@ internal static class FirewallRegressionTests
             {
                 ConsoleUi.Configure(false, true);
                 Parsing();
+                GroupingByTransport();
+                CrossTransportOwnershipRefusal();
+                AmbiguousMutationOutcome();
                 TransportSelection();
                 DirectionalPorts();
                 AddAndCleanup();
@@ -105,6 +114,8 @@ internal static class FirewallRegressionTests
                 ManagementActionCodec();
                 ManagementReadbackClassification();
                 ManagementEscapeWql();
+                CmdAddCommandOmitsProgramWhenUnset();
+                CmdUnsafeCharactersRejected();
 #if FIREWALL_TEST_STUBS
                 EtwFailure();
 #endif
@@ -221,6 +232,57 @@ internal static class FirewallRegressionTests
         }
         ManagementIdentityKey();
         return FirewallModule.Main(new string[] { "profiles", "--transport", "management", "--no-color" });
+    }
+
+    // Shared by --powershell-read-only and --cmd-read-only: both drive an entirely different process
+    // (powershell.exe / cmd.exe+netsh.exe) than management's in-process WMI, but read the same
+    // root\StandardCimv2 provider, so the same candidate-name probe strategy (and the same
+    // FirewallReadbackUnsupportedException skip-past-unsupported-shapes reasoning) applies unchanged.
+    private static int PowerShellReadOnly() { return TransportReadOnly("powershell"); }
+    private static int CmdReadOnly() { return TransportReadOnly("cmd"); }
+
+    private static int TransportReadOnly(string transport)
+    {
+        ConsoleUi.Configure(false, true);
+        using (IFirewallBackend backend = FirewallModule.CreateBackend(transport))
+        {
+            Assert(backend.FindByName(FirewallModule.NameFor(Guid.NewGuid())).Count == 0, transport + " absent enumeration");
+            bool verified = false;
+            foreach (string existingName in CandidateRealRuleElementNames(25))
+            {
+                IList<FirewallRuleData> matches;
+                try { matches = backend.FindByName(existingName); }
+                catch (FirewallReadbackUnsupportedException)
+                {
+                    // See ManagementReadOnly's identical remark: try the next candidate rather than
+                    // letting enumeration order make this test flaky.
+                    continue;
+                }
+                if (matches.Count == 0)
+                {
+                    // CandidateRealRuleElementNames reads the raw WMI ElementName directly, which for
+                    // many built-in rules is an unresolved MUI resource reference (e.g.
+                    // "@FirewallAPI.dll,-32765"); confirmed live that both Get-NetFirewallRule.DisplayName
+                    // and netsh's "Rule Name:" show the resolved text ("Network Discovery (UPnP-Out)")
+                    // instead, so a raw-ElementName candidate can legitimately round-trip to zero matches
+                    // through these two transports even though the rule exists. This never affects this
+                    // tool's own rules (their name is always a literal WinTraceForge.Firewall.<guid>
+                    // string, never an MUI reference) -- only this probe's candidate selection. Try the
+                    // next candidate rather than treating a resolution mismatch as a readback failure.
+                    continue;
+                }
+                assertions++;
+                Console.WriteLine("Existing rule: ElementName-keyed lookup and full filter-association readback succeeded (" + transport + ").");
+                verified = true;
+                break;
+            }
+            if (!verified)
+            {
+                Console.WriteLine("No readable pre-existing rule found among the first candidates " +
+                    "(all were unsupported shapes); " + transport + " full snapshot probe skipped.");
+            }
+        }
+        return FirewallModule.Main(new string[] { "profiles", "--transport", transport, "--no-color" });
     }
 
     private static string FirstNativeTcpUdpName()
@@ -416,9 +478,80 @@ internal static class FirewallRegressionTests
         Bad("rule", "add", "--remote-address", "192.0.2.1", "--remote-port", "443", "--protocol", "any");
     }
 
+    // Pins netsh's one real, documented gap ("add rule" has no group=/grouping= parameter): only
+    // --transport cmd may ever expect an empty Grouping; every other transport -- including
+    // powershell, whose New-NetFirewallRule -Group sets the identical WMI property management writes
+    // directly -- must keep expecting the real marker. A future change that widens this exemption to
+    // another transport, or drops it for cmd, breaks cross-transport ownership silently; this test
+    // does not.
+    private static void GroupingByTransport()
+    {
+        foreach (string transport in new[] { "com", "native", "management", "powershell" })
+        {
+            FirewallOptions options = FirewallModule.Parse(new[] { "rule", "add", "--remote-address", "192.0.2.10",
+                "--remote-port", "44443", "--transport", transport });
+            Assert(FirewallModule.ExpectedRule(options, 1).Grouping == FirewallModule.Group,
+                transport + " expects the real Grouping marker");
+        }
+        FirewallOptions cmdOptions = FirewallModule.Parse(new[] { "rule", "add", "--remote-address", "192.0.2.10",
+            "--remote-port", "44443", "--transport", "cmd" });
+        Assert(FirewallModule.ExpectedRule(cmdOptions, 1).Grouping == "",
+            "cmd cannot stamp Grouping via netsh, so it expects an empty one");
+    }
+
+    // Pins that a backend reporting MutationStatus.ApiUnknown (powershell/cmd's "no clear
+    // success/failure marker" case; see PowerShellFirewallBackend.Add and CmdFirewallBackend.Add)
+    // flows straight through FirewallOperation.Mutate to the shared lifecycle, is never silently
+    // upgraded to ApiSucceeded, and -- because VerifyAfterApiFailure is false and ApiUnknown is not
+    // ApiFailed -- still lets Verify() run and settle the outcome via readback, exactly like a
+    // genuinely successful mutation would.
+    private static void AmbiguousMutationOutcome()
+    {
+        FakeBackend backend = new FakeBackend { AddOutcome = MutationStatus.ApiUnknown };
+        FirewallRunEvidence evidence;
+        int code = Run(AddOptions(), backend, out evidence);
+        Assert(code == 0 && evidence.Lifecycle.Mutation == MutationStatus.ApiUnknown, "ambiguous add outcome reaches the lifecycle unchanged");
+        Assert(evidence.Lifecycle.Verification == VerificationStatus.Confirmed, "ambiguous add outcome still runs Verify");
+        Assert(evidence.MutationReturned && evidence.ReadbackConfirmed, "ambiguous add outcome is settled by readback");
+
+        backend = new FakeBackend();
+        backend.Rules.Add(FirewallModule.ExpectedRule(AddOptions(), 1));
+        backend.RemoveOutcome = MutationStatus.ApiUnknown;
+        code = Run(Options("remove"), backend, out evidence);
+        Assert(code == 0 && evidence.Lifecycle.Mutation == MutationStatus.ApiUnknown, "ambiguous remove outcome reaches the lifecycle unchanged");
+        Assert(evidence.Lifecycle.Verification == VerificationStatus.Confirmed, "ambiguous remove outcome still runs Verify");
+    }
+
+    // A cmd-created rule (empty Grouping) is legitimately owned when checked/removed with
+    // --transport cmd, and legitimately refused as a foreign/Grouping-mismatched rule by every other
+    // transport -- and symmetrically, a rule carrying the real Grouping marker (as every non-cmd
+    // transport creates) is refused by --transport cmd, since ExpectedGrouping("cmd") is "". Both
+    // directions matter: this is the actual protection stopping one transport from touching a rule it
+    // cannot prove it owns, not just a one-way check.
+    private static void CrossTransportOwnershipRefusal()
+    {
+        FirewallOptions cmdAdd = FirewallModule.Parse(new[] { "rule", "add", "--remote-address", "192.0.2.10",
+            "--remote-port", "44443", "--id", Id, "--transport", "cmd" });
+        FakeBackend cmdOwned = new FakeBackend();
+        cmdOwned.Rules.Add(FirewallModule.ExpectedRule(cmdAdd, 1));
+        FirewallRunEvidence evidence;
+        Assert(Run(FirewallModule.Parse(new[] { "rule", "check", "--id", Id, "--transport", "cmd" }), cmdOwned, out evidence) == 0,
+            "cmd owns a rule with empty Grouping");
+        Assert(Run(FirewallModule.Parse(new[] { "rule", "check", "--id", Id, "--transport", "management" }), cmdOwned, out evidence) == 1,
+            "management refuses a cmd-created (empty-Grouping) rule as foreign");
+        Assert(Run(FirewallModule.Parse(new[] { "rule", "check", "--id", Id, "--transport", "powershell" }), cmdOwned, out evidence) == 1,
+            "powershell refuses a cmd-created (empty-Grouping) rule as foreign");
+
+        FakeBackend comOwned = new FakeBackend();
+        comOwned.Rules.Add(FirewallModule.ExpectedRule(AddOptions(), 1));
+        Assert(Run(Options("check"), comOwned, out evidence) == 0, "com owns a rule with the real Grouping marker");
+        Assert(Run(FirewallModule.Parse(new[] { "rule", "check", "--id", Id, "--transport", "cmd" }), comOwned, out evidence) == 1,
+            "cmd refuses a com/native/management/powershell-created rule as foreign (it cannot prove the Grouping marker)");
+    }
+
     private static void TransportSelection()
     {
-        foreach (string transport in new[] { "com", "native", "management" })
+        foreach (string transport in new[] { "com", "native", "management", "powershell", "cmd" })
         {
             FirewallOptions options = FirewallModule.Parse(new[] { "profiles", "--transport", transport.ToUpperInvariant() });
             Assert(options.Transport == transport, "profile transport normalized");
@@ -460,7 +593,7 @@ internal static class FirewallRegressionTests
 
     private static void DirectionalPorts()
     {
-        foreach (string transport in new[] { "com", "native", "management" })
+        foreach (string transport in new[] { "com", "native", "management", "powershell", "cmd" })
         {
             foreach (string direction in new[] { "in", "out" })
             {
@@ -773,6 +906,59 @@ internal static class FirewallRegressionTests
         const BindingFlags flags = BindingFlags.Static | BindingFlags.NonPublic;
         try { return typeof(ManagementFirewallBackend).GetMethod(method, flags).Invoke(null, arguments); }
         catch (TargetInvocationException error) { throw error.InnerException; }
+    }
+
+    private static string CmdBuildAddCommand(FirewallRuleData rule)
+    {
+        const BindingFlags flags = BindingFlags.Static | BindingFlags.NonPublic;
+        try { return (string)typeof(CmdFirewallBackend).GetMethod("BuildAddCommand", flags).Invoke(null, new object[] { rule }); }
+        catch (TargetInvocationException error) { throw error.InnerException; }
+    }
+
+    private static void CmdRequireSafeForCmd(string value)
+    {
+        const BindingFlags flags = BindingFlags.Static | BindingFlags.NonPublic;
+        try { typeof(CmdFirewallBackend).GetMethod("RequireSafeForCmd", flags).Invoke(null, new object[] { value, "test value" }); }
+        catch (TargetInvocationException error) { throw error.InnerException; }
+    }
+
+    // '"' would break netsh's own name="..."/program="..." quoting; '%' expands an environment
+    // variable even inside a quoted cmd.exe region; '!' does too when delayed expansion happens to be
+    // enabled (RunNetsh's own /V:OFF already disables it for this invocation, but RequireSafeForCmd is
+    // a second, registry-independent layer -- see its own remarks); a control character has no safe
+    // representation on a single command line. A plain printable path must pass through unrejected.
+    private static void CmdUnsafeCharactersRejected()
+    {
+        foreach (char unsafeChar in new[] { '"', '%', '!', '\r', '\n', '\t', '\x01' })
+        {
+            bool rejected = false;
+            try { CmdRequireSafeForCmd(@"C:\Tools\a" + unsafeChar + "b.exe"); }
+            catch (FirewallRefusalException) { rejected = true; }
+            Assert(rejected, "cmd rejects unsafe character 0x" + ((int)unsafeChar).ToString("X2"));
+        }
+        bool accepted = true;
+        try { CmdRequireSafeForCmd(@"C:\Tools\Ordinary Path (2).exe"); }
+        catch (FirewallRefusalException) { accepted = false; }
+        Assert(accepted, "cmd accepts an ordinary path with spaces/parentheses");
+    }
+
+    // Pins the exact bug found in review: "add rule ?" documents program=<Application Path and File
+    // Name> with no "any" keyword (unlike localport=/remoteport=, which do document "any"), so sending
+    // program="any" for an unrestricted rule would persist a rule scoped to a program literally named
+    // "any" instead of the "all programs" the CLI's default (no --program) actually requests. The
+    // fix omits program= entirely in that case, matching com/management; this snapshot test fails
+    // loudly if that regresses.
+    private static void CmdAddCommandOmitsProgramWhenUnset()
+    {
+        FirewallRuleData withoutProgram = FirewallModule.ExpectedRule(AddOptions(), 1);
+        Assert(withoutProgram.ApplicationName.Length == 0, "test precondition: no --program given");
+        string command = CmdBuildAddCommand(withoutProgram);
+        Assert(command.IndexOf("program=", StringComparison.Ordinal) < 0, "cmd add omits program= entirely when unset");
+
+        FirewallOptions withProgram = FirewallModule.Parse(new[] { "rule", "add", "--remote-address", "192.0.2.10",
+            "--remote-port", "44443", "--program", @"C:\Tools\probe.exe" });
+        string commandWithProgram = CmdBuildAddCommand(FirewallModule.ExpectedRule(withProgram, 1));
+        Assert(commandWithProgram.Contains("program=\"C:\\Tools\\probe.exe\""), "cmd add quotes an explicit program path");
     }
 
     // Pins the exact accepted/rejected set for MSFT_NetFirewallRule.Action's live ValueMap {2, 3, 4}

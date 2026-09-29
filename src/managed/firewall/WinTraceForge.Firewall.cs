@@ -87,8 +87,16 @@ internal interface IFirewallBackend : IDisposable
     IList<FirewallProfileData> ReadProfiles();
     IList<FirewallRuleData> FindByName(string name);
     void PrepareAdd(FirewallRuleData rule);
-    void Add();
-    void Remove(string name);
+    // Returns ApiSucceeded or ApiUnknown only; a definite rejection is reported by throwing, never by
+    // returning ApiFailed (see FirewallOperation.Mutate, which passes this straight through to the
+    // shared runner). com/native/management always return ApiSucceeded: COM/WMI either throw or
+    // definitively succeed. powershell and cmd shell out to a separate process and can legitimately
+    // complete without a trustworthy signal either way (no marker found; an ambiguous exit code that
+    // could equally mean "netsh rejected this" or "something killed the process after it already
+    // wrote the rule") -- ApiUnknown lets the shared post-mutation Verify() readback settle it, the
+    // same fallback DefenderModule.PowerShellBackend.Add() already uses for the identical situation.
+    MutationStatus Add();
+    MutationStatus Remove(string name);
 }
 
 internal interface IFirewallReader
@@ -102,8 +110,8 @@ internal interface IFirewallReader
 
 internal interface IFirewallWriter
 {
-    void Add();
-    void Remove(string name);
+    MutationStatus Add();
+    MutationStatus Remove(string name);
 }
 
 internal class FirewallRefusalException : InvalidOperationException
@@ -160,6 +168,8 @@ internal static partial class FirewallModule
             case "com": return new ComFirewallBackend();
             case "native": return new NativeFirewallBackend();
             case "management": return new ManagementFirewallBackend();
+            case "powershell": return new PowerShellFirewallBackend();
+            case "cmd": return new CmdFirewallBackend();
             default: throw new FirewallRefusalException("Unknown Firewall transport; no fallback.");
         }
     }
@@ -209,11 +219,12 @@ internal static partial class FirewallModule
             if (CommonArguments.TryParse(args, ref i, options, seen)) { continue; }
             if (key == "--transport")
             {
-                if (i + 1 >= args.Length) { throw new ArgumentException("--transport requires com, native, or management."); }
+                if (i + 1 >= args.Length) { throw new ArgumentException("--transport requires com, native, management, powershell, or cmd."); }
                 options.Transport = args[++i].ToLowerInvariant();
-                if (options.Transport != "com" && options.Transport != "native" && options.Transport != "management")
+                if (options.Transport != "com" && options.Transport != "native" && options.Transport != "management" &&
+                    options.Transport != "powershell" && options.Transport != "cmd")
                 {
-                    throw new ArgumentException("Firewall transports: com, native, management. No fallback.");
+                    throw new ArgumentException("Firewall transports: com, native, management, powershell, cmd. No fallback.");
                 }
                 continue;
             }
@@ -436,6 +447,18 @@ internal static partial class FirewallModule
                 "System.Management -> WMI root\\StandardCimv2 MSFT_NetFirewallProfile / MSFT_NetConnectionProfile -> Windows Firewall" :
                 "System.Management -> WMI root\\StandardCimv2 MSFT_NetFirewallRule -> Windows Firewall";
         }
+        if (options.Transport == "powershell")
+        {
+            return options.Kind == ControlKind.FirewallProfiles ?
+                "Process -> powershell.exe -> Get-NetFirewallProfile/Get-NetConnectionProfile (NetSecurity/NetConnection modules) -> WMI" :
+                "Process -> powershell.exe -> New-/Get-/Remove-NetFirewallRule (NetSecurity module) -> WMI";
+        }
+        if (options.Transport == "cmd")
+        {
+            return options.Kind == ControlKind.FirewallProfiles ?
+                "Process -> cmd.exe -> netsh.exe advfirewall show allprofiles/currentprofile -> Windows Firewall" :
+                "Process -> cmd.exe -> netsh.exe advfirewall firewall add/show/delete rule -> Windows Firewall";
+        }
         return "C# COM interop -> INetFwPolicy2 / INetFwRule3 -> Windows Firewall";
     }
 
@@ -510,11 +533,38 @@ internal static partial class FirewallModule
         ConsoleUi.Text("Do not disable Firewall or broadly reset policy to clean up a rule test. No automatic rollback is performed.");
     }
 
+    // netsh advfirewall firewall add rule has no group=/grouping= parameter (confirmed against
+    // Microsoft's own documented parameter list for "add rule"); a rule created by the cmd transport
+    // can never carry this tool's Grouping marker the way com/native/management/powershell all do
+    // (PowerShell's New-NetFirewallRule -Group sets the same MSFT_NetFirewallRule.RuleGroup property
+    // management writes directly, so it is unaffected). Ownership for a cmd-created rule therefore
+    // rests on Name+Description alone; RequireOwnedUnique/Mismatches/ExpectedRule all call this so a
+    // rule created by one transport is not silently treated as ownable by another that expects a
+    // Grouping value netsh could never have written. See docs\user\firewall.md for the consequence:
+    // cmd-created rules should be checked/removed with --transport cmd.
+    internal static string ExpectedGrouping(string transport) { return transport == "cmd" ? "" : Group; }
+
+    // Renders a Profiles bitmask as the comma-separated profile-name list both New-NetFirewallRule's
+    // -Profile parameter and netsh's profile= parameter accept and echo back verbatim on readback
+    // (confirmed live: an all-profile rule reads back "Domain,Private,Public", never the word "Any",
+    // regardless of how it was created) -- shared between PowerShellFirewallBackend and
+    // CmdFirewallBackend rather than duplicated. mask is always a nonzero 1..7 value here: Probe()
+    // refuses an invalid/empty mask before any backend is asked to add a rule.
+    internal static string ProfileList(int mask)
+    {
+        List<string> names = new List<string>();
+        if ((mask & 1) != 0) { names.Add("Domain"); }
+        if ((mask & 2) != 0) { names.Add("Private"); }
+        if ((mask & 4) != 0) { names.Add("Public"); }
+        if (names.Count == 0) { throw new FirewallRefusalException("Invalid empty firewall profile mask."); }
+        return string.Join(",", names.ToArray());
+    }
+
     internal static FirewallRuleData ExpectedRule(FirewallOptions options, int profiles)
     {
         return new FirewallRuleData
         {
-            Name = options.RuleName, Grouping = Group, Description = DescriptionFor(options.Id),
+            Name = options.RuleName, Grouping = ExpectedGrouping(options.Transport), Description = DescriptionFor(options.Id),
             Enabled = true, Direction = options.Direction, Action = options.Action, Protocol = options.Protocol,
             Profiles = profiles, LocalAddresses = "*", RemoteAddresses = options.RemoteAddress,
             LocalPorts = options.LocalPort == 0 ? "*" : options.LocalPort.ToString(CultureInfo.InvariantCulture),
@@ -531,7 +581,7 @@ internal static partial class FirewallModule
         if (rules.Count != 1) { throw new FirewallRefusalException("Refused: duplicate/ambiguous rule name; no mutation."); }
         FirewallRuleData rule = rules[0];
         if (!string.Equals(rule.Name, options.RuleName, StringComparison.Ordinal) ||
-            !string.Equals(rule.Grouping, Group, StringComparison.Ordinal) ||
+            !string.Equals(rule.Grouping, ExpectedGrouping(options.Transport), StringComparison.Ordinal) ||
             !string.Equals(rule.Description, DescriptionFor(options.Id), StringComparison.Ordinal))
         {
             throw new FirewallRefusalException("Refused: name/group/description do not exactly match this tool's ownership schema.");
@@ -649,7 +699,7 @@ internal static partial class FirewallModule
         ConsoleUi.Section("Usage");
         ConsoleUi.Text("wtf.exe firewall <command> [options]");
         ConsoleUi.Section("Options");
-        ConsoleUi.Row("--transport", "com|native|management  (default: com; no automatic fallback)");
+        ConsoleUi.Row("--transport", "com|native|management|powershell|cmd  (default: com; no automatic fallback)");
         ConsoleUi.Row("--id", "Test GUID: generated for add; required for check/remove.");
         ConsoleUi.Row("--remote-address", "One literal IPv4/IPv6 address  (required for add)");
         ConsoleUi.Row("--remote-port", "1..65535  (required outbound; optional inbound, default: all)");
@@ -669,9 +719,16 @@ internal static partial class FirewallModule
         ConsoleUi.Row("com", "C# COM interop -> INetFwPolicy2 / INetFwRule3");
         ConsoleUi.Row("native", "P/Invoke -> C++ INetFwPolicy2 / INetFwRule3");
         ConsoleUi.Row("management", "System.Management -> WMI MSFT_NetFirewallRule (root\\StandardCimv2)");
-        ConsoleUi.Text("com/native target Windows Firewall COM (netfw); management targets the WMI Firewall " +
-            "provider that PowerShell's New-NetFirewallRule uses. All three read/write the same persisted " +
-            "rule store, not WFP filters; a rule added with one transport can be checked/removed with another.");
+        ConsoleUi.Row("powershell", "powershell.exe -> New-/Get-/Remove-NetFirewallRule (NetSecurity module)");
+        ConsoleUi.Row("cmd", "cmd.exe -> netsh.exe advfirewall firewall add/show/delete rule");
+        ConsoleUi.Text("com/native target Windows Firewall COM (netfw); management and powershell both target the " +
+            "same WMI Firewall provider (powershell through its own cmdlets, management directly). All four " +
+            "read/write the same persisted rule store, not WFP filters; a rule added with one of these four " +
+            "transports can be checked/removed with another.");
+        ConsoleUi.Text("cmd instead shells to netsh, which has no group=/grouping= parameter for 'add rule': a " +
+            "cmd-created rule can never carry this tool's Grouping marker, so its ownership rests on Name+" +
+            "Description alone. Check/remove a cmd-created rule with --transport cmd; the other four transports " +
+            "will refuse it as a Grouping mismatch (by design -- see the Extended notes below).");
         ConsoleUi.Section("Quick start");
         ConsoleUi.Text("Add a test rule (administrator required; retain the printed ID):");
         ConsoleUi.Text("  .\\wtf.exe firewall rule add --remote-address 192.0.2.10 --remote-port 44443");
@@ -683,13 +740,17 @@ internal static partial class FirewallModule
         ConsoleUi.Section("Before you run");
         ConsoleUi.Text("Add/remove require elevation. Quote paths with spaces; use an approved test endpoint.");
         ConsoleUi.Text("Native transport and ETW require WinTraceForge.Native.dll; Rule3 requires Windows 8+.");
+        ConsoleUi.Text("powershell/cmd use System32's own powershell.exe/cmd.exe (no PATH lookup) and need the " +
+            "NetSecurity module / netsh.exe advfirewall firewall context respectively.");
         ConsoleUi.Text("Configuration readback is not proof of traffic blocking/allowing or effective policy.");
         ConsoleUi.HelpExitCodes();
         ConsoleUi.Status("WARN", "Authorized testing only; no Firewall Off, profile mutation or automatic cleanup.");
         if (!ConsoleUi.Verbose) { return; }
         ConsoleUi.Section("Extended notes");
         ConsoleUi.Text("--transport applies to add/check/remove/profiles. Native rule operations execute in C++, not C# COM.");
-        ConsoleUi.Text("Both transports share the same ownership schema; either can inspect/clean up the same marked ID.");
+        ConsoleUi.Text("com/native/management/powershell share the same ownership schema; any of the four can inspect/clean " +
+            "up a rule created by another. cmd cannot stamp Grouping (see Routes above), so use --transport cmd " +
+            "consistently for a rule it created; the other four will refuse it as a Grouping mismatch.");
         ConsoleUi.Text("Cleanup commands preserve the selected transport. No failure triggers automatic transport switching.");
         ConsoleUi.Text("Native requires this release's x64 DLL beside the EXE; older Defender-only DLLs are incompatible.");
         ConsoleUi.Text("management scopes address/port/program via the WMI Firewall provider's call-context " +
@@ -700,7 +761,20 @@ internal static partial class FirewallModule
             "restriction and edge traversal Block, matching the fixed defaults com/native also use.");
         ConsoleUi.Text("management's Local modify state is read from the WindowsFirewall Group Policy registry keys " +
             "(AllowLocalPolicyMerge/AllowLocalIPsecPolicyMerge), since MSFT_NetFirewallRule/-Profile expose no direct " +
-            "equivalent to INetFwPolicy2.LocalPolicyModifyState; it never reports 2 (INBOUND_BLOCKED).");
+            "equivalent to INetFwPolicy2.LocalPolicyModifyState; it never reports 2 (INBOUND_BLOCKED). powershell and " +
+            "cmd read the identical registry keys the same way (they are not WMI/COM properties either).");
+        ConsoleUi.Text("powershell drives the NetSecurity module's own cmdlets (New-/Get-/Remove-NetFirewallRule, " +
+            "Get-NetFirewall*Filter, Get-NetFirewallProfile) and the NetConnection module's Get-NetConnectionProfile " +
+            "for the active profile mask; these are a thin cmdlet wrapper over the same WMI provider management " +
+            "queries directly, so readback fidelity matches management's.");
+        ConsoleUi.Text("cmd parses the fixed-column text of 'netsh advfirewall firewall show rule ... verbose' and " +
+            "'netsh advfirewall show allprofiles/currentprofile'; this is inherently more fragile than a typed API " +
+            "(locale- and version-sensitive label text) and refuses outright on any unrecognized label or value " +
+            "rather than guessing. cmd never reads ExcludedInterfaces (netsh exposes no such field); it is always " +
+            "reported empty for that transport.");
+        ConsoleUi.Text("netsh advfirewall firewall add rule has no group=/grouping= parameter, so cmd-created rules " +
+            "carry an empty Grouping; RequireOwnedUnique/Mismatches compare against '' instead of " + Group + " only " +
+            "for --transport cmd. Use --transport cmd consistently for a rule you created with it.");
         ConsoleUi.Text("Changing caller implementation alone does not establish different enforcement or detection; compare evidence.");
         ConsoleUi.Text("Add defaults: all local addresses and no program, service or interface restriction.");
         ConsoleUi.Text("Outbound requires remote port; inbound requires local port. The opposite-side port defaults to all.");
@@ -882,13 +956,18 @@ internal sealed class ComFirewallBackend : IFirewallBackend
         finally { Release(rule); }
     }
 
-    public void Add()
+    public MutationStatus Add()
     {
         if (preparedRule == null) { throw new FirewallRefusalException("No detached rule was prepared."); }
         Invoke(rules, "Add", BindingFlags.InvokeMethod, new object[] { preparedRule });
+        return MutationStatus.ApiSucceeded;
     }
 
-    public void Remove(string name) { Invoke(rules, "Remove", BindingFlags.InvokeMethod, new object[] { name }); }
+    public MutationStatus Remove(string name)
+    {
+        Invoke(rules, "Remove", BindingFlags.InvokeMethod, new object[] { name });
+        return MutationStatus.ApiSucceeded;
+    }
 
     private static FirewallRuleData ReadRule(object rule)
     {

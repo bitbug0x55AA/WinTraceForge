@@ -61,7 +61,12 @@ internal static class FirewallGroupPolicy
 // port/program -- relies on the shared post-Add Verify() readback every transport already goes through.
 internal sealed class ManagementFirewallBackend : IFirewallBackend
 {
-    private const string AnySentinel = "Any";
+    // AnySentinel and the raw-value codecs/normalizers below are internal (not private): reused by
+    // PowerShellFirewallBackend and CmdFirewallBackend, which read the same root\StandardCimv2
+    // provider through NetSecurity cmdlets / netsh respectively and observe the identical "Any"
+    // sentinel and raw enum values this class already decodes -- the same reuse rationale as
+    // DefenderModule.ComObjects/PowerShellRunner being shared with AsrModule.
+    internal const string AnySentinel = "Any";
     private readonly ManagementScope scope = new ManagementScope(@"\\.\root\StandardCimv2");
     private FirewallRuleData preparedRule;
 
@@ -88,7 +93,7 @@ internal sealed class ManagementFirewallBackend : IFirewallBackend
 
     public int LocalPolicyModifyState { get { return FirewallGroupPolicy.ReadLocalPolicyModifyState(CurrentProfiles); } }
 
-    private static int NetworkCategoryToProfileBit(int category)
+    internal static int NetworkCategoryToProfileBit(int category)
     {
         // MSFT_NetConnectionProfile.NetworkCategory: 0=Public, 1=Private, 2=DomainAuthenticated.
         switch (category)
@@ -138,7 +143,7 @@ internal sealed class ManagementFirewallBackend : IFirewallBackend
     // NetSecurity.GpoBoolean: 0=False, 1=True, 2=NotConfigured. NotConfigured resolves to the
     // documented Windows Firewall built-in default (profiles enabled; inbound rules honored) so this
     // reports the same *effective* value netfw's own (tri-state-free) COM properties would return.
-    private static bool ResolveGpoBoolean(int raw, bool notConfiguredDefault)
+    internal static bool ResolveGpoBoolean(int raw, bool notConfiguredDefault)
     {
         if (raw == 0) { return false; }
         if (raw == 1) { return true; }
@@ -148,7 +153,7 @@ internal sealed class ManagementFirewallBackend : IFirewallBackend
 
     // NetSecurity.Action: 0=NotConfigured, 2=Allow, 4=Block. NotConfigured resolves to Windows
     // Firewall's built-in default action for the given direction (Block inbound, Allow outbound).
-    private static int ResolveProfileAction(int raw, int notConfiguredDefault)
+    internal static int ResolveProfileAction(int raw, int notConfiguredDefault)
     {
         if (raw == 0) { return notConfiguredDefault; }
         if (raw == 2) { return 1; }
@@ -269,7 +274,7 @@ internal sealed class ManagementFirewallBackend : IFirewallBackend
         preparedRule = rule;
     }
 
-    public void Add()
+    public MutationStatus Add()
     {
         if (preparedRule == null) { throw new FirewallRefusalException("No detached rule was prepared."); }
         FirewallRuleData rule = preparedRule;
@@ -294,9 +299,10 @@ internal sealed class ManagementFirewallBackend : IFirewallBackend
             instance.Put(options);
         }
         preparedRule = null;
+        return MutationStatus.ApiSucceeded;
     }
 
-    public void Remove(string name)
+    public MutationStatus Remove(string name)
     {
         using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(scope,
             new ObjectQuery("SELECT * FROM MSFT_NetFirewallRule WHERE ElementName = '" + EscapeWql(name) + "'")))
@@ -305,6 +311,7 @@ internal sealed class ManagementFirewallBackend : IFirewallBackend
         {
             only.Delete();
         }
+        return MutationStatus.ApiSucceeded;
     }
 
     public void Dispose() { }
@@ -359,7 +366,7 @@ internal sealed class ManagementFirewallBackend : IFirewallBackend
     // a real, named CIM value this schema query could not identify by name (no rule using it existed
     // on the host used to verify this mapping); this tool only ever creates Allow(2)/Block(4) rules,
     // so 3 is recognized-but-unsupported rather than truly unrecognized.
-    private static int RuleActionFromRaw(int raw)
+    internal static int RuleActionFromRaw(int raw)
     {
         if (raw == 2) { return 1; }
         if (raw == 4) { return 0; }
@@ -371,27 +378,30 @@ internal sealed class ManagementFirewallBackend : IFirewallBackend
         throw new FirewallRefusalException("Unrecognized MSFT_NetFirewallRule.Action value: " + raw.ToString(CultureInfo.InvariantCulture));
     }
 
-    private static int RuleActionToRaw(int action) { return action == 1 ? 2 : 4; }
+    internal static int RuleActionToRaw(int action) { return action == 1 ? 2 : 4; }
 
     // MSFT_NetFirewallRule.Enabled: 1=True, 2=False (NetSecurity.Enabled; distinct from the profile-
     // level NetSecurity.GpoBoolean used by MSFT_NetFirewallProfile.Enabled).
-    private static bool RuleEnabledFromRaw(int raw)
+    internal static bool RuleEnabledFromRaw(int raw)
     {
         if (raw == 1) { return true; }
         if (raw == 2) { return false; }
         throw new FirewallRefusalException("Unrecognized MSFT_NetFirewallRule.Enabled value: " + raw.ToString(CultureInfo.InvariantCulture));
     }
 
-    private static int RuleEnabledToRaw(bool enabled) { return enabled ? 1 : 2; }
+    internal static int RuleEnabledToRaw(bool enabled) { return enabled ? 1 : 2; }
 
-    private static int ProtocolNumber(string protocol)
+    // Message text deliberately does not name a transport: reused as-is by PowerShellFirewallBackend
+    // and CmdFirewallBackend, whose callers already prefix/attribute the failure to their own
+    // transport where it matters (see FindByName's callers in each).
+    internal static int ProtocolNumber(string protocol)
     {
         if (string.Equals(protocol, "TCP", StringComparison.OrdinalIgnoreCase)) { return 6; }
         if (string.Equals(protocol, "UDP", StringComparison.OrdinalIgnoreCase)) { return 17; }
-        throw new FirewallReadbackUnsupportedException("Unsupported protocol on a management-transport rule readback: " + protocol);
+        throw new FirewallReadbackUnsupportedException("Unsupported protocol on a firewall rule readback: " + protocol);
     }
 
-    private static string ProtocolName(int protocol)
+    internal static string ProtocolName(int protocol)
     {
         if (protocol == 6) { return "TCP"; }
         if (protocol == 17) { return "UDP"; }
@@ -408,14 +418,15 @@ internal sealed class ManagementFirewallBackend : IFirewallBackend
         throw new FirewallRefusalException("Unexpected firewall filter array type.");
     }
 
-    private static string FirstOrAny(string[] values)
+    // Message text deliberately does not name a transport: reused as-is by PowerShellFirewallBackend.
+    internal static string FirstOrAny(string[] values)
     {
         if (values.Length == 0) { return "*"; }
         if (values.Length == 1) { return values[0] == AnySentinel ? "*" : values[0]; }
-        throw new FirewallReadbackUnsupportedException("Unsupported multi-value firewall filter on a management-transport rule readback.");
+        throw new FirewallReadbackUnsupportedException("Unsupported multi-value firewall filter on a firewall rule readback.");
     }
 
-    private static string NoneIfAny(string value)
+    internal static string NoneIfAny(string value)
     {
         return string.IsNullOrEmpty(value) || value == AnySentinel ? "" : value;
     }
@@ -423,7 +434,7 @@ internal sealed class ManagementFirewallBackend : IFirewallBackend
     // DisabledInterfaceAliases (unlike the address/port/application/service filters above, which use
     // the "Any" sentinel) reports an unset value as a single-element ["NotConfigured"] array rather
     // than an empty one; normalize both to empty so management's readback matches com/native's.
-    private static string[] FilterUnconfiguredSentinel(string[] values)
+    internal static string[] FilterUnconfiguredSentinel(string[] values)
     {
         return values.Length == 1 && (values[0] == "NotConfigured" || values[0] == AnySentinel) ? new string[0] : values;
     }

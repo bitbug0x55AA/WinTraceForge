@@ -130,22 +130,24 @@ internal sealed class NativeFirewallBackend : IFirewallBackend
         }
     }
 
-    public void Add()
+    public MutationStatus Add()
     {
         lock (gate)
         {
             EnsureOpen();
             if (!prepared) { throw new FirewallRefusalException("No detached rule was prepared."); }
             Empty(7);
+            return MutationStatus.ApiSucceeded;
         }
     }
 
-    public void Remove(string name)
+    public MutationStatus Remove(string name)
     {
         ValidateName(name);
         lock (gate)
         {
             using (PacketReader reader = Invoke(8, NamePacket(name))) { reader.End(); }
+            return MutationStatus.ApiSucceeded;
         }
     }
 
