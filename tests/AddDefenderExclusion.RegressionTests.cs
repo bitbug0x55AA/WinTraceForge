@@ -35,6 +35,7 @@ internal static class RegressionTests
         CheckAsrArguments();
         CheckAsrLifecycle();
         CheckAsrPolicySourceAndCatalog();
+        CheckAsrStatusRuleDisplay();
         CheckAsrSnapshotDecoding();
         CheckNativeSetterTypeGate();
         CheckAsrTelemetry();
@@ -984,6 +985,48 @@ internal static class RegressionTests
             new[] { ruleKey, AsrRegistry.GlobalExclusionsSourceKey });
         Assert(sources.ContainsKey(ruleKey) && sources.ContainsKey(AsrRegistry.GlobalExclusionsSourceKey),
             "ASR registry policy-source lookup returns every requested key without throwing");
+    }
+
+    private static void CheckAsrStatusRuleDisplay()
+    {
+        string configuredRule = AsrRuleCatalog.JavaScriptOrVbScriptRuleId;
+        string explicitNotConfigured = "D4F940AB-401B-4EFC-AADC-AD5F3C50688A";
+        string unrecognizedRule = Guid.NewGuid().ToString("D").ToUpperInvariant();
+
+        AsrSnapshot empty = EmptyAsrSnapshot();
+        var rules = new Dictionary<string, AsrAction>(StringComparer.OrdinalIgnoreCase)
+        {
+            { configuredRule, AsrAction.Block },
+            { explicitNotConfigured, AsrAction.NotConfigured },
+            { unrecognizedRule, AsrAction.Audit }
+        };
+        var snapshot = new AsrSnapshot(rules, new List<string>(), empty.AvExclusions);
+        var backend = new FakeAsrBackend { Snapshot = snapshot };
+        backend.PolicySource[configuredRule] = AsrPolicySourceKind.GroupPolicy;
+        backend.PolicySource[explicitNotConfigured] = AsrPolicySourceKind.Local;
+
+        string output;
+        TextWriter original = Console.Out;
+        using (var writer = new StringWriter())
+        {
+            try
+            {
+                Console.SetOut(writer);
+                AsrModule.RunWithBackend(AsrModule.Parse(new[] { "status" }), new AsrRunEvidence(), backend);
+            }
+            finally { Console.SetOut(original); }
+            output = writer.ToString();
+        }
+
+        Assert(output.Contains(AsrRuleCatalog.NameOf(configuredRule)), "ASR status shows known rule names without --verbose");
+        Assert(output.Contains(configuredRule) && output.Contains("Block  source=GroupPolicy"),
+            "ASR status keeps the GUID and reports the real source of a configured rule");
+        Assert(output.Contains("NotConfigured  source=Local"),
+            "ASR status attributes the source of an explicit NotConfigured entry");
+        Assert(output.Contains("Audit  source=Unknown") && output.Contains("(name unknown; not in catalog)"),
+            "ASR status keeps source=Unknown for an existing entry and labels an unknown name");
+        Assert(output.Contains("NotConfigured  source=N/A"),
+            "ASR status shows source=N/A for a catalog rule missing from the snapshot");
     }
 
     // Deterministic coverage for the snapshot assembly shared by all three ASR backends: every

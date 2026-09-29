@@ -76,6 +76,8 @@ internal static class AsrRuleCatalog
 
     internal static readonly IEnumerable<string> KnownRuleIds = Names.Keys;
 
+    internal static bool IsKnown(string ruleId) { return Names.ContainsKey(ruleId); }
+
     internal static string NameOf(string ruleId)
     {
         string name;

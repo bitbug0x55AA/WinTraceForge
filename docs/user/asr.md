@@ -12,9 +12,15 @@ ASR commands support `--transport management|com|native|powershell`, defaulting 
 .\wtf.exe defender asr exclusion --check -Path "C:\Lab Data"
 ```
 
-`status` and every `--check` are read-only and do not require elevation. `status` reports configured rule actions, policy sources, ASR-only global exclusions, and ordinary AV exclusions that also widen the ASR exception surface. A small set of known rule GUIDs is shown as `NotConfigured` when absent. Unknown GUIDs are supported; only their display names may be missing.
+`status` and every `--check` are read-only and do not require elevation. `status` reports configured rule actions, policy sources, ASR-only global exclusions, and ordinary AV exclusions that also widen the ASR exception surface. Each rule is printed as its GUID plus its name on the following line; a GUID that is not in the built-in catalog is labeled `(name unknown; not in catalog)`. A small set of known rule GUIDs is shown as `NotConfigured` when Defender's configuration has no entry for them. Unrecognized GUIDs are supported; only their display names are missing.
 
-Policy sources are `Local`, `GroupPolicy`, or `Unknown`, based on corresponding registry settings. Intune/MDM and Windows Security defaults that populate neither key remain `Unknown`; the output is not a complete resultant-policy report.
+Policy sources are `Local`, `GroupPolicy`, `Unknown`, or `N/A`:
+
+- `N/A` means Defender's current configuration has no entry for the rule (`NotConfigured  source=N/A`), so there is no policy source to attribute. It does not mean the source could not be identified.
+- `Local` and `GroupPolicy` are derived from the corresponding registry settings for a rule that has a configuration entry.
+- `Unknown` means the rule does have a configuration entry, but neither registry key explains it. Intune/MDM and Windows Security defaults that populate neither key remain `Unknown`; the output is not a complete resultant-policy report.
+
+A rule that is explicitly configured as `NotConfigured` still has an entry, so it reports its real source (`Local`, `GroupPolicy`, or `Unknown`) rather than `N/A`.
 
 Defender may hide exclusion content from non-administrators. The tool reports that it could not observe the list, rather than showing an empty list. An exclusion `--check` over hidden content is unconfirmed (exit 3). Re-run elevated to read it. `exclusion --check` requires `-Path`; use `status` for a general listing.
 

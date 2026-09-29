@@ -131,17 +131,24 @@ internal static partial class AsrModule
                     { return string.Equals(id, known, StringComparison.OrdinalIgnoreCase); }))
                 { allRuleIds.Add(known); }
             }
-            var policyKeys = new List<string>(allRuleIds);
+            // Only rules that have an entry in the Defender configuration snapshot have a policy
+            // source to attribute; catalog-only rules are shown as absent (source=N/A), not Unknown.
+            // An entry whose action is NotConfigured is still an entry and is queried like any other.
+            var policyKeys = new List<string>(snapshot.Rules.Keys);
             policyKeys.Add(AsrRegistry.GlobalExclusionsSourceKey);
             Dictionary<string, AsrPolicySourceKind> sources = backend.ReadPolicySource(policyKeys);
 
             foreach (string ruleId in allRuleIds)
             {
                 AsrAction action;
-                bool configured = snapshot.Rules.TryGetValue(ruleId, out action);
-                AsrPolicySourceKind source = sources.ContainsKey(ruleId) ? sources[ruleId] : AsrPolicySourceKind.Unknown;
-                ConsoleUi.Row(ruleId, (configured ? action.ToString() : "NotConfigured") + "  source=" + source);
-                ConsoleUi.Detail("  " + AsrRuleCatalog.NameOf(ruleId));
+                bool hasEntry = snapshot.Rules.TryGetValue(ruleId, out action);
+                string sourceText = "N/A";
+                if (hasEntry)
+                {
+                    sourceText = (sources.ContainsKey(ruleId) ? sources[ruleId] : AsrPolicySourceKind.Unknown).ToString();
+                }
+                ConsoleUi.Row(ruleId, (hasEntry ? action.ToString() : "NotConfigured") + "  source=" + sourceText);
+                ConsoleUi.Text("  " + (AsrRuleCatalog.IsKnown(ruleId) ? AsrRuleCatalog.NameOf(ruleId) : "(name unknown; not in catalog)"));
             }
 
             ConsoleUi.Section("ASR-only (global) exclusions");
