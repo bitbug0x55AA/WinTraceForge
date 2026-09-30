@@ -42,6 +42,14 @@ internal static partial class FirewallModule
                 ConsoleUi.Section("Firewall profiles (read-only)");
                 ConsoleUi.Row("Active profile mask", current.ToString(CultureInfo.InvariantCulture));
                 ConsoleUi.Row("Local modify state", ModifyState(backend.LocalPolicyModifyState));
+                // cmd reads netsh's Local policy store (confirmed live: "netsh advfirewall show store"
+                // reports "Policy Store: Local" by default, with no netsh command found to select an
+                // ActiveStore equivalent); every other transport explicitly reads the GPO-merged
+                // effective policy. Printed unconditionally (not only when they might differ) so the
+                // console output alone -- not just code comments and docs\user\firewall.md -- can never
+                // be mistaken for the effective policy on a GPO-managed host.
+                ConsoleUi.Row("Policy store", options.Transport == "cmd" ?
+                    "Local (not GPO-merged effective policy)" : "Effective (GPO-merged)");
                 foreach (FirewallProfileData profile in backend.ReadProfiles())
                 {
                     ConsoleUi.Row(ProfileName(profile.Profile), "enabled=" + profile.Enabled +
@@ -142,6 +150,7 @@ internal static partial class FirewallModule
             evidence.MutationAttempted = true;
             MutationStatus status = options.Operation == "add" ? backend.Add() : backend.Remove(options.RuleName);
             evidence.MutationReturned = true;
+            evidence.MutationOutcome = status;
             return status;
         }
 
@@ -150,20 +159,35 @@ internal static partial class FirewallModule
             evidence.Stage = options.Operation == "add" ? "Firewall add readback" : "Firewall remove readback";
             ConsoleUi.Section("Result / readback");
             IList<FirewallRuleData> actual = backend.FindByName(options.RuleName);
+            // MutationOutcome distinguishes a definite API result (ApiSucceeded, or a thrown failure
+            // that never reaches here) from ApiUnknown (powershell/cmd's "no clear success marker"
+            // case, deferred to exactly this readback -- see IFirewallBackend.Add/Remove). Wording
+            // below reflects that: "returned" only when the backend actually reported success, never
+            // when all that is really known is "the process ended and this is what we found."
+            bool ambiguous = evidence.MutationOutcome == MutationStatus.ApiUnknown;
             if (options.Operation == "remove")
             {
                 if (actual.Count != 0)
                 {
-                    evidence.Outcome = "Remove returned, but the name is still present at readback; no further deletion attempted.";
+                    evidence.Outcome = ambiguous ?
+                        "Remove outcome ambiguous; the rule is still present at readback (not removed). No further deletion attempted." :
+                        "Remove returned, but the name is still present at readback; no further deletion attempted.";
                     return VerificationStatus.Mismatch;
                 }
                 evidence.ReadbackConfirmed = true;
                 evidence.Outcome = "Remove confirmed: no matching rule name at readback.";
                 return VerificationStatus.Confirmed;
             }
+            if (actual.Count == 0 && ambiguous)
+            {
+                evidence.Outcome = "Add outcome ambiguous; rule absent at readback (not applied). No automatic cleanup attempted.";
+                return VerificationStatus.Mismatch;
+            }
             if (actual.Count != 1)
             {
-                evidence.Outcome = "Add returned, but readback did not find exactly one rule. No automatic cleanup attempted.";
+                evidence.Outcome = ambiguous ?
+                    "Add outcome ambiguous; readback found " + actual.Count + " matching rules, not exactly one. No automatic cleanup attempted." :
+                    "Add returned, but readback did not find exactly one rule. No automatic cleanup attempted.";
                 return VerificationStatus.Mismatch;
             }
             IList<string> mismatches = Mismatches(baseline.Expected, actual[0]);

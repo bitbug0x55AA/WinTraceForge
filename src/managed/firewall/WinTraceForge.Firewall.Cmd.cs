@@ -6,8 +6,8 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
-using System.Globalization;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading.Tasks;
 
@@ -27,9 +27,16 @@ using System.Threading.Tasks;
 //     verbose" and "netsh advfirewall show allprofiles/currentprofile", not a typed API. This is
 //     inherently more fragile than the other transports (locale- and Windows-version-sensitive label
 //     text) and refuses outright (FirewallRefusalException/FirewallReadbackUnsupportedException) on
-//     any unrecognized label or value rather than guessing -- the same fail-loud posture
-//     ManagementFirewallBackend already applies to its own WMI readback. ExcludedInterfaces is always
-//     reported as "not available (cmd)": netsh exposes no such field via any show command.
+//     any unrecognized label rather than guessing -- the same fail-loud posture
+//     ManagementFirewallBackend already applies to its own WMI readback. Only specific fields (LocalIP,
+//     InterfaceTypes, Security, Edge traversal, Action, Direction, Enabled, Profiles, Protocol, and a
+//     comma-joined RemoteIP) are value-checked; Program/Service/Description/a single RemoteIP or port
+//     pass through as plain text. ExcludedInterfaces is always reported as "not available (cmd)":
+//     netsh exposes no such field via any show command. "firewall profiles" also reads netsh's Local
+//     policy store, not the GPO-merged effective policy management/powershell explicitly request
+//     (confirmed live: "netsh advfirewall show store" reports "Policy Store: Local" by default, with
+//     no netsh command found to select an ActiveStore equivalent) -- FirewallOperation.Probe prints
+//     which store cmd read so this cannot be mistaken for the effective policy in console output alone.
 // Hardening mirrors DefenderModule.PowerShellRunner's rationale: cmd.exe and netsh.exe are launched by
 // absolute System32 path (never a bare name subject to PATH/CreateProcess search-order hijack), and
 // /D disables AutoRun (the HKLM/HKCU "Command Processor\AutoRun" registry value cmd.exe would
@@ -93,10 +100,18 @@ internal sealed class CmdFirewallBackend : IFirewallBackend
         Result result = RunNetsh("advfirewall show allprofiles");
         if (result.ExitCode != 0 || !ContainsOkTrailer(result.Stdout))
         { throw new InvalidOperationException("netsh advfirewall show allprofiles failed: " + DescribeFailure(result)); }
+        return ParseAllProfiles(result.Stdout);
+    }
 
+    // Split from ReadProfiles so the text-parsing logic can be unit-tested directly against a fixture
+    // string (real "netsh advfirewall show allprofiles" output captured from a development host),
+    // without spawning cmd.exe/netsh.exe -- the same run/parse split FindByName already has via
+    // ParseShowRuleBlocks/DecodeShowRuleBlock.
+    internal static IList<FirewallProfileData> ParseAllProfiles(string stdout)
+    {
         Dictionary<string, FirewallProfileData> byName = new Dictionary<string, FirewallProfileData>(StringComparer.Ordinal);
         string currentHeader = null;
-        foreach (string rawLine in SplitLines(result.Stdout))
+        foreach (string rawLine in SplitLines(stdout))
         {
             string line = rawLine.TrimEnd();
             foreach (string headerName in new[] { "Domain", "Private", "Public" })
@@ -174,7 +189,14 @@ internal sealed class CmdFirewallBackend : IFirewallBackend
     public IList<FirewallRuleData> FindByName(string name)
     {
         RequireSafeForCmd(name, "rule name");
-        Result result = RunNetsh("advfirewall firewall show rule name=\"" + name + "\" verbose");
+        return ParseFindByNameResult(RunNetsh("advfirewall firewall show rule name=\"" + name + "\" verbose"));
+    }
+
+    // Split from FindByName (like ParseRules below) so the not-found/failure classification -- not
+    // just the successful-block parsing -- can be unit-tested directly against a constructed Result,
+    // without spawning cmd.exe/netsh.exe.
+    internal static IList<FirewallRuleData> ParseFindByNameResult(Result result)
+    {
         if (result.ExitCode != 0)
         {
             if (result.Stdout.Trim() == NotFoundMessage) { return new List<FirewallRuleData>(); }
@@ -182,9 +204,18 @@ internal sealed class CmdFirewallBackend : IFirewallBackend
         }
         if (!ContainsOkTrailer(result.Stdout))
         { throw new InvalidOperationException("netsh advfirewall firewall show rule did not end with 'Ok.': " + DescribeFailure(result)); }
+        return ParseRules(result.Stdout);
+    }
 
+    // Split from FindByName so the text-parsing logic can be unit-tested directly against a fixture
+    // string (real "netsh advfirewall firewall show rule ... verbose" output captured from a
+    // development host, covering a rule with Program+Service, one with neither, one with a
+    // comma-joined multi-value RemoteIP, and one with no Description line), without spawning
+    // cmd.exe/netsh.exe.
+    internal static IList<FirewallRuleData> ParseRules(string stdout)
+    {
         List<FirewallRuleData> rules = new List<FirewallRuleData>();
-        foreach (Dictionary<string, string> block in ParseShowRuleBlocks(result.Stdout)) { rules.Add(DecodeShowRuleBlock(block)); }
+        foreach (Dictionary<string, string> block in ParseShowRuleBlocks(stdout)) { rules.Add(DecodeShowRuleBlock(block)); }
         return rules;
     }
 
@@ -244,7 +275,13 @@ internal sealed class CmdFirewallBackend : IFirewallBackend
         {
             Name = Require(block, "Rule Name"),
             Grouping = Require(block, "Grouping"),
-            Description = Require(block, "Description"),
+            // Confirmed live (21 of 606 real rules on a development host, e.g. "Smart Connect"): unlike
+            // Grouping, which is always present as a line with an empty value when unset, netsh omits
+            // the "Description:" line entirely when a rule has none -- the same "line absent" shape as
+            // Program/Service, not a structural anomaly. Requiring it unconditionally would refuse a
+            // valid, common rule shape with a plain FirewallRefusalException; management already maps
+            // the equivalent WMI-null case to "" via "?? \"\"" rather than treating it as an error.
+            Description = block.ContainsKey("Description") ? block["Description"] : "",
             Enabled = ParseYesNo(Require(block, "Enabled"), "Enabled"),
             Direction = ParseDirection(Require(block, "Direction")),
             Profiles = ParseProfileList(Require(block, "Profiles")),
@@ -394,18 +431,7 @@ internal sealed class CmdFirewallBackend : IFirewallBackend
         if (pendingAddCommand == null) { throw new FirewallRefusalException("No detached rule was prepared."); }
         string command = pendingAddCommand;
         pendingAddCommand = null;
-        Result result = RunNetsh(command);
-        if (result.ExitCode == 0 && ContainsOkTrailer(result.Stdout)) { return MutationStatus.ApiSucceeded; }
-        // netsh has no equivalent of a WMI ReturnValue, and unlike the powershell transport's own
-        // script (whose WTF_ADD_ERROR marker is only ever written by our own try/catch, so it
-        // unambiguously means netsh's cmdlet equivalent itself rejected the request), a nonzero exit
-        // or missing "Ok." trailer from this opaque external process cannot be trusted as a definite
-        // rejection: cmd.exe/netsh.exe being torn down externally after the rule was already written
-        // would look identical. Defer to the shared post-mutation Verify() readback instead of
-        // reporting a hard failure that skips it (see FirewallOperation.VerifyAfterApiFailure).
-        ConsoleUi.Status("WARN", "netsh.exe ended without a clear success marker; verifying configuration by readback.");
-        ConsoleUi.Detail(DescribeFailure(result));
-        return MutationStatus.ApiUnknown;
+        return ClassifyMutation(RunNetsh(command));
     }
 
     public MutationStatus Remove(string name)
@@ -420,7 +446,21 @@ internal sealed class CmdFirewallBackend : IFirewallBackend
         IList<FirewallRuleData> refreshed = FindByName(name);
         if (refreshed.Count != 1)
         { throw new FirewallRefusalException("Refused: expected exactly one rule to remove, found " + refreshed.Count + "."); }
-        Result result = RunNetsh("advfirewall firewall delete rule name=\"" + name + "\"");
+        return ClassifyMutation(RunNetsh("advfirewall firewall delete rule name=\"" + name + "\""));
+    }
+
+    // Pure function of its input (no process I/O), so it can be unit-tested directly against a
+    // constructed Result rather than only through a live netsh run or a fake-backend lifecycle test.
+    // netsh has no equivalent of a WMI ReturnValue, and unlike the powershell transport's own script
+    // (whose WTF_ADD_ERROR/WTF_REMOVE_ERROR marker is only ever written by our own try/catch, so it
+    // unambiguously means the cmdlet equivalent itself rejected the request), a nonzero exit or
+    // missing "Ok." trailer from this opaque external process cannot be trusted as a definite
+    // rejection: cmd.exe/netsh.exe being torn down externally after the rule was already
+    // written/removed would look identical to netsh itself rejecting the request. Defer to the shared
+    // post-mutation Verify() readback instead of reporting a hard failure that skips it (see
+    // FirewallOperation.VerifyAfterApiFailure).
+    internal static MutationStatus ClassifyMutation(Result result)
+    {
         if (result.ExitCode == 0 && ContainsOkTrailer(result.Stdout)) { return MutationStatus.ApiSucceeded; }
         ConsoleUi.Status("WARN", "netsh.exe ended without a clear success marker; verifying configuration by readback.");
         ConsoleUi.Detail(DescribeFailure(result));
@@ -464,6 +504,20 @@ internal sealed class CmdFirewallBackend : IFirewallBackend
 
     private static IEnumerable<string> SplitLines(string text) { return (text ?? "").Replace("\r\n", "\n").Split('\n'); }
 
+    [DllImport("kernel32.dll")]
+    private static extern int GetOEMCP();
+
+    // A redirected console child (CreateNoWindow still allocates a console) writes in the SYSTEM OEM
+    // codepage (Win32 GetOEMCP()), not .NET's Encoding.Default (the ANSI codepage) and not
+    // CultureInfo.CurrentCulture.TextInfo.OEMCodePage either -- that property is the OEM codepage
+    // *associated with the current culture*, not the machine's actual console codepage, and the two
+    // can genuinely differ: confirmed live on a development host with CurrentCulture=zh-CN (OEM 936,
+    // a double-byte codepage) while GetOEMCP() correctly reported the real system codepage, 437. Using
+    // 936 there would not just mis-render a non-ASCII byte, it could misalign every following byte
+    // (a DBCS lead byte swallows the next byte as its trail byte). Pulled out as its own function so
+    // the codepage-selection logic itself can be unit-tested without spawning a process.
+    internal static Encoding NetshOutputEncoding() { return Encoding.GetEncoding(GetOEMCP()); }
+
     internal sealed class Result
     {
         internal readonly int ExitCode;
@@ -493,13 +547,8 @@ internal sealed class CmdFirewallBackend : IFirewallBackend
             CreateNoWindow = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
-            // netsh (like most console apps) writes redirected output in the OEM codepage, not the
-            // ANSI codepage Encoding.Default represents in .NET Framework -- on many Western Windows
-            // installs these are different codepages (e.g. 1252 vs 850), which would garble a
-            // non-ASCII --program path on readback (our own fixed English label text and GUID-based
-            // Name/Description are pure ASCII and unaffected either way).
-            StandardOutputEncoding = Encoding.GetEncoding(CultureInfo.CurrentCulture.TextInfo.OEMCodePage),
-            StandardErrorEncoding = Encoding.GetEncoding(CultureInfo.CurrentCulture.TextInfo.OEMCodePage)
+            StandardOutputEncoding = NetshOutputEncoding(),
+            StandardErrorEncoding = NetshOutputEncoding()
         };
         Process process;
         try { process = Process.Start(start); }

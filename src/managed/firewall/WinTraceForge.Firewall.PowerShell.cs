@@ -25,12 +25,31 @@ using System.Text;
 // this backend reuses wholesale rather than duplicating.
 internal sealed class PowerShellFirewallBackend : IFirewallBackend
 {
+    // Shared by every script this backend builds -- see BuildXScript() and PowerShellScriptProloguesAreApplied
+    // in Firewall.RegressionTests.cs, which asserts each builder's output actually starts with this exact
+    // text so a future edit that trims or reorders one script's setup lines cannot silently drop
+    // Set-StrictMode from it without a CI-covered test failing (see RuleFields' remarks on why
+    // Set-StrictMode matters for FindByName specifically).
+    internal const string ScriptPrologue = "$ErrorActionPreference = 'Stop'\r\nSet-StrictMode -Version Latest\r\n";
+
     private string pendingAddScript;
 
     internal PowerShellFirewallBackend()
     {
+        DefenderModule.PowerShellRunner.Result result = DefenderModule.PowerShellRunner.RunScript(BuildConnectScript());
+        string errorMessage = DefenderModule.PowerShellRunner.FindMarkerMessage(result.Stdout, "WTF_CONNECT_ERROR:");
+        if (errorMessage != null || !DefenderModule.PowerShellRunner.ContainsMarker(result.Stdout, "WTF_CONNECT_OK"))
+        {
+            throw new NotSupportedException("PowerShell NetSecurity/NetConnection modules (New-/Get-/Remove-NetFirewallRule, " +
+                "Get-NetFirewall*Filter, Get-NetFirewallProfile, Get-NetConnectionProfile) are unavailable. " +
+                (errorMessage ?? DefenderModule.PowerShellRunner.DescribeFailure(result)));
+        }
+    }
+
+    internal static string BuildConnectScript()
+    {
         StringBuilder script = new StringBuilder();
-        script.Append("$ErrorActionPreference = 'Stop'\r\n");
+        script.Append(ScriptPrologue);
         script.Append("try {\r\n");
         foreach (string command in new[]
         {
@@ -49,31 +68,14 @@ internal sealed class PowerShellFirewallBackend : IFirewallBackend
         script.Append(DefenderModule.PowerShellRunner.EmitErrorMarkerStatement("WTF_CONNECT_ERROR:"));
         script.Append("    exit 1\r\n");
         script.Append("}\r\n");
-
-        DefenderModule.PowerShellRunner.Result result = DefenderModule.PowerShellRunner.RunScript(script.ToString());
-        string errorMessage = DefenderModule.PowerShellRunner.FindMarkerMessage(result.Stdout, "WTF_CONNECT_ERROR:");
-        if (errorMessage != null || !DefenderModule.PowerShellRunner.ContainsMarker(result.Stdout, "WTF_CONNECT_OK"))
-        {
-            throw new NotSupportedException("PowerShell NetSecurity/NetConnection modules (New-/Get-/Remove-NetFirewallRule, " +
-                "Get-NetFirewall*Filter, Get-NetFirewallProfile, Get-NetConnectionProfile) are unavailable. " +
-                (errorMessage ?? DefenderModule.PowerShellRunner.DescribeFailure(result)));
-        }
+        return script.ToString();
     }
 
     public int CurrentProfiles
     {
         get
         {
-            StringBuilder script = new StringBuilder();
-            script.Append("$ErrorActionPreference = 'Stop'\r\n");
-            script.Append("try {\r\n");
-            script.Append("    foreach ($p in @(NetConnection\\Get-NetConnectionProfile)) { Write-Output ('WTF_CAT:' + [int]$p.NetworkCategory) }\r\n");
-            script.Append("    Write-Output 'WTF_CAT_OK'\r\n");
-            script.Append("} catch {\r\n");
-            script.Append(DefenderModule.PowerShellRunner.EmitErrorMarkerStatement("WTF_CAT_ERROR:"));
-            script.Append("    exit 1\r\n");
-            script.Append("}\r\n");
-            DefenderModule.PowerShellRunner.Result result = DefenderModule.PowerShellRunner.RunScript(script.ToString());
+            DefenderModule.PowerShellRunner.Result result = DefenderModule.PowerShellRunner.RunScript(BuildCurrentProfilesScript());
             string errorMessage = DefenderModule.PowerShellRunner.FindMarkerMessage(result.Stdout, "WTF_CAT_ERROR:");
             if (errorMessage != null || !DefenderModule.PowerShellRunner.ContainsMarker(result.Stdout, "WTF_CAT_OK"))
             {
@@ -93,6 +95,20 @@ internal sealed class PowerShellFirewallBackend : IFirewallBackend
         }
     }
 
+    internal static string BuildCurrentProfilesScript()
+    {
+        StringBuilder script = new StringBuilder();
+        script.Append(ScriptPrologue);
+        script.Append("try {\r\n");
+        script.Append("    foreach ($p in @(NetConnection\\Get-NetConnectionProfile)) { Write-Output ('WTF_CAT:' + [int]$p.NetworkCategory) }\r\n");
+        script.Append("    Write-Output 'WTF_CAT_OK'\r\n");
+        script.Append("} catch {\r\n");
+        script.Append(DefenderModule.PowerShellRunner.EmitErrorMarkerStatement("WTF_CAT_ERROR:"));
+        script.Append("    exit 1\r\n");
+        script.Append("}\r\n");
+        return script.ToString();
+    }
+
     // A plain registry read (the same WindowsFirewall GPO keys ManagementFirewallBackend reads), not
     // a WMI/COM/cmdlet property -- reused directly rather than re-implemented via a PowerShell script.
     public int LocalPolicyModifyState { get { return FirewallGroupPolicy.ReadLocalPolicyModifyState(CurrentProfiles); } }
@@ -100,26 +116,7 @@ internal sealed class PowerShellFirewallBackend : IFirewallBackend
     public IList<FirewallProfileData> ReadProfiles()
     {
         string marker = Guid.NewGuid().ToString("N");
-        StringBuilder script = new StringBuilder();
-        script.Append("$ErrorActionPreference = 'Stop'\r\n");
-        script.Append("try {\r\n");
-        script.Append("    $profiles = @(NetSecurity\\Get-NetFirewallProfile -PolicyStore ActiveStore -Name Domain,Private,Public)\r\n");
-        script.Append("    if ($profiles.Count -ne 3) { throw ('Expected exactly 3 firewall profiles, got ' + $profiles.Count) }\r\n");
-        script.Append("    foreach ($p in $profiles) {\r\n");
-        script.Append("        Write-Output ('WTF_PROFILE_" + marker + ":' + $p.Name + ':' + [int]$p.Enabled + ':' + " +
-            "[int]$p.AllowInboundRules + ':' + [int]$p.DefaultInboundAction + ':' + [int]$p.DefaultOutboundAction)\r\n");
-        script.Append("        foreach ($alias in $p.DisabledInterfaceAliases) {\r\n");
-        script.Append("            Write-Output ('WTF_IFACE_" + marker + ":' + $p.Name + ':' + " +
-            "[Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([string]$alias)))\r\n");
-        script.Append("        }\r\n");
-        script.Append("    }\r\n");
-        script.Append("    Write-Output 'WTF_PROFILES_OK'\r\n");
-        script.Append("} catch {\r\n");
-        script.Append(DefenderModule.PowerShellRunner.EmitErrorMarkerStatement("WTF_PROFILES_ERROR:"));
-        script.Append("    exit 1\r\n");
-        script.Append("}\r\n");
-
-        DefenderModule.PowerShellRunner.Result result = DefenderModule.PowerShellRunner.RunScript(script.ToString());
+        DefenderModule.PowerShellRunner.Result result = DefenderModule.PowerShellRunner.RunScript(BuildReadProfilesScript(marker));
         string errorMessage = DefenderModule.PowerShellRunner.FindMarkerMessage(result.Stdout, "WTF_PROFILES_ERROR:");
         if (errorMessage != null)
         { throw new InvalidOperationException("Get-NetFirewallProfile (PowerShell) failed: " + errorMessage); }
@@ -178,6 +175,29 @@ internal sealed class PowerShellFirewallBackend : IFirewallBackend
         return result2;
     }
 
+    internal static string BuildReadProfilesScript(string marker)
+    {
+        StringBuilder script = new StringBuilder();
+        script.Append(ScriptPrologue);
+        script.Append("try {\r\n");
+        script.Append("    $profiles = @(NetSecurity\\Get-NetFirewallProfile -PolicyStore ActiveStore -Name Domain,Private,Public)\r\n");
+        script.Append("    if ($profiles.Count -ne 3) { throw ('Expected exactly 3 firewall profiles, got ' + $profiles.Count) }\r\n");
+        script.Append("    foreach ($p in $profiles) {\r\n");
+        script.Append("        Write-Output ('WTF_PROFILE_" + marker + ":' + $p.Name + ':' + [int]$p.Enabled + ':' + " +
+            "[int]$p.AllowInboundRules + ':' + [int]$p.DefaultInboundAction + ':' + [int]$p.DefaultOutboundAction)\r\n");
+        script.Append("        foreach ($alias in $p.DisabledInterfaceAliases) {\r\n");
+        script.Append("            Write-Output ('WTF_IFACE_" + marker + ":' + $p.Name + ':' + " +
+            "[Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([string]$alias)))\r\n");
+        script.Append("        }\r\n");
+        script.Append("    }\r\n");
+        script.Append("    Write-Output 'WTF_PROFILES_OK'\r\n");
+        script.Append("} catch {\r\n");
+        script.Append(DefenderModule.PowerShellRunner.EmitErrorMarkerStatement("WTF_PROFILES_ERROR:"));
+        script.Append("    exit 1\r\n");
+        script.Append("}\r\n");
+        return script.ToString();
+    }
+
     private static int NameToProfileBit(string name)
     {
         if (string.Equals(name, "Domain", StringComparison.OrdinalIgnoreCase)) { return 1; }
@@ -197,6 +217,18 @@ internal sealed class PowerShellFirewallBackend : IFirewallBackend
     // One CIM-backed object per rule plus each of its 7 associated MSFT_Net*Filter objects (the exact
     // same object shape ManagementFirewallBackend.ReadRule reads via GetRelated), fetched through the
     // matching Get-NetFirewall*Filter cmdlet piped from the rule instead of a WQL relationship query.
+    // Every field below is read via a bare $rule./$filter. property access with no existence check of
+    // its own (unlike DefenderModule.PowerShellRunner.BuildReadScript's explicit
+    // $pref.PSObject.Properties['<field>'] assertion): without Set-StrictMode, a property renamed or
+    // removed by a future NetSecurity module version would read back as $null/0 rather than throwing,
+    // and for Authentication/Encryption/InterfaceType/OverrideBlockRules 0 means "unrestricted" -- so a
+    // rule that actually carries one of these restrictions would silently decode as unrestricted
+    // instead of hitting the FirewallReadbackUnsupportedException refusal below. Every script this
+    // backend runs sets Set-StrictMode -Version Latest immediately after $ErrorActionPreference
+    // specifically to close this: confirmed live that it turns a nonexistent-property read into a
+    // terminating error even on a plain, strongly-typed (non-PSCustomObject) object -- see
+    // PowerShellStrictModeCatchesMissingProperty in Firewall.RegressionTests.cs, which exercises this
+    // exact mechanism against a real powershell.exe rather than only asserting it in a comment.
     private static readonly string[] RuleFields =
     {
         "ElementName", "RuleGroup", "Description", "Enabled", "Direction", "Action", "Profiles",
@@ -209,8 +241,25 @@ internal sealed class PowerShellFirewallBackend : IFirewallBackend
     public IList<FirewallRuleData> FindByName(string name)
     {
         string marker = Guid.NewGuid().ToString("N");
+        string scriptText = BuildFindByNameScript(name, marker);
+        DefenderModule.PowerShellRunner.ValidateScriptLength(scriptText);
+
+        DefenderModule.PowerShellRunner.Result result = DefenderModule.PowerShellRunner.RunScript(scriptText);
+        string errorMessage = DefenderModule.PowerShellRunner.FindMarkerMessage(result.Stdout, "WTF_READ_ERROR:");
+        if (errorMessage != null)
+        { throw new InvalidOperationException("Get-NetFirewallRule (PowerShell) readback failed: " + errorMessage); }
+        if (!DefenderModule.PowerShellRunner.ContainsMarker(result.Stdout, "WTF_READ_OK"))
+        {
+            throw new InvalidOperationException("Get-NetFirewallRule (PowerShell) readback did not complete (exit " +
+                result.ExitCode + "): " + DefenderModule.PowerShellRunner.DescribeFailure(result));
+        }
+        return ParseRules(result.Stdout, marker);
+    }
+
+    internal static string BuildFindByNameScript(string name, string marker)
+    {
         StringBuilder script = new StringBuilder();
-        script.Append("$ErrorActionPreference = 'Stop'\r\n");
+        script.Append(ScriptPrologue);
         script.Append("try {\r\n");
         script.Append("    $name = " + DefenderModule.PowerShellRunner.EncodeValueExpression(name) + "\r\n");
         script.Append("    $rules = @(NetSecurity\\Get-NetFirewallRule | Where-Object { $_.DisplayName -eq $name })\r\n");
@@ -267,22 +316,14 @@ internal sealed class PowerShellFirewallBackend : IFirewallBackend
         script.Append(DefenderModule.PowerShellRunner.EmitErrorMarkerStatement("WTF_READ_ERROR:"));
         script.Append("    exit 1\r\n");
         script.Append("}\r\n");
-        string scriptText = script.ToString();
-        DefenderModule.PowerShellRunner.ValidateScriptLength(scriptText);
-
-        DefenderModule.PowerShellRunner.Result result = DefenderModule.PowerShellRunner.RunScript(scriptText);
-        string errorMessage = DefenderModule.PowerShellRunner.FindMarkerMessage(result.Stdout, "WTF_READ_ERROR:");
-        if (errorMessage != null)
-        { throw new InvalidOperationException("Get-NetFirewallRule (PowerShell) readback failed: " + errorMessage); }
-        if (!DefenderModule.PowerShellRunner.ContainsMarker(result.Stdout, "WTF_READ_OK"))
-        {
-            throw new InvalidOperationException("Get-NetFirewallRule (PowerShell) readback did not complete (exit " +
-                result.ExitCode + "): " + DefenderModule.PowerShellRunner.DescribeFailure(result));
-        }
-        return ParseRules(result.Stdout, marker);
+        return script.ToString();
     }
 
-    private static IList<FirewallRuleData> ParseRules(string stdout, string marker)
+    // Internal (not private): unit-tested directly against a constructed marker-delimited fixture
+    // string (Firewall.RegressionTests.cs), covering a truncated stream (missing WTF_END_...), a
+    // begin-marker index out of range, and a begin/end field-name mismatch -- none of which require a
+    // live powershell.exe run to exercise, since this function's only input is text.
+    internal static IList<FirewallRuleData> ParseRules(string stdout, string marker)
     {
         string countPrefix = "WTF_COUNT_" + marker + ":";
         int? count = null;
@@ -403,10 +444,10 @@ internal sealed class PowerShellFirewallBackend : IFirewallBackend
         pendingAddScript = BuildAddScript(rule);
     }
 
-    private static string BuildAddScript(FirewallRuleData rule)
+    internal static string BuildAddScript(FirewallRuleData rule)
     {
         StringBuilder script = new StringBuilder();
-        script.Append("$ErrorActionPreference = 'Stop'\r\n");
+        script.Append(ScriptPrologue);
         script.Append("try {\r\n");
         script.Append("    NetSecurity\\New-NetFirewallRule");
         script.Append(" -DisplayName " + DefenderModule.PowerShellRunner.EncodeValueExpression(rule.Name));
@@ -439,24 +480,22 @@ internal sealed class PowerShellFirewallBackend : IFirewallBackend
         if (pendingAddScript == null) { throw new FirewallRefusalException("No detached rule was prepared."); }
         DefenderModule.PowerShellRunner.Result result = DefenderModule.PowerShellRunner.RunScript(pendingAddScript);
         pendingAddScript = null;
-        string errorMessage = DefenderModule.PowerShellRunner.FindMarkerMessage(result.Stdout, "WTF_ADD_ERROR:");
-        if (errorMessage != null)
-        { throw new InvalidOperationException("New-NetFirewallRule (PowerShell) failed: " + errorMessage); }
-        if (DefenderModule.PowerShellRunner.ContainsMarker(result.Stdout, "WTF_ADD_OK")) { return MutationStatus.ApiSucceeded; }
-        // No WMI ReturnValue exists for a PowerShell cmdlet call and no marker was found either
-        // (crash, or the process torn down externally after New-NetFirewallRule may already have
-        // run): genuinely unknown, not a known failure. The shared FirewallOperation.Verify()
-        // readback that always follows is the only thing that can settle it either way.
-        ConsoleUi.Status("WARN", "powershell.exe ended (exit code " + result.ExitCode +
-            ") without a clear success/failure marker; verifying configuration by readback.");
-        ConsoleUi.Detail(DefenderModule.PowerShellRunner.DescribeFailure(result));
-        return MutationStatus.ApiUnknown;
+        return ClassifyMutation(result, "WTF_ADD_OK", "WTF_ADD_ERROR:", "New-NetFirewallRule (PowerShell) failed: ");
     }
 
     public MutationStatus Remove(string name)
     {
+        string scriptText = BuildRemoveScript(name);
+        DefenderModule.PowerShellRunner.ValidateScriptLength(scriptText);
+
+        DefenderModule.PowerShellRunner.Result result = DefenderModule.PowerShellRunner.RunScript(scriptText);
+        return ClassifyMutation(result, "WTF_REMOVE_OK", "WTF_REMOVE_ERROR:", "Remove-NetFirewallRule (PowerShell) failed: ");
+    }
+
+    internal static string BuildRemoveScript(string name)
+    {
         StringBuilder script = new StringBuilder();
-        script.Append("$ErrorActionPreference = 'Stop'\r\n");
+        script.Append(ScriptPrologue);
         script.Append("try {\r\n");
         script.Append("    $name = " + DefenderModule.PowerShellRunner.EncodeValueExpression(name) + "\r\n");
         script.Append("    $rules = @(NetSecurity\\Get-NetFirewallRule | Where-Object { $_.DisplayName -eq $name })\r\n");
@@ -467,14 +506,25 @@ internal sealed class PowerShellFirewallBackend : IFirewallBackend
         script.Append(DefenderModule.PowerShellRunner.EmitErrorMarkerStatement("WTF_REMOVE_ERROR:"));
         script.Append("    exit 1\r\n");
         script.Append("}\r\n");
-        string scriptText = script.ToString();
-        DefenderModule.PowerShellRunner.ValidateScriptLength(scriptText);
+        return script.ToString();
+    }
 
-        DefenderModule.PowerShellRunner.Result result = DefenderModule.PowerShellRunner.RunScript(scriptText);
-        string errorMessage = DefenderModule.PowerShellRunner.FindMarkerMessage(result.Stdout, "WTF_REMOVE_ERROR:");
-        if (errorMessage != null)
-        { throw new InvalidOperationException("Remove-NetFirewallRule (PowerShell) failed: " + errorMessage); }
-        if (DefenderModule.PowerShellRunner.ContainsMarker(result.Stdout, "WTF_REMOVE_OK")) { return MutationStatus.ApiSucceeded; }
+    // Thin wrapper around the pure DefenderModule.PowerShellRunner.ClassifyResult (itself unit-tested
+    // directly against a constructed Result -- see Firewall.RegressionTests.cs -- rather than only
+    // through a live script run or a fake-backend lifecycle test): Ok maps to ApiSucceeded, Error
+    // throws (the only case where "the script's own try/catch reported a real failure" is actually
+    // known), and Unknown maps to ApiUnknown, warning and deferring to the shared post-mutation
+    // Verify() readback that always follows -- exactly DefenderModule's own Add() handling of the
+    // identical situation.
+    internal static MutationStatus ClassifyMutation(DefenderModule.PowerShellRunner.Result result,
+        string okMarker, string errorPrefix, string failurePrefix)
+    {
+        string errorMessage;
+        DefenderModule.PowerShellRunner.AddOutcome outcome =
+            DefenderModule.PowerShellRunner.ClassifyResult(result, okMarker, errorPrefix, out errorMessage);
+        if (outcome == DefenderModule.PowerShellRunner.AddOutcome.Error)
+        { throw new InvalidOperationException(failurePrefix + errorMessage); }
+        if (outcome == DefenderModule.PowerShellRunner.AddOutcome.Ok) { return MutationStatus.ApiSucceeded; }
         ConsoleUi.Status("WARN", "powershell.exe ended (exit code " + result.ExitCode +
             ") without a clear success/failure marker; verifying configuration by readback.");
         ConsoleUi.Detail(DefenderModule.PowerShellRunner.DescribeFailure(result));

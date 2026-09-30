@@ -49,6 +49,7 @@ internal sealed class FirewallRunEvidence : ControlRunEvidence
     internal bool BaselineRead;
     internal bool MutationAttempted;
     internal bool MutationReturned;
+    internal MutationStatus MutationOutcome = MutationStatus.NotAttempted;
     internal bool ReadbackConfirmed;
     internal bool AlreadyAbsent;
     internal int FrozenProfiles;
@@ -769,9 +770,15 @@ internal static partial class FirewallModule
             "queries directly, so readback fidelity matches management's.");
         ConsoleUi.Text("cmd parses the fixed-column text of 'netsh advfirewall firewall show rule ... verbose' and " +
             "'netsh advfirewall show allprofiles/currentprofile'; this is inherently more fragile than a typed API " +
-            "(locale- and version-sensitive label text) and refuses outright on any unrecognized label or value " +
-            "rather than guessing. cmd never reads ExcludedInterfaces (netsh exposes no such field); it is always " +
-            "reported empty for that transport.");
+            "(locale- and version-sensitive label text) and refuses outright on any unrecognized label. Only " +
+            "specific fields (LocalIP, InterfaceTypes, Security, Edge traversal, Action, Direction, Enabled, " +
+            "Profiles, Protocol, RemoteIP when comma-joined) are value-checked against known text; Program, " +
+            "Service, Description and a single-value RemoteIP/port are passed through as plain text. A missing " +
+            "'Description:' line (netsh omits it, not an 'Any' sentinel, when a rule has none) reads as ''.");
+        ConsoleUi.Text("cmd never reads ExcludedInterfaces (netsh exposes no such field); it reads back as the " +
+            "literal text 'not available (cmd)', not an empty list, so it is never mistaken for a confirmed none.");
+        ConsoleUi.Text("cmd's 'firewall profiles' reads netsh's Local policy store, not the GPO-merged effective " +
+            "policy management/powershell explicitly request; the printed 'Policy store' line says which.");
         ConsoleUi.Text("netsh advfirewall firewall add rule has no group=/grouping= parameter, so cmd-created rules " +
             "carry an empty Grouping; RequireOwnedUnique/Mismatches compare against '' instead of " + Group + " only " +
             "for --transport cmd. Use --transport cmd consistently for a rule you created with it.");

@@ -1196,9 +1196,20 @@ internal static class DefenderModule
         // rejection.
         internal static AddOutcome ClassifyAddResult(Result result, out string errorMessage)
         {
-            errorMessage = FindMarkerMessage(result.Stdout, "WTF_ADD_ERROR:");
+            return ClassifyResult(result, "WTF_ADD_OK", "WTF_ADD_ERROR:", out errorMessage);
+        }
+
+        // General form of ClassifyAddResult, parameterized on the OK/ERROR: marker pair rather than
+        // hard-coded to "WTF_ADD_*" -- reused by FirewallModule's PowerShellFirewallBackend for its
+        // Remove() outcome (marker pair "WTF_REMOVE_OK"/"WTF_REMOVE_ERROR:"), which needs the identical
+        // Ok/Error/Unknown classification but is not an Add. A pure function of its inputs (no process
+        // I/O), so it can be unit-tested directly against a constructed Result rather than only through
+        // a live script run or a fake-backend lifecycle test.
+        internal static AddOutcome ClassifyResult(Result result, string okMarker, string errorPrefix, out string errorMessage)
+        {
+            errorMessage = FindMarkerMessage(result.Stdout, errorPrefix);
             if (errorMessage != null) { return AddOutcome.Error; }
-            return ContainsMarker(result.Stdout, "WTF_ADD_OK") ? AddOutcome.Ok : AddOutcome.Unknown;
+            return ContainsMarker(result.Stdout, okMarker) ? AddOutcome.Ok : AddOutcome.Unknown;
         }
 
         // Builds a read script for one CIM-backed source expression (e.g. "ConfigDefender\Get-MpPreference";
