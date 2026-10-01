@@ -58,6 +58,16 @@ namespace
             wcscmp(name, L"AttackSurfaceReductionRules_Actions") == 0);
     }
 
+    // The only properties Remove may be asked to act on: the four antivirus exclusion string arrays.
+    // The ASR properties stay out of reach of NativeRemove; this module has no ASR removal.
+    bool IsExclusionName(const wchar_t* name)
+    {
+        return name && (wcscmp(name, L"ExclusionPath") == 0 ||
+            wcscmp(name, L"ExclusionExtension") == 0 ||
+            wcscmp(name, L"ExclusionProcess") == 0 ||
+            wcscmp(name, L"ExclusionIpAddress") == 0);
+    }
+
     // Every allowed property is a CIM array; only AttackSurfaceReductionRules_Actions is a UInt8
     // array (Add-MpPreference's own action enum is byte-sized) -- every other one is a string array.
     CIMTYPE ExpectedArrayType(const wchar_t* name)
@@ -115,6 +125,18 @@ extern "C" __declspec(dllexport) HRESULT __cdecl NativeOpen(void** handle) noexc
     }
     *handle = session;
     return S_OK;
+}
+
+// Loads only the MSFT_MpPreference class definition: what the read and Remove metadata checks need.
+// Unlike NativePrepare it never touches the Add method, so it works where Add's metadata is unavailable.
+extern "C" __declspec(dllexport) HRESULT __cdecl NativePrepareRead(void* handle) noexcept
+{
+    Session* session = static_cast<Session*>(handle);
+    if (!session || !session->services) { return E_INVALIDARG; }
+    BStr className(L"MSFT_MpPreference");
+    if (!className.value) { return E_OUTOFMEMORY; }
+    return session->services->GetObject(className.value, 0, nullptr,
+        session->definition.ReleaseAndGetAddressOf(), nullptr);
 }
 
 extern "C" __declspec(dllexport) HRESULT __cdecl NativePrepare(void* handle) noexcept
@@ -210,6 +232,99 @@ extern "C" __declspec(dllexport) HRESULT __cdecl NativeAdd(
     ComPtr<IWbemClassObject> result;
     HRESULT hr = session->services->ExecMethod(className.value, method.value, 0, nullptr,
         session->input.Get(), result.GetAddressOf(), nullptr);
+    if (FAILED(hr)) { return hr; }
+    if (!result) { return S_OK; }
+    hr = result->Get(L"ReturnValue", 0, returnValue, nullptr, nullptr);
+    return hr == WBEM_E_NOT_FOUND ? S_OK : hr;
+}
+
+// Read surface only: is the property a readable array of the expected type on the preference class?
+// Unlike NativeSupports it does not consult the Add input, so a property Add omits is still found.
+extern "C" __declspec(dllexport) HRESULT __cdecl NativeSupportsRead(
+    void* handle, const wchar_t* name, BOOL* supported) noexcept
+{
+    Session* session = static_cast<Session*>(handle);
+    if (!supported) { return E_POINTER; }
+    *supported = FALSE;
+    if (!session || !session->definition || !Allowed(name)) { return E_INVALIDARG; }
+    CIMTYPE type = 0;
+    HRESULT hr = session->definition->Get(name, 0, nullptr, &type, nullptr);
+    if (hr == WBEM_E_NOT_FOUND) { return S_OK; }
+    if (FAILED(hr)) { return hr; }
+    *supported = type == ExpectedArrayType(name);
+    return S_OK;
+}
+
+// Reports whether MSFT_MpPreference.Remove accepts the named exclusion property as a string array.
+// Needs a session that already ran NativePrepare (it supplies the class definition).
+extern "C" __declspec(dllexport) HRESULT __cdecl NativeSupportsRemove(
+    void* handle, const wchar_t* name, BOOL* supported) noexcept
+{
+    Session* session = static_cast<Session*>(handle);
+    if (!supported) { return E_POINTER; }
+    *supported = FALSE;
+    // The name gate runs before any session check and returns its own HRESULT, so it is observable
+    // (and regression-tested) without a live provider session, like the setters' type gate.
+    if (!IsExclusionName(name)) { return WBEM_E_INVALID_PROPERTY; }
+    if (!session || !session->definition) { return E_INVALIDARG; }
+    ComPtr<IWbemClassObject> parameters;
+    HRESULT hr = session->definition->GetMethod(L"Remove", 0, parameters.GetAddressOf(), nullptr);
+    if (hr == WBEM_E_NOT_FOUND) { return S_OK; }
+    if (FAILED(hr)) { return hr; }
+    if (!parameters) { return S_OK; }
+    CIMTYPE type = 0;
+    hr = parameters->Get(name, 0, nullptr, &type, nullptr);
+    if (hr == WBEM_E_NOT_FOUND) { return S_OK; }
+    if (FAILED(hr)) { return hr; }
+    *supported = type == (CIM_STRING | CIM_FLAG_ARRAY);
+    return S_OK;
+}
+
+// One MSFT_MpPreference.Remove request for the given values of a single exclusion property. A fresh
+// input instance is spawned per call, so values from an earlier request can never leak into this one.
+extern "C" __declspec(dllexport) HRESULT __cdecl NativeRemove(
+    void* handle, const wchar_t* name, const wchar_t* const* values, int count, VARIANT* returnValue) noexcept
+{
+    if (!returnValue) { return E_POINTER; }
+    VariantInit(returnValue);
+    // Name gate first, with a distinguishable HRESULT: only the four exclusion properties may be removed.
+    if (!IsExclusionName(name)) { return WBEM_E_INVALID_PROPERTY; }
+    if (!values || count <= 0) { return E_INVALIDARG; }
+    Session* session = static_cast<Session*>(handle);
+    if (!session || !session->services || !session->definition) { return E_INVALIDARG; }
+    ComPtr<IWbemClassObject> parameters;
+    HRESULT hr = session->definition->GetMethod(L"Remove", 0, parameters.GetAddressOf(), nullptr);
+    if (FAILED(hr)) { return hr; }
+    if (!parameters) { return WBEM_E_INVALID_METHOD_PARAMETERS; }
+    CIMTYPE type = 0;
+    hr = parameters->Get(name, 0, nullptr, &type, nullptr);
+    if (FAILED(hr)) { return hr; }
+    if (type != (CIM_STRING | CIM_FLAG_ARRAY)) { return WBEM_E_TYPE_MISMATCH; }
+    ComPtr<IWbemClassObject> input;
+    hr = parameters->SpawnInstance(0, input.GetAddressOf());
+    if (FAILED(hr)) { return hr; }
+    {
+        Variant array;
+        array.value.vt = VT_ARRAY | VT_BSTR;
+        array.value.parray = SafeArrayCreateVector(VT_BSTR, 0, static_cast<ULONG>(count));
+        if (!array.value.parray) { return E_OUTOFMEMORY; }
+        for (LONG i = 0; i < count; i++)
+        {
+            if (!values[i]) { return E_INVALIDARG; }
+            BStr value(values[i]);
+            if (!value.value) { return E_OUTOFMEMORY; }
+            hr = SafeArrayPutElement(array.value.parray, &i, value.value);
+            if (FAILED(hr)) { return hr; }
+        }
+        hr = input->Put(name, 0, &array.value, 0);
+        if (FAILED(hr)) { return hr; }
+    }
+    BStr className(L"MSFT_MpPreference");
+    BStr method(L"Remove");
+    if (!className.value || !method.value) { return E_OUTOFMEMORY; }
+    ComPtr<IWbemClassObject> result;
+    hr = session->services->ExecMethod(className.value, method.value, 0, nullptr,
+        input.Get(), result.GetAddressOf(), nullptr);
     if (FAILED(hr)) { return hr; }
     if (!result) { return S_OK; }
     hr = result->Get(L"ReturnValue", 0, returnValue, nullptr, nullptr);

@@ -26,9 +26,27 @@ internal static class DefenderModule
         "ExclusionPath", "ExclusionExtension", "ExclusionProcess", "ExclusionIpAddress"
     };
 
+    // The explicit command word that follows "defender exclusion". Add is also the mode of the
+    // legacy implicit syntax (values without a command word), flagged by Options.LegacySyntax.
+    internal enum ExclusionMode { Add, Check, List, Remove }
+
+    // Defender returns this text in place of the real values when the caller may not read the
+    // exclusion lists (a non-administrator, or a policy that hides them from local administrators).
+    // Only the language-independent "N/A:" prefix is matched, since the sentence itself is localized.
+    private const string UnreadableMarkerPrefix = "N/A:";
+
     internal sealed class Options : ControlOptions
     {
-        internal bool CheckOnly;
+        internal ExclusionMode Mode = ExclusionMode.Add;
+        // True when the legacy implicit-add / --check syntax was used instead of a command word.
+        internal bool LegacySyntax;
+        // Legacy view of Mode: setting it maps to Check/Add, as the old --check flag did.
+        internal bool CheckOnly
+        {
+            get { return Mode == ExclusionMode.Check; }
+            set { Mode = value ? ExclusionMode.Check : ExclusionMode.Add; }
+        }
+        internal bool ReadOnly { get { return Mode == ExclusionMode.Check || Mode == ExclusionMode.List; } }
         internal string Transport = "management";
         internal readonly Dictionary<string, List<string>> Exclusions =
             new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
@@ -67,6 +85,7 @@ internal static class DefenderModule
             PrintHelp();
             return 0;
         }
+        PrintLegacyHint(options);
 
         var evidence = new RunEvidence();
         return ControlRuntime.Execute(options, evidence,
@@ -129,17 +148,27 @@ internal static class DefenderModule
         var commonSeen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         if (args.Length == 0)
         {
-            throw new ArgumentException("Specify an exclusion, --check, or --help. There is no default exclusion.");
+            throw new ArgumentException("Specify a command (add, check, list, or remove) or --help. There is no default exclusion.");
         }
 
-        for (int i = 0; i < args.Length; i++)
+        int first = 0;
+        bool explicitCommand = TryParseCommand(args[0], out options.Mode);
+        if (explicitCommand) { first = 1; }
+        bool legacyCheck = false;
+
+        for (int i = first; i < args.Length; i++)
         {
             string argument = args[i];
             if (CommonArguments.TryParse(args, ref i, options, commonSeen)) { continue; }
 
             if (string.Equals(argument, "--check", StringComparison.OrdinalIgnoreCase))
             {
-                options.CheckOnly = true;
+                if (explicitCommand)
+                {
+                    throw new ArgumentException("--check is the legacy spelling and cannot follow a command. Use 'check' as the command.");
+                }
+                legacyCheck = true;
+                options.Mode = ExclusionMode.Check;
                 continue;
             }
 
@@ -172,6 +201,12 @@ internal static class DefenderModule
             }
             if (type == null)
             {
+                ExclusionMode misplaced;
+                if (TryParseCommand(argument, out misplaced))
+                {
+                    throw new ArgumentException("The command must come first: wtf.exe defender exclusion " +
+                        argument.ToLowerInvariant() + " [options]. Unexpected: " + argument);
+                }
                 throw new ArgumentException("Unknown option or unexpected value: " + argument);
             }
 
@@ -183,6 +218,17 @@ internal static class DefenderModule
             }
             while (i + 1 < args.Length && !args[i + 1].StartsWith("-", StringComparison.Ordinal))
             {
+                ExclusionMode word;
+                if (TryParseCommand(args[i + 1], out word))
+                {
+                    // A trailing command word would otherwise be swallowed as a value (and add would
+                    // persist an exclusion with that name). This applies to the legacy implicit add too:
+                    // it is the likeliest misplacement during migration, and -ExclusionTYPE=VALUE covers
+                    // the rare literal value.
+                    throw new ArgumentException("'" + args[i + 1] + "' follows -" + type +
+                        " and would be taken as a value. The command must come first; for a literal value use -" +
+                        type + "=" + args[i + 1] + ".");
+                }
                 AddValue(options, type, args[++i]);
                 count++;
             }
@@ -193,19 +239,62 @@ internal static class DefenderModule
         }
         if (options.Help)
         {
-            if (options.CheckOnly || options.Exclusions.Count != 0 ||
+            if (legacyCheck || options.Exclusions.Count != 0 ||
                 transportSpecified || commonSeen.Count != 0)
             {
                 throw new ArgumentException("Use --help by itself, or with --verbose / --no-color.");
             }
             return options;
         }
-        if (!options.CheckOnly && options.Exclusions.Count == 0)
+        if (!explicitCommand)
         {
-            throw new ArgumentException("Specify at least one exclusion for Add, or use --check.");
+            // Migration period: the old syntax still works, but main prints the replacement command.
+            options.LegacySyntax = true;
+            if (!legacyCheck && options.Exclusions.Count == 0)
+            {
+                throw new ArgumentException("Specify a command (add, check, list, or remove), a legacy exclusion, or --help. There is no default exclusion.");
+            }
+            if (!legacyCheck) { options.Mode = ExclusionMode.Add; }
+        }
+        else if (options.Mode == ExclusionMode.Add && options.Exclusions.Count == 0)
+        {
+            throw new ArgumentException("'add' requires at least one -ExclusionTYPE VALUE; there is no default exclusion.");
+        }
+        else if (options.Mode == ExclusionMode.Remove && options.Exclusions.Count == 0)
+        {
+            throw new ArgumentException("'remove' requires an explicit -ExclusionTYPE and value; there is no remove-all mode.");
+        }
+        else if (options.Mode == ExclusionMode.List && options.Exclusions.Count != 0)
+        {
+            throw new ArgumentException("'list' reads every readable exclusion and does not accept values; use 'check' for specific values.");
         }
         CommonArguments.Validate(options, commonSeen);
         return options;
+    }
+
+    private static bool TryParseCommand(string word, out ExclusionMode mode)
+    {
+        foreach (ExclusionMode candidate in new[] { ExclusionMode.Add, ExclusionMode.Check,
+            ExclusionMode.List, ExclusionMode.Remove })
+        {
+            if (string.Equals(word, candidate.ToString(), StringComparison.OrdinalIgnoreCase))
+            {
+                mode = candidate;
+                return true;
+            }
+        }
+        mode = ExclusionMode.Add;
+        return false;
+    }
+
+    internal static void PrintLegacyHint(Options options)
+    {
+        if (!options.LegacySyntax) { return; }
+        string command = options.Mode == ExclusionMode.Check ? "check" : "add";
+        ConsoleUi.Status("WARN", (options.Mode == ExclusionMode.Check ?
+            "'--check' is deprecated and will be removed." : "Implicit add is deprecated and will be removed.") +
+            " Use: wtf.exe defender exclusion " + command + " [options]" +
+            (options.Mode == ExclusionMode.Check ? "" : " -ExclusionTYPE VALUE") + ".", true);
     }
 
     private static void AddValue(Options options, string type, string value)
@@ -234,11 +323,15 @@ internal static class DefenderModule
     private static void PrintHelp()
     {
         ConsoleUi.Section("Usage");
-        ConsoleUi.Text("wtf.exe defender exclusion [options] -ExclusionTYPE VALUE [VALUE ...]");
+        ConsoleUi.Text("wtf.exe defender exclusion <command> [options] [-ExclusionTYPE VALUE [VALUE ...]]");
         ConsoleUi.Section("Options");
         ConsoleUi.Row("--transport", "management|com|native|powershell  (default: management)");
-        ConsoleUi.Row("--check", "Read-only: prepare inputs and read baseline; never invokes Add.");
         ConsoleUi.HelpOptions();
+        ConsoleUi.Section("Commands");
+        ConsoleUi.Row("add", "Add the values you name (administrator required).");
+        ConsoleUi.Row("check", "Read-only: are these values present? No values: capability check.");
+        ConsoleUi.Row("list", "Read-only: each type's entries. An unreadable list is never shown as empty.");
+        ConsoleUi.Row("remove", "Remove only named values (admin). No remove-all; refuses unreadable lists.");
         ConsoleUi.Section("Exclusion types");
         ConsoleUi.Row("-ExclusionPath", "Files or directories");
         ConsoleUi.Row("-ExclusionExtension", "File extensions");
@@ -248,29 +341,34 @@ internal static class DefenderModule
         ConsoleUi.Row("management", "System.Management -> WMI");
         ConsoleUi.Row("com", "SWbemServices COM Automation -> WMI");
         ConsoleUi.Row("native", "C++ IWbemServices::ExecMethod -> WMI");
-        ConsoleUi.Row("powershell", "powershell.exe -> Add-MpPreference/Get-MpPreference");
-        ConsoleUi.Text("All routes target Defender preferences directly or via Defender cmdlets; no fallback.");
+        ConsoleUi.Row("powershell", "powershell.exe -> Add-/Remove-/Get-MpPreference");
         ConsoleUi.Section("Quick start");
-        ConsoleUi.Text("Read-only check:");
-        ConsoleUi.Text("  .\\wtf.exe defender exclusion --check -ExclusionPath \"C:\\Lab Data\"");
-        ConsoleUi.Text("Add an exclusion (administrator required):");
-        ConsoleUi.Text("  .\\wtf.exe defender exclusion -ExclusionPath \"C:\\Lab Data\"");
-        ConsoleUi.HelpTelemetry();
+        ConsoleUi.Text("  .\\wtf.exe defender exclusion check -ExclusionPath \"C:\\Lab Data\"");
+        ConsoleUi.Text("  .\\wtf.exe defender exclusion add -ExclusionPath \"C:\\Lab Data\"");
+        ConsoleUi.Text("  .\\wtf.exe defender exclusion remove -ExclusionPath \"C:\\Lab Data\"");
         ConsoleUi.Section("Before you run");
-        ConsoleUi.Text("Quote paths with spaces; separate values with spaces, not commas.");
-        ConsoleUi.Text("No arguments: usage error; no default exclusion is added.");
+        ConsoleUi.Text("No command: usage error. Old implicit add and --check still work but warn.");
         ConsoleUi.Text("Native transport and ETW require WinTraceForge.Native.dll beside the EXE.");
         ConsoleUi.Text("powershell transport uses System32's own powershell.exe (no PATH lookup) and needs ConfigDefender.");
         ConsoleUi.HelpExitCodes();
         ConsoleUi.Status("WARN", "Exclusions reduce protection. Authorized testing only; no automatic cleanup.");
         if (!ConsoleUi.Verbose) { return; }
         ConsoleUi.Section("Extended notes");
+        ConsoleUi.HelpTelemetry();
+        ConsoleUi.Text("Quote paths with spaces; separate values with spaces, not commas.");
+        ConsoleUi.Text("All routes target Defender preferences directly or via Defender cmdlets; no fallback.");
         ConsoleUi.Text("Parameter names are case-insensitive and may be combined or repeated.");
         ConsoleUi.Text("PowerShell array syntax and parameter abbreviations are not supported.");
         ConsoleUi.Text("For a value starting with '-', use -ExclusionTYPE=VALUE.");
-        ConsoleUi.Text("--check alone reads metadata; with values it also prepares inputs and reads the baseline.");
-        ConsoleUi.Text("--check does not validate provider acceptance, write permissions, or prevention policy.");
-        ConsoleUi.Text("Existing exclusions are preserved. Every requested item is read back after Add.");
+        ConsoleUi.Text("The command must come first. The legacy --check cannot follow a command.");
+        ConsoleUi.Text("check alone reads metadata; with values it also prepares inputs and reads the baseline.");
+        ConsoleUi.Text("check does not validate provider acceptance, write permissions, or prevention policy.");
+        ConsoleUi.Text("list shows each type as entries, EMPTY (readable, none), UNSUPPORTED (not a readable preference field) or UNREADABLE (contents withheld from this identity, e.g. non-administrator).");
+        ConsoleUi.Text("UNREADABLE is never reported as empty and never as 'value absent'; check/list then exit 3.");
+        ConsoleUi.Text("Existing exclusions are preserved. Every requested item is read back after add.");
+        ConsoleUi.Text("remove reads a baseline first: values already absent are reported ALREADY_ABSENT and never sent to Remove; an unreadable list refuses the whole command.");
+        ConsoleUi.Text("remove sends one request per value, reads every value back, and lists REMOVED_CONFIRMED, NOT_CONFIRMED, ERROR or ALREADY_ABSENT for each. No rollback.");
+        ConsoleUi.Text("Exclusions carry no WTF ownership marker: remove never claims a value was created by WTF.");
         ConsoleUi.Text("A missing WMI return code is a warning; known nonzero codes remain errors.");
         ConsoleUi.Text("Pre-existing values do not prove a new change. Batch changes are not transactional.");
         ConsoleUi.Text("Eventlog reads existing channels; it does not start raw ETW tracing or enable audit policies.");
@@ -289,11 +387,96 @@ internal static class DefenderModule
     {
         internal bool AddAttempted;
         internal bool AddReturned;
+        // Remove sends one request per value; these count requests sent and requests that returned.
+        internal int RemoveInvoked;
+        internal int RemoveReturned;
+        internal bool RemoveAttempted { get { return RemoveInvoked > 0; } }
+        // null when some requested type's list could not be read, so presence is unknown.
         internal bool? AllPresentBefore;
+        // check/list: at least one examined type could not be read (never reported as empty/absent).
+        internal bool ListUnreadable;
+        internal readonly List<RemoveItem> RemoveItems = new List<RemoveItem>();
         internal ControlLifecycleResult<DefenderBaseline> Lifecycle;
     }
 
+    internal enum RemoveState { Pending, AlreadyAbsent, Removed, NotConfirmed, Error }
+
+    // One requested value of a remove command. Stored holds the spelling(s) Defender actually
+    // reported, which is what the Remove request sends, so a case or trailing-backslash difference
+    // between the request and the stored entry cannot make the request silently match nothing.
+    internal sealed class RemoveItem
+    {
+        internal readonly string Type;
+        internal readonly string Requested;
+        internal readonly List<string> Stored = new List<string>();
+        internal RemoveState State = RemoveState.Pending;
+        internal string Detail;
+        internal bool Invoked;
+        internal RemoveItem(string type, string requested) { Type = type; Requested = requested; }
+        internal string Label
+        {
+            get
+            {
+                switch (State)
+                {
+                    case RemoveState.AlreadyAbsent: return "ALREADY_ABSENT";
+                    case RemoveState.Removed: return "REMOVED_CONFIRMED";
+                    case RemoveState.NotConfirmed: return "NOT_CONFIRMED";
+                    case RemoveState.Error: return "ERROR";
+                    default: return "PENDING";
+                }
+            }
+        }
+    }
+
+    // A readback with the unreadable-list case separated out: a type in Unreadable has no usable
+    // values (Defender returned its "N/A:" placeholder), so callers must report "unknown" for it,
+    // never "empty" or "value absent". The placeholder text itself is dropped from Values.
+    internal sealed class ExclusionSnapshot
+    {
+        internal readonly Dictionary<string, List<string>> Values =
+            new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        internal readonly HashSet<string> Unreadable = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        internal static ExclusionSnapshot From(Dictionary<string, List<string>> raw)
+        {
+            var snapshot = new ExclusionSnapshot();
+            foreach (var entry in raw)
+            {
+                if (entry.Value.Exists(delegate(string value)
+                    { return value != null && value.StartsWith(UnreadableMarkerPrefix, StringComparison.OrdinalIgnoreCase); }))
+                {
+                    snapshot.Unreadable.Add(entry.Key);
+                    snapshot.Values[entry.Key] = new List<string>();
+                }
+                else
+                {
+                    snapshot.Values[entry.Key] = entry.Value;
+                }
+            }
+            return snapshot;
+        }
+    }
+
     private static int Run(Options options, RunEvidence evidence)
+    {
+        return Execute(options, evidence,
+            delegate { return CreateBackend(options.Transport); }, IsAdministrator);
+    }
+
+    private static bool IsAdministrator()
+    {
+        using (WindowsIdentity identity = WindowsIdentity.GetCurrent())
+        {
+            return new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
+        }
+    }
+
+    // The run header, the elevation gate and the lifecycle, with the backend factory and the
+    // elevation test injected (the same shape as FirewallModule.Execute) so tests can prove the gate
+    // refuses a write before any backend is created. Header first, gate second, backend last.
+    internal static int Execute(Options options, RunEvidence evidence,
+        Func<IPreferenceBackend> createBackend, Func<bool> isAdministrator)
     {
         evidence.Stage = "Identity";
         ConsoleUi.Section("Run");
@@ -307,19 +490,18 @@ internal static class DefenderModule
         }
         ConsoleUi.Detail("Executable: " + Assembly.GetExecutingAssembly().Location);
         ConsoleUi.Row("Transport", options.Transport);
-        ConsoleUi.Detail("Route: " + DescribeRoute(options.Transport));
-        ConsoleUi.Row("Mode", options.CheckOnly ? "CHECK ONLY - no changes" : "ADD exclusions");
+        ConsoleUi.Detail("Route: " + DescribeRoute(options.Transport, options.Mode));
+        ConsoleUi.Row("Mode", options.Mode == ExclusionMode.Check ? "CHECK ONLY - no changes" :
+            options.Mode == ExclusionMode.List ? "LIST - read-only, no changes" :
+            options.Mode == ExclusionMode.Remove ? "REMOVE exclusions" : "ADD exclusions");
 
-        bool isAdministrator;
         using (WindowsIdentity identity = WindowsIdentity.GetCurrent())
         {
-            isAdministrator = new WindowsPrincipal(identity)
-                .IsInRole(WindowsBuiltInRole.Administrator);
             ConsoleUi.Row("Identity", identity.Name);
         }
-
-        ConsoleUi.Row("Administrator", isAdministrator ? "Yes" : "No");
-        ConsoleUi.Detail("Elevated administrator: " + isAdministrator);
+        bool elevated = isAdministrator();
+        ConsoleUi.Row("Administrator", elevated ? "Yes" : "No");
+        ConsoleUi.Detail("Elevated administrator: " + elevated);
         if (options.Exclusions.Count > 0) { ConsoleUi.Section("Requested exclusions"); }
         foreach (var exclusion in options.Exclusions)
         {
@@ -329,26 +511,31 @@ internal static class DefenderModule
             }
         }
 
-        if (!options.CheckOnly && !isAdministrator)
+        if (!options.ReadOnly && !elevated)
         {
             return ReportError("Open a terminal with Run as administrator, then run this EXE again.");
         }
 
         evidence.Stage = "Connect";
-        using (IPreferenceBackend backend = CreateBackend(options.Transport))
+        using (IPreferenceBackend backend = createBackend())
         {
             return RunWithBackend(options, evidence, backend);
         }
     }
 
-    private static string DescribeRoute(string transport)
+    private static string DescribeRoute(string transport, ExclusionMode mode)
     {
+        string method = mode == ExclusionMode.Add ? "MSFT_MpPreference.Add" :
+            mode == ExclusionMode.Remove ? "MSFT_MpPreference.Remove (after a baseline read)" :
+            "MSFT_MpPreference query (read-only)";
+        string cmdlet = mode == ExclusionMode.Add ? "Add-MpPreference" :
+            mode == ExclusionMode.Remove ? "Remove-MpPreference" : "Get-MpPreference";
         switch (transport)
         {
-            case "native": return "P/Invoke -> native C++ IWbemLocator/IWbemServices::ExecMethod -> WMI -> MSFT_MpPreference.Add";
-            case "com": return ".NET COM interop -> SWbemLocator/SWbemServices -> WMI -> MSFT_MpPreference.Add";
-            case "powershell": return "Process -> powershell.exe -> Add-MpPreference/Get-MpPreference (Defender PowerShell module) -> MSFT_MpPreference.Add";
-            default: return "System.Management -> WMI -> MSFT_MpPreference.Add";
+            case "native": return "P/Invoke -> native C++ IWbemLocator/IWbemServices::ExecMethod -> WMI -> " + method;
+            case "com": return ".NET COM interop -> SWbemLocator/SWbemServices -> WMI -> " + method;
+            case "powershell": return "Process -> powershell.exe -> " + cmdlet + "/Get-MpPreference (Defender PowerShell module) -> " + method;
+            default: return "System.Management -> WMI -> " + method;
         }
     }
 
@@ -378,8 +565,8 @@ internal static class DefenderModule
 
     internal sealed class DefenderBaseline
     {
-        internal readonly Dictionary<string, List<string>> Values;
-        internal DefenderBaseline(Dictionary<string, List<string>> values) { Values = values; }
+        internal readonly ExclusionSnapshot Snapshot;
+        internal DefenderBaseline(ExclusionSnapshot snapshot) { Snapshot = snapshot; }
     }
 
     private sealed class DefenderOperation : IControlOperation<DefenderBaseline, IPreferenceReader, IPreferenceWriter>
@@ -389,45 +576,213 @@ internal static class DefenderModule
         internal DefenderOperation(Options options, RunEvidence evidence)
         { this.options = options; this.evidence = evidence; }
         public string Transport { get { return options.Transport; } }
-        public bool VerifyAfterApiFailure { get { return false; } }
-        public string ManualRestoration { get { return "Remove only test-created exclusions; preserve the captured baseline."; } }
+        // A partly failed remove must still be read back so every value gets its own result.
+        public bool VerifyAfterApiFailure { get { return options.Mode == ExclusionMode.Remove; } }
+        public string ManualRestoration
+        {
+            get
+            {
+                return options.Mode == ExclusionMode.Remove ? DescribeRemoveRestoration(options, evidence) :
+                    "Remove only test-created exclusions; preserve the captured baseline.";
+            }
+        }
 
         public ProbeResult<DefenderBaseline> Probe(IPreferenceReader backend)
         {
             evidence.Stage = "Connect";
             backend.Connect();
             evidence.Stage = "Prepare";
+            switch (options.Mode)
+            {
+                case ExclusionMode.List: return ProbeList(backend);
+                case ExclusionMode.Remove: return ProbeRemove(backend);
+                default: return ProbeAddOrCheck(backend);
+            }
+        }
+
+        private ProbeResult<DefenderBaseline> ProbeAddOrCheck(IPreferenceReader backend)
+        {
+            bool check = options.Mode == ExclusionMode.Check;
             backend.Prepare(options.Exclusions);
-            if (options.CheckOnly && options.Exclusions.Count == 0) { ConsoleUi.Section("Capabilities"); }
+            if (check && options.Exclusions.Count == 0) { ConsoleUi.Section("Capabilities"); }
             foreach (string type in ExclusionTypes)
             {
-                if (options.CheckOnly && (options.Exclusions.Count == 0 || options.Exclusions.ContainsKey(type)) &&
+                if (check && (options.Exclusions.Count == 0 || options.Exclusions.ContainsKey(type)) &&
                     (options.Exclusions.Count == 0 || options.Verbose))
                 { ConsoleUi.Text(type + ": " + (backend.Supports(type) ? "supported (string[])" : "unsupported")); }
             }
-            Dictionary<string, List<string>> baseline = null;
+            ExclusionSnapshot baseline = null;
             if (options.Exclusions.Count > 0)
             {
                 evidence.Stage = "Baseline read";
-                baseline = backend.Read(options.Exclusions.Keys);
+                baseline = ExclusionSnapshot.From(backend.Read(options.Exclusions.Keys));
                 bool allPresent = true;
+                bool unknown = false;
                 ConsoleUi.Section("Baseline");
                 foreach (var exclusion in options.Exclusions)
                 {
                     foreach (string value in exclusion.Value)
                     {
-                        bool present = ContainsExclusion(baseline, exclusion.Key, value);
+                        if (baseline.Unreadable.Contains(exclusion.Key))
+                        {
+                            ConsoleUi.Status("WARN", exclusion.Key + ": " + value + " [unknown - list unreadable]");
+                            unknown = true;
+                            continue;
+                        }
+                        bool present = ContainsExclusion(baseline.Values, exclusion.Key, value);
                         ConsoleUi.Status(present ? "SEEN" : "INFO", exclusion.Key + ": " + value +
                             (present ? " [present]" : " [not observed]"));
                         allPresent &= present;
                     }
                 }
-                evidence.AllPresentBefore = allPresent;
+                if (unknown)
+                {
+                    ConsoleUi.Text(UnreadableExplanation);
+                }
+                evidence.ListUnreadable = unknown;
+                evidence.AllPresentBefore = unknown ? (bool?)null : allPresent;
             }
-            if (options.CheckOnly)
+            if (check)
             {
                 evidence.Stage = "Check complete";
+                if (evidence.ListUnreadable)
+                {
+                    ConsoleUi.Status("WARN", "Check incomplete: an unreadable list says nothing about whether a value is present. No settings were changed.");
+                    return new ProbeResult<DefenderBaseline>(new DefenderBaseline(baseline),
+                        ProbeStatus.ReadOnlyMismatch, RestorationPolicy.None);
+                }
                 ConsoleUi.Status("OK", "Read-only check passed. No settings were changed.");
+                return new ProbeResult<DefenderBaseline>(new DefenderBaseline(baseline),
+                    ProbeStatus.ReadOnlyConfirmed, RestorationPolicy.None);
+            }
+            return new ProbeResult<DefenderBaseline>(new DefenderBaseline(baseline),
+                ProbeStatus.Ready, RestorationPolicy.Manual);
+        }
+
+        private ProbeResult<DefenderBaseline> ProbeList(IPreferenceReader backend)
+        {
+            // Read surface only: list never depends on Add's metadata, so a provider whose Add interface
+            // is unavailable can still be listed.
+            backend.PrepareRead();
+            // The read surface decides what can be listed: a type that Add's metadata omits but the
+            // preference object still returns is a real, readable list.
+            var supported = new List<string>();
+            foreach (string type in ExclusionTypes)
+            {
+                if (backend.SupportsRead(type)) { supported.Add(type); }
+            }
+            ExclusionSnapshot snapshot = new ExclusionSnapshot();
+            if (supported.Count > 0)
+            {
+                evidence.Stage = "List read";
+                snapshot = ExclusionSnapshot.From(backend.Read(supported));
+            }
+            bool unreadable = false;
+            ConsoleUi.Section("Exclusions");
+            foreach (string type in ExclusionTypes)
+            {
+                if (!supported.Contains(type))
+                {
+                    ConsoleUi.Row(type, "UNSUPPORTED - not a readable field of the preference object");
+                }
+                else if (snapshot.Unreadable.Contains(type))
+                {
+                    ConsoleUi.Row(type, "UNREADABLE - contents withheld from this identity; not an empty list");
+                    unreadable = true;
+                }
+                else
+                {
+                    List<string> values = snapshot.Values[type].FindAll(delegate(string value) { return value != null; });
+                    values.Sort(StringComparer.OrdinalIgnoreCase);
+                    if (values.Count == 0)
+                    {
+                        ConsoleUi.Row(type, "EMPTY - readable, no entries");
+                        continue;
+                    }
+                    ConsoleUi.Row(type, values.Count + (values.Count == 1 ? " entry" : " entries"));
+                    foreach (string value in values) { ConsoleUi.Text("    " + TelemetryEvidence.Safe(value)); }
+                }
+            }
+            evidence.ListUnreadable = unreadable;
+            evidence.Stage = "List complete";
+            if (supported.Count == 0)
+            {
+                // Nothing was read at all, so nothing can be called a complete list.
+                ConsoleUi.Status("WARN", "List incomplete: no exclusion type is readable on this provider, so nothing was listed. No settings were changed.");
+                return new ProbeResult<DefenderBaseline>(new DefenderBaseline(snapshot),
+                    ProbeStatus.ReadOnlyMismatch, RestorationPolicy.None);
+            }
+            if (unreadable)
+            {
+                ConsoleUi.Text(UnreadableExplanation);
+                ConsoleUi.Status("WARN", "List incomplete: at least one type could not be read. No settings were changed.");
+                return new ProbeResult<DefenderBaseline>(new DefenderBaseline(snapshot),
+                    ProbeStatus.ReadOnlyMismatch, RestorationPolicy.None);
+            }
+            ConsoleUi.Status("OK", "Read-only list complete. No settings were changed.");
+            return new ProbeResult<DefenderBaseline>(new DefenderBaseline(snapshot),
+                ProbeStatus.ReadOnlyConfirmed, RestorationPolicy.None);
+        }
+
+        private ProbeResult<DefenderBaseline> ProbeRemove(IPreferenceReader backend)
+        {
+            // Read and Remove surfaces only; Add's metadata is neither needed nor consulted.
+            backend.PrepareRead();
+            foreach (string type in options.Exclusions.Keys)
+            {
+                string reason = null;
+                bool supported = false;
+                try { supported = backend.SupportsRead(type) && backend.SupportsRemove(type); }
+                catch (ManagementException ex) { reason = ex.Message; }
+                catch (COMException ex) { reason = ex.Message; }
+                if (!supported)
+                {
+                    // A provider without a Remove method fails the metadata lookup instead of saying
+                    // "false"; every transport reports it through this one refusal.
+                    throw new InvalidOperationException("Unsupported exclusion type for remove: " + type +
+                        (reason == null ? "" : " (" + reason + ")") + ". Nothing was removed.");
+                }
+            }
+            evidence.Stage = "Baseline read";
+            ExclusionSnapshot baseline = ExclusionSnapshot.From(backend.Read(options.Exclusions.Keys));
+            if (baseline.Unreadable.Count != 0)
+            {
+                evidence.ListUnreadable = true;
+                var names = new List<string>(baseline.Unreadable);
+                names.Sort(StringComparer.OrdinalIgnoreCase);
+                throw new InvalidOperationException("Refusing to remove: the " + string.Join(", ", names.ToArray()) +
+                    " list cannot be read by this identity, so presence cannot be established. " +
+                    "Re-run elevated. Nothing was changed.");
+            }
+
+            var scheduled = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            ConsoleUi.Section("Baseline");
+            foreach (var exclusion in options.Exclusions)
+            {
+                foreach (string value in exclusion.Value)
+                {
+                    // Two spellings of one value (e.g. a trailing backslash) are one request.
+                    if (!scheduled.Add(exclusion.Key + "|" + NormalizeValue(exclusion.Key, value))) { continue; }
+                    var item = new RemoveItem(exclusion.Key, value);
+                    foreach (string stored in baseline.Values[exclusion.Key])
+                    {
+                        if (EquivalentValues(exclusion.Key, stored, value) && !item.Stored.Contains(stored))
+                        {
+                            item.Stored.Add(stored);
+                        }
+                    }
+                    bool present = item.Stored.Count != 0;
+                    if (!present) { item.State = RemoveState.AlreadyAbsent; item.Detail = "not present in the baseline; no Remove was sent"; }
+                    ConsoleUi.Status(present ? "SEEN" : "INFO", exclusion.Key + ": " + TelemetryEvidence.Safe(value) +
+                        (present ? " [present]" : " [already absent]"));
+                    evidence.RemoveItems.Add(item);
+                }
+            }
+            if (!evidence.RemoveItems.Exists(delegate(RemoveItem item) { return item.State == RemoveState.Pending; }))
+            {
+                evidence.Stage = "Remove not needed";
+                PrintRemoveResults(evidence);
+                ConsoleUi.Status("OK", "Every requested value is already absent. No Remove was invoked; no settings were changed.");
                 return new ProbeResult<DefenderBaseline>(new DefenderBaseline(baseline),
                     ProbeStatus.ReadOnlyConfirmed, RestorationPolicy.None);
             }
@@ -437,6 +792,7 @@ internal static class DefenderModule
 
         public MutationStatus Mutate(DefenderBaseline baseline, IPreferenceWriter backend)
         {
+            if (options.Mode == ExclusionMode.Remove) { return MutateRemove(backend); }
             evidence.Stage = "Add invocation";
             ConsoleUi.Section("Apply & verify");
             evidence.AddAttempted = true;
@@ -458,11 +814,126 @@ internal static class DefenderModule
             return MutationStatus.ApiSucceeded;
         }
 
+        // One request per value, so a rejection or error is attributed to exactly that value and the
+        // rest of the batch still runs. There is no rollback: a value already removed stays removed.
+        private MutationStatus MutateRemove(IPreferenceWriter backend)
+        {
+            evidence.Stage = "Remove invocation";
+            ConsoleUi.Section("Apply & verify");
+            bool anyFailed = false;
+            bool anyUnknown = false;
+            foreach (RemoveItem item in evidence.RemoveItems)
+            {
+                if (item.State != RemoveState.Pending) { continue; }
+                item.Invoked = true;
+                evidence.RemoveInvoked++;
+                try
+                {
+                    object returnValue = backend.Remove(item.Type, item.Stored);
+                    evidence.RemoveReturned++;
+                    uint status;
+                    if (!TryGetStatusCode(returnValue, out status))
+                    {
+                        anyUnknown = true;
+                        item.State = RemoveState.NotConfirmed;
+                        item.Detail = "request returned no usable WMI return code; awaiting readback";
+                    }
+                    else if (status != 0)
+                    {
+                        anyFailed = true;
+                        item.State = RemoveState.Error;
+                        item.Detail = "Defender rejected the request. WMI return code: " + status +
+                            " (0x" + status.ToString("X8") + ")";
+                    }
+                    else
+                    {
+                        item.State = RemoveState.NotConfirmed;
+                        item.Detail = "request accepted; awaiting readback";
+                    }
+                }
+                catch (Exception error)
+                {
+                    anyFailed = true;
+                    item.State = RemoveState.Error;
+                    item.Detail = error.Message;
+                }
+            }
+            evidence.Stage = "Return status";
+            if (anyUnknown)
+            {
+                ConsoleUi.Status("WARN", "No usable WMI return code for at least one request; verifying by readback.");
+            }
+            return anyFailed ? MutationStatus.ApiFailed :
+                anyUnknown ? MutationStatus.ApiUnknown : MutationStatus.ApiSucceeded;
+        }
+
         public VerificationStatus Verify(DefenderBaseline baseline, IPreferenceReader backend)
         {
+            if (options.Mode == ExclusionMode.Remove) { return VerifyRemove(backend); }
             evidence.Stage = "Post-Add readback";
-            return VerifyExclusions(options.Exclusions, backend.Read(options.Exclusions.Keys)) ?
+            ExclusionSnapshot after = ExclusionSnapshot.From(backend.Read(options.Exclusions.Keys));
+            return VerifyExclusions(options.Exclusions, after.Values, after.Unreadable) ?
                 VerificationStatus.Confirmed : VerificationStatus.Mismatch;
+        }
+
+        private VerificationStatus VerifyRemove(IPreferenceReader backend)
+        {
+            evidence.Stage = "Post-Remove readback";
+            var types = new List<string>();
+            foreach (RemoveItem item in evidence.RemoveItems)
+            {
+                if (item.Invoked && !types.Contains(item.Type)) { types.Add(item.Type); }
+            }
+            if (types.Count == 0)
+            {
+                // Nothing was sent, so there is nothing to read back or confirm.
+                PrintRemoveResults(evidence);
+                return VerificationStatus.Mismatch;
+            }
+            ExclusionSnapshot after;
+            try { after = ExclusionSnapshot.From(backend.Read(types)); }
+            catch
+            {
+                // Nothing can be confirmed; every invoked value keeps its unconfirmed/error state.
+                foreach (RemoveItem item in evidence.RemoveItems)
+                {
+                    if (item.Invoked) { item.Detail += "; post-removal readback failed"; }
+                }
+                PrintRemoveResults(evidence);
+                throw;
+            }
+            bool allConfirmed = true;
+            foreach (RemoveItem item in evidence.RemoveItems)
+            {
+                if (!item.Invoked) { continue; }
+                if (after.Unreadable.Contains(item.Type))
+                {
+                    if (item.State != RemoveState.Error) { item.State = RemoveState.NotConfirmed; }
+                    item.Detail += "; the list is unreadable after the request, so removal cannot be confirmed";
+                    allConfirmed = false;
+                    continue;
+                }
+                bool still = ContainsExclusion(after.Values, item.Type, item.Requested);
+                if (item.State == RemoveState.Error)
+                {
+                    item.Detail += still ? "; value still present in readback" :
+                        "; value is no longer observed in readback, but this request failed, so the change is not attributed to it";
+                    allConfirmed = false;
+                }
+                else if (still)
+                {
+                    item.State = RemoveState.NotConfirmed;
+                    item.Detail = "value still present in readback after the request returned";
+                    allConfirmed = false;
+                }
+                else
+                {
+                    item.State = RemoveState.Removed;
+                    item.Detail = "value no longer observed in readback";
+                }
+            }
+            PrintRemoveResults(evidence);
+            return allConfirmed ? VerificationStatus.Confirmed : VerificationStatus.Mismatch;
         }
 
         public void Restore(DefenderBaseline baseline, IPreferenceWriter backend) { throw new NotSupportedException("Manual restoration selected."); }
@@ -470,32 +941,93 @@ internal static class DefenderModule
         { throw new NotSupportedException("Manual restoration selected."); }
     }
 
+    private const string UnreadableExplanation =
+        "UNREADABLE: Defender withheld the list contents from this identity (typically a non-administrator, " +
+        "or a policy that hides exclusions). That is not an empty list and not proof a value is absent. " +
+        "Re-run elevated to observe it.";
+
+    // Prints one line per requested value, so a batch that partly succeeded states each outcome.
+    internal static void PrintRemoveResults(RunEvidence evidence)
+    {
+        ConsoleUi.Section("Remove results");
+        foreach (RemoveItem item in evidence.RemoveItems)
+        {
+            string tag = item.State == RemoveState.Removed ? "OK" :
+                item.State == RemoveState.AlreadyAbsent ? "INFO" :
+                item.State == RemoveState.Error ? "FAIL" : "WARN";
+            string stored = item.Stored.Count != 0 && !item.Stored.Contains(item.Requested) ?
+                " (stored as " + TelemetryEvidence.Safe(string.Join(" / ", item.Stored.ToArray())) + ")" : "";
+            ConsoleUi.Status(tag, item.Label + "  " + item.Type + ": " + TelemetryEvidence.Safe(item.Requested) +
+                stored + (string.IsNullOrEmpty(item.Detail) ? "" : " - " + item.Detail),
+                item.State == RemoveState.Error || item.State == RemoveState.NotConfirmed);
+        }
+    }
+
+    // WTF never marks exclusions, so this only restates the request: it lists the values a Remove
+    // request was sent for (whatever their final state), not values WTF created or owned.
+    private static string DescribeRemoveRestoration(Options options, RunEvidence evidence)
+    {
+        var command = new StringBuilder();
+        foreach (string type in ExclusionTypes)
+        {
+            bool first = true;
+            foreach (RemoveItem item in evidence.RemoveItems)
+            {
+                if (!item.Invoked || item.Type != type) { continue; }
+                foreach (string value in item.Stored)
+                {
+                    command.Append(first ? " -" + type : "").Append(" \"").Append(TelemetryEvidence.Safe(value)).Append('"');
+                    first = false;
+                }
+            }
+        }
+        return "No automatic rollback. These values were not created by WTF; if a removal was unintended, " +
+            "re-add it: wtf.exe defender exclusion add --transport " + options.Transport + command;
+    }
+
     internal interface IPreferenceBackend : IDisposable
     {
         void Connect();
+        // Read/Remove surface only: loads the preference class metadata. Never touches Add's.
+        void PrepareRead();
         void Prepare(Dictionary<string, List<string>> exclusions);
         bool Supports(string name);
+        // Read-surface only: is the type a readable string-array field of the preference class?
+        bool SupportsRead(string name);
+        bool SupportsRemove(string name);
         object Add();
+        // One Remove request for the given values of a single exclusion type.
+        object Remove(string type, IList<string> values);
         Dictionary<string, List<string>> Read(ICollection<string> types);
     }
 
     internal interface IPreferenceReader
     {
         void Connect();
+        void PrepareRead();
         void Prepare(Dictionary<string, List<string>> exclusions);
         bool Supports(string name);
+        bool SupportsRead(string name);
+        bool SupportsRemove(string name);
         Dictionary<string, List<string>> Read(ICollection<string> types);
     }
 
-    internal interface IPreferenceWriter { object Add(); }
+    internal interface IPreferenceWriter
+    {
+        object Add();
+        object Remove(string type, IList<string> values);
+    }
 
     private sealed class PreferenceReader : IPreferenceReader
     {
         private readonly IPreferenceBackend inner;
         internal PreferenceReader(IPreferenceBackend inner) { this.inner = inner; }
         public void Connect() { inner.Connect(); }
+        public void PrepareRead() { inner.PrepareRead(); }
         public void Prepare(Dictionary<string, List<string>> exclusions) { inner.Prepare(exclusions); }
         public bool Supports(string name) { return inner.Supports(name); }
+        public bool SupportsRead(string name) { return inner.SupportsRead(name); }
+        public bool SupportsRemove(string name) { return inner.SupportsRemove(name); }
         public Dictionary<string, List<string>> Read(ICollection<string> types) { return inner.Read(types); }
     }
 
@@ -504,6 +1036,7 @@ internal static class DefenderModule
         private readonly IPreferenceBackend inner;
         internal PreferenceWriter(IPreferenceBackend inner) { this.inner = inner; }
         public object Add() { return inner.Add(); }
+        public object Remove(string type, IList<string> values) { return inner.Remove(type, values); }
     }
 
     private sealed class NativeBackend : IPreferenceBackend
@@ -513,6 +1046,11 @@ internal static class DefenderModule
         public void Connect()
         {
             CheckNative(NativeMethods.NativeOpen(out handle), "IWbemLocator::ConnectServer / proxy security");
+        }
+
+        public void PrepareRead()
+        {
+            CheckNative(NativeMethods.NativePrepareRead(handle), "GetObject");
         }
 
         public void Prepare(Dictionary<string, List<string>> exclusions)
@@ -537,10 +1075,35 @@ internal static class DefenderModule
             return supported;
         }
 
+        public bool SupportsRead(string name)
+        {
+            bool supported;
+            CheckNative(NativeMethods.NativeSupportsRead(handle, name, out supported), "Get class property metadata: " + name);
+            return supported;
+        }
+
+        public bool SupportsRemove(string name)
+        {
+            bool supported;
+            CheckNative(NativeMethods.NativeSupportsRemove(handle, name, out supported),
+                "Get Remove parameter metadata: " + name);
+            return supported;
+        }
+
         public object Add()
         {
             object returnValue;
             CheckNative(NativeMethods.NativeAdd(handle, out returnValue), "IWbemServices::ExecMethod(Add)");
+            return returnValue;
+        }
+
+        public object Remove(string type, IList<string> values)
+        {
+            string[] array = new string[values.Count];
+            values.CopyTo(array, 0);
+            object returnValue;
+            CheckNative(NativeMethods.NativeRemove(handle, type, array, array.Length, out returnValue),
+                "IWbemServices::ExecMethod(Remove, " + type + ")");
             return returnValue;
         }
 
@@ -586,6 +1149,10 @@ internal static class DefenderModule
 
         [DllImport(Library, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         [DefaultDllImportSearchPaths(DllImportSearchPath.AssemblyDirectory | DllImportSearchPath.System32)]
+        internal static extern int NativePrepareRead(IntPtr handle);
+
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.AssemblyDirectory | DllImportSearchPath.System32)]
         internal static extern int NativePrepare(IntPtr handle);
 
         [DllImport(Library, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true, CharSet = CharSet.Unicode)]
@@ -597,9 +1164,23 @@ internal static class DefenderModule
         internal static extern int NativeSetValues(IntPtr handle, string name,
             [In, MarshalAs(UnmanagedType.LPArray, ArraySubType = UnmanagedType.LPWStr, SizeParamIndex = 3)] string[] values, int count);
 
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true, CharSet = CharSet.Unicode)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.AssemblyDirectory | DllImportSearchPath.System32)]
+        internal static extern int NativeSupportsRead(IntPtr handle, string name, [MarshalAs(UnmanagedType.Bool)] out bool supported);
+
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true, CharSet = CharSet.Unicode)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.AssemblyDirectory | DllImportSearchPath.System32)]
+        internal static extern int NativeSupportsRemove(IntPtr handle, string name, [MarshalAs(UnmanagedType.Bool)] out bool supported);
+
         [DllImport(Library, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         [DefaultDllImportSearchPaths(DllImportSearchPath.AssemblyDirectory | DllImportSearchPath.System32)]
         internal static extern int NativeAdd(IntPtr handle, [MarshalAs(UnmanagedType.Struct)] out object returnValue);
+
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true, CharSet = CharSet.Unicode)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.AssemblyDirectory | DllImportSearchPath.System32)]
+        internal static extern int NativeRemove(IntPtr handle, string name,
+            [In, MarshalAs(UnmanagedType.LPArray, ArraySubType = UnmanagedType.LPWStr, SizeParamIndex = 3)] string[] values, int count,
+            [MarshalAs(UnmanagedType.Struct)] out object returnValue);
 
         [DllImport(Library, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true, CharSet = CharSet.Unicode)]
         [DefaultDllImportSearchPaths(DllImportSearchPath.AssemblyDirectory | DllImportSearchPath.System32)]
@@ -630,13 +1211,28 @@ internal static class DefenderModule
         return decoded;
     }
 
-    private sealed class ComBackend : IPreferenceBackend
+    // Management and COM supply raw provider records and nothing else; this one non-virtual Read turns
+    // them into lists through AssembleExclusions, so neither transport can bypass the singleton gate.
+    private abstract class RecordReadBackend
+    {
+        public Dictionary<string, List<string>> Read(ICollection<string> types)
+        {
+            return AssembleExclusions(ReadRecords(types), types);
+        }
+
+        protected abstract IList<Dictionary<string, object>> ReadRecords(ICollection<string> types);
+    }
+
+    private sealed class ComBackend : RecordReadBackend, IPreferenceBackend
     {
         private readonly ComObjects objects = new ComObjects();
         private object services;
+        private object preferenceClass;
         private object input;
         private Dictionary<string, object> inputProperties;
         private Dictionary<string, object> classProperties;
+        private Dictionary<string, object> removeProperties;
+        private object removeDefinition;
 
         public void Connect()
         {
@@ -652,9 +1248,15 @@ internal static class DefenderModule
             objects.Set(security, "ImpersonationLevel", 3);
         }
 
+        public void PrepareRead()
+        {
+            preferenceClass = objects.Call(services, "Get", "MSFT_MpPreference", 0, new DispatchWrapper(null));
+            classProperties = objects.Properties(preferenceClass);
+        }
+
         public void Prepare(Dictionary<string, List<string>> exclusions)
         {
-            object preferenceClass = objects.Call(services, "Get", "MSFT_MpPreference", 0, new DispatchWrapper(null));
+            PrepareRead();
             object methods = objects.Get(preferenceClass, "Methods_");
             object add = objects.Call(methods, "Item", "Add", 0);
             object definition = objects.Get(add, "InParameters");
@@ -664,7 +1266,6 @@ internal static class DefenderModule
             }
             input = objects.Call(definition, "SpawnInstance_", 0);
             inputProperties = objects.Properties(input);
-            classProperties = objects.Properties(preferenceClass);
             foreach (var exclusion in exclusions)
             {
                 if (!Supports(exclusion.Key))
@@ -690,7 +1291,12 @@ internal static class DefenderModule
 
         public object Add()
         {
-            object result = objects.Call(services, "ExecMethod", "MSFT_MpPreference", "Add", input, 0, new DispatchWrapper(null));
+            return Execute("Add", input);
+        }
+
+        private object Execute(string method, object parameters)
+        {
+            object result = objects.Call(services, "ExecMethod", "MSFT_MpPreference", method, parameters, 0, new DispatchWrapper(null));
             if (result == null)
             {
                 return null;
@@ -700,17 +1306,57 @@ internal static class DefenderModule
                 objects.Get(property, "Value") : null;
         }
 
-        public Dictionary<string, List<string>> Read(ICollection<string> types)
+        private object RemoveDefinition()
         {
-            var configured = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
-            foreach (string type in types) { configured.Add(type, new List<string>()); }
+            // Cached: every Methods_/Item/InParameters call adds RCWs that live until Dispose.
+            if (removeDefinition != null) { return removeDefinition; }
+            object methods = objects.Get(preferenceClass, "Methods_");
+            object remove = objects.Call(methods, "Item", "Remove", 0);
+            object definition = objects.Get(remove, "InParameters");
+            if (definition == null)
+            {
+                throw new InvalidOperationException("Defender COM Remove parameter metadata is unavailable.");
+            }
+            removeDefinition = definition;
+            return definition;
+        }
+
+        public bool SupportsRead(string name)
+        {
+            return IsStringArray(classProperties, name);
+        }
+
+        public bool SupportsRemove(string name)
+        {
+            if (removeProperties == null) { removeProperties = objects.Properties(RemoveDefinition()); }
+            return IsStringArray(removeProperties, name);
+        }
+
+        public object Remove(string type, IList<string> values)
+        {
+            object parameters = objects.Call(RemoveDefinition(), "SpawnInstance_", 0);
+            Dictionary<string, object> properties = objects.Properties(parameters);
+            if (!IsStringArray(properties, type))
+            {
+                throw new InvalidOperationException("Defender COM Remove does not accept " + type + ".");
+            }
+            string[] array = new string[values.Count];
+            values.CopyTo(array, 0);
+            objects.Set(properties[type], "Value", array);
+            return Execute("Remove", parameters);
+        }
+
+        protected override IList<Dictionary<string, object>> ReadRecords(ICollection<string> types)
+        {
             object results = objects.Call(services, "ExecQuery",
                 "SELECT " + string.Join(", ", types) + " FROM MSFT_MpPreference", "WQL", 0, new DispatchWrapper(null));
             int count = Convert.ToInt32(objects.Get(results, "Count"), CultureInfo.InvariantCulture);
+            var records = new List<Dictionary<string, object>>();
             for (int i = 0; i < count; i++)
             {
                 object record = objects.Call(results, "ItemIndex", i);
                 Dictionary<string, object> properties = objects.Properties(record);
+                var fields = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
                 foreach (string type in types)
                 {
                     object property;
@@ -718,11 +1364,11 @@ internal static class DefenderModule
                     {
                         throw new InvalidOperationException("Missing COM readback field: " + type);
                     }
-                    object raw = objects.Get(property, "Value");
-                    configured[type].AddRange(DecodeStringArray(raw, type));
+                    fields[type] = objects.Get(property, "Value");
                 }
+                records.Add(fields);
             }
-            return configured;
+            return records;
         }
 
         public void Dispose() { objects.Dispose(); }
@@ -831,7 +1477,7 @@ internal static class DefenderModule
         }
     }
 
-    private sealed class ManagementBackend : IPreferenceBackend
+    private sealed class ManagementBackend : RecordReadBackend, IPreferenceBackend
     {
         private readonly ManagementScope scope =
             new ManagementScope(@"\\.\root\Microsoft\Windows\Defender");
@@ -840,10 +1486,15 @@ internal static class DefenderModule
 
         public void Connect() { scope.Connect(); }
 
-        public void Prepare(Dictionary<string, List<string>> exclusions)
+        public void PrepareRead()
         {
             preferenceClass = new ManagementClass(scope, new ManagementPath("MSFT_MpPreference"), null);
             preferenceClass.Get();
+        }
+
+        public void Prepare(Dictionary<string, List<string>> exclusions)
+        {
+            PrepareRead();
             input = preferenceClass.GetMethodParameters("Add");
             if (input == null)
             {
@@ -869,23 +1520,59 @@ internal static class DefenderModule
         {
             using (ManagementBaseObject result = preferenceClass.InvokeMethod("Add", input, null))
             {
-                if (result != null)
+                return ReturnValueOf(result);
+            }
+        }
+
+        private static object ReturnValueOf(ManagementBaseObject result)
+        {
+            if (result != null)
+            {
+                foreach (PropertyData property in result.Properties)
                 {
-                    foreach (PropertyData property in result.Properties)
+                    if (string.Equals(property.Name, "ReturnValue", StringComparison.OrdinalIgnoreCase))
                     {
-                        if (string.Equals(property.Name, "ReturnValue", StringComparison.OrdinalIgnoreCase))
-                        {
-                            return property.Value;
-                        }
+                        return property.Value;
                     }
                 }
             }
             return null;
         }
 
-        public Dictionary<string, List<string>> Read(ICollection<string> types)
+        public bool SupportsRead(string name)
         {
-            return ReadExclusions(scope, types);
+            return HasStringArrayProperty(preferenceClass.Properties, name);
+        }
+
+        public bool SupportsRemove(string name)
+        {
+            using (ManagementBaseObject parameters = preferenceClass.GetMethodParameters("Remove"))
+            {
+                return parameters != null && HasStringArrayProperty(parameters.Properties, name);
+            }
+        }
+
+        public object Remove(string type, IList<string> values)
+        {
+            using (ManagementBaseObject parameters = preferenceClass.GetMethodParameters("Remove"))
+            {
+                if (parameters == null || !HasStringArrayProperty(parameters.Properties, type))
+                {
+                    throw new InvalidOperationException("Defender WMI Remove does not accept " + type + ".");
+                }
+                string[] array = new string[values.Count];
+                values.CopyTo(array, 0);
+                parameters[type] = array;
+                using (ManagementBaseObject result = preferenceClass.InvokeMethod("Remove", parameters, null))
+                {
+                    return ReturnValueOf(result);
+                }
+            }
+        }
+
+        protected override IList<Dictionary<string, object>> ReadRecords(ICollection<string> types)
+        {
+            return ReadExclusionRecords(scope, types);
         }
 
         public void Dispose()
@@ -918,41 +1605,105 @@ internal static class DefenderModule
     private sealed class PowerShellBackend : IPreferenceBackend
     {
         private Dictionary<string, bool> supportsCache;
+        private string readError;
+        private bool addAvailable;
         private string pendingAddScript;
 
         public void Connect()
         {
+            PowerShellRunner.Result result = PowerShellRunner.RunScript(BuildConnectScript());
+            string errorMessage = PowerShellRunner.FindMarkerMessage(result.Stdout, "WTF_CONNECT_ERROR:");
+            if (errorMessage != null || !PowerShellRunner.ContainsMarker(result.Stdout, "WTF_CONNECT_OK"))
+            {
+                throw new NotSupportedException("PowerShell Defender module (Get-MpPreference) is unavailable. " +
+                    (errorMessage ?? PowerShellRunner.DescribeFailure(result)));
+            }
+            ApplyConnectOutput(result.Stdout);
+        }
+
+        // Internal for tests. One launch discovers everything the later phases ask about: Add's and
+        // Remove's parameter sets, and which exclusion fields the Get-MpPreference object really has
+        // (the read surface). Discovering the read surface here keeps `list` at two launches (connect +
+        // read) instead of three. A failure of that discovery does not fail connect: it is reported as
+        // Read.ERROR and only surfaces if a caller asks for read support.
+        internal static string BuildConnectScript()
+        {
             var script = new StringBuilder();
             script.Append("$ErrorActionPreference = 'Stop'\r\n");
             script.Append("try {\r\n");
-            script.Append("    Get-Command ConfigDefender\\Add-MpPreference | Out-Null\r\n");
+            // Get-MpPreference is the only mandatory cmdlet (every command reads). Add-MpPreference and
+            // Remove-MpPreference are discovered, not required: list/remove must work without Add, and
+            // add/check without Remove. A missing one is reported as AddCmdlet=False / Remove.*=False.
             script.Append("    Get-Command ConfigDefender\\Get-MpPreference | Out-Null\r\n");
-            script.Append("    $cmd = Get-Command ConfigDefender\\Add-MpPreference\r\n");
+            script.Append("    $cmd = Get-Command ConfigDefender\\Add-MpPreference -ErrorAction SilentlyContinue\r\n");
+            script.Append("    Write-Output ('AddCmdlet=' + [bool]$cmd)\r\n");
             script.Append("    foreach ($n in @('ExclusionPath','ExclusionExtension','ExclusionProcess','ExclusionIpAddress')) {\r\n");
-            script.Append("        Write-Output ($n + '=' + $cmd.Parameters.ContainsKey($n))\r\n");
+            script.Append("        Write-Output ($n + '=' + [bool]($cmd -and $cmd.Parameters.ContainsKey($n)))\r\n");
+            script.Append("    }\r\n");
+            // Remove-MpPreference is only needed by 'remove'; its absence must not break add/check/list.
+            script.Append("    $rm = Get-Command ConfigDefender\\Remove-MpPreference -ErrorAction SilentlyContinue\r\n");
+            script.Append("    foreach ($n in @('ExclusionPath','ExclusionExtension','ExclusionProcess','ExclusionIpAddress')) {\r\n");
+            script.Append("        Write-Output ('Remove.' + $n + '=' + [bool]($rm -and $rm.Parameters.ContainsKey($n)))\r\n");
+            script.Append("    }\r\n");
+            script.Append("    try {\r\n");
+            script.Append("        $instances = @(ConfigDefender\\Get-MpPreference)\r\n");
+            script.Append("        if ($instances.Count -ne 1) { throw ('Expected exactly one instance, got ' + $instances.Count + '.') }\r\n");
+            script.Append("        foreach ($n in @('ExclusionPath','ExclusionExtension','ExclusionProcess','ExclusionIpAddress')) {\r\n");
+            script.Append("            Write-Output ('Read.' + $n + '=' + [bool]$instances[0].PSObject.Properties[$n])\r\n");
+            script.Append("        }\r\n");
+            script.Append("    } catch {\r\n");
+            script.Append("        Write-Output ('Read.ERROR=' + [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($_.Exception.Message)))\r\n");
             script.Append("    }\r\n");
             script.Append("    Write-Output 'WTF_CONNECT_OK'\r\n");
             script.Append("} catch {\r\n");
             script.Append(PowerShellRunner.EmitErrorMarkerStatement("WTF_CONNECT_ERROR:"));
             script.Append("    exit 1\r\n");
             script.Append("}\r\n");
+            return script.ToString();
+        }
 
-            PowerShellRunner.Result result = PowerShellRunner.RunScript(script.ToString());
-            string errorMessage = PowerShellRunner.FindMarkerMessage(result.Stdout, "WTF_CONNECT_ERROR:");
-            if (errorMessage != null || !PowerShellRunner.ContainsMarker(result.Stdout, "WTF_CONNECT_OK"))
-            {
-                throw new NotSupportedException("PowerShell Defender module (Add-MpPreference/Get-MpPreference) is unavailable. " +
-                    (errorMessage ?? PowerShellRunner.DescribeFailure(result)));
-            }
-            supportsCache = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
-            foreach (string line in PowerShellRunner.SplitLines(result.Stdout))
+        private static readonly string[] CapabilityTypes =
+            { "ExclusionPath", "ExclusionExtension", "ExclusionProcess", "ExclusionIpAddress" };
+
+        // Internal for tests: parses the connect script's name=True/False lines. A capability that never
+        // arrived is unobserved, not "unsupported", so every row of every group must be present
+        // (the Read group may instead be replaced by a Read.ERROR), or connect fails.
+        internal void ApplyConnectOutput(string stdout)
+        {
+            var parsed = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            string error = null;
+            foreach (string line in PowerShellRunner.SplitLines(stdout))
             {
                 int equals = line.IndexOf('=');
                 if (equals <= 0) { continue; }
-                supportsCache[line.Substring(0, equals)] =
-                    string.Equals(line.Substring(equals + 1), "True", StringComparison.OrdinalIgnoreCase);
+                string key = line.Substring(0, equals);
+                if (key == "Read.ERROR")
+                {
+                    try { error = PowerShellRunner.DecodeValue(line.Substring(equals + 1)); }
+                    catch (FormatException) { error = line.Substring(equals + 1); }
+                    continue;
+                }
+                parsed[key] = string.Equals(line.Substring(equals + 1), "True", StringComparison.OrdinalIgnoreCase);
             }
+            var missing = new List<string>();
+            if (!parsed.ContainsKey("AddCmdlet")) { missing.Add("AddCmdlet"); }
+            foreach (string type in CapabilityTypes)
+            {
+                if (!parsed.ContainsKey(type)) { missing.Add(type); }
+                if (!parsed.ContainsKey("Remove." + type)) { missing.Add("Remove." + type); }
+                if (error == null && !parsed.ContainsKey("Read." + type)) { missing.Add("Read." + type); }
+            }
+            if (missing.Count != 0)
+            {
+                throw new InvalidOperationException("PowerShell connect output is incomplete (missing " +
+                    string.Join(", ", missing.ToArray()) + "); capabilities are unobserved, not unsupported.");
+            }
+            supportsCache = parsed;
+            readError = error;
+            addAvailable = parsed["AddCmdlet"];
         }
+
+        public void PrepareRead() { }
 
         public void Prepare(Dictionary<string, List<string>> exclusions)
         {
@@ -962,6 +1713,11 @@ internal static class DefenderModule
             // MutationStatus.ApiFailed (as if Defender itself had rejected a request that
             // powershell.exe never even got a chance to run).
             string script = BuildAddScript(exclusions);
+            // Only after the length check, so an oversized request still fails the same way everywhere.
+            if (!addAvailable)
+            {
+                throw new NotSupportedException("ConfigDefender\\Add-MpPreference is unavailable; add cannot run on this transport.");
+            }
             foreach (var exclusion in exclusions)
             {
                 if (!Supports(exclusion.Key))
@@ -976,6 +1732,68 @@ internal static class DefenderModule
         {
             bool supported;
             return supportsCache != null && supportsCache.TryGetValue(name, out supported) && supported;
+        }
+
+        // Read surface, as discovered by the connect script from the Get-MpPreference object itself
+        // (not Add-MpPreference's parameter set). If that discovery failed, the caller learns why
+        // instead of being told the type is unsupported.
+        public bool SupportsRead(string name)
+        {
+            if (readError != null)
+            {
+                throw new InvalidOperationException("Get-MpPreference (PowerShell) field discovery failed: " + readError);
+            }
+            bool supported;
+            return supportsCache != null && supportsCache.TryGetValue("Read." + name, out supported) && supported;
+        }
+
+        public bool SupportsRemove(string name)
+        {
+            bool supported;
+            return supportsCache != null && supportsCache.TryGetValue("Remove." + name, out supported) && supported;
+        }
+
+        // Internal for tests: the script for one Remove request (a single type), length-validated.
+        internal static string BuildRemoveScript(string type, IList<string> values)
+        {
+            var script = new StringBuilder();
+            script.Append("$ErrorActionPreference = 'Stop'\r\n");
+            script.Append("try {\r\n");
+            script.Append("    ConfigDefender\\Remove-MpPreference -" + type + " " +
+                PowerShellRunner.EncodeValuesExpression(values) + "\r\n");
+            script.Append("    Write-Output 'WTF_REMOVE_OK'\r\n");
+            script.Append("} catch {\r\n");
+            script.Append(PowerShellRunner.EmitErrorMarkerStatement("WTF_REMOVE_ERROR:"));
+            script.Append("    exit 1\r\n");
+            script.Append("}\r\n");
+            string result = script.ToString();
+            PowerShellRunner.ValidateScriptLength(result);
+            return result;
+        }
+
+        public object Remove(string type, IList<string> values)
+        {
+            if (!SupportsRemove(type))
+            {
+                throw new NotSupportedException("Remove-MpPreference -" + type + " is unavailable.");
+            }
+            PowerShellRunner.Result result = PowerShellRunner.RunScript(BuildRemoveScript(type, values));
+            string errorMessage;
+            PowerShellRunner.AddOutcome outcome = PowerShellRunner.ClassifyResult(
+                result, "WTF_REMOVE_OK", "WTF_REMOVE_ERROR:", out errorMessage);
+            if (outcome == PowerShellRunner.AddOutcome.Error)
+            {
+                throw new InvalidOperationException("Remove-MpPreference (PowerShell) failed: " + errorMessage);
+            }
+            if (outcome == PowerShellRunner.AddOutcome.Unknown)
+            {
+                // Same reasoning as Add(): no marker is not a known failure; readback decides.
+                ConsoleUi.Status("WARN", "powershell.exe ended (exit code " + result.ExitCode +
+                    ") without a clear success/failure marker; verifying configuration by readback.");
+                ConsoleUi.Detail(PowerShellRunner.DescribeFailure(result));
+            }
+            // Remove-MpPreference is a void cmdlet: no WMI return code exists to report.
+            return null;
         }
 
         private static string BuildAddScript(Dictionary<string, List<string>> exclusions)
@@ -1361,14 +2179,23 @@ internal static class DefenderModule
             string beginPrefix = "WTF_BEGIN_" + marker + ":";
             string endPrefix = "WTF_END_" + marker + ":";
             string current = null;
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (string line in SplitLines(stdout))
             {
                 if (line.StartsWith(beginPrefix, StringComparison.Ordinal))
                 {
+                    if (current != null)
+                    {
+                        throw new InvalidOperationException("PowerShell readback block for field " + current + " was not closed.");
+                    }
                     current = line.Substring(beginPrefix.Length);
                     if (!result.ContainsKey(current))
                     {
                         throw new InvalidOperationException("Unexpected PowerShell readback field: " + current);
+                    }
+                    if (!seen.Add(current))
+                    {
+                        throw new InvalidOperationException("PowerShell readback returned field " + current + " more than once.");
                     }
                     continue;
                 }
@@ -1386,6 +2213,14 @@ internal static class DefenderModule
             if (current != null)
             {
                 throw new InvalidOperationException("PowerShell readback truncated for field: " + current);
+            }
+            // A field that never arrived is unobserved, not an empty list.
+            foreach (string field in fields)
+            {
+                if (!seen.Contains(field))
+                {
+                    throw new InvalidOperationException("PowerShell readback is missing field: " + field);
+                }
             }
             return result;
         }
@@ -1457,15 +2292,10 @@ internal static class DefenderModule
         return false;
     }
 
-    private static Dictionary<string, List<string>> ReadExclusions(
+    private static IList<Dictionary<string, object>> ReadExclusionRecords(
         ManagementScope scope, ICollection<string> types)
     {
-        var configured = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
-        foreach (string type in types)
-        {
-            configured.Add(type, new List<string>());
-        }
-
+        var records = new List<Dictionary<string, object>>();
         using (var searcher = new ManagementObjectSearcher(scope,
             new ObjectQuery("SELECT " + string.Join(", ", types) + " FROM MSFT_MpPreference")))
         using (ManagementObjectCollection results = searcher.Get())
@@ -1474,35 +2304,60 @@ internal static class DefenderModule
             {
                 using (preference)
                 {
-                    foreach (string type in types)
-                    {
-                        object raw = preference[type];
-                        if (raw == null || raw == DBNull.Value)
-                        {
-                            continue;
-                        }
-                        string[] values = raw as string[];
-                        if (values == null)
-                        {
-                            throw new InvalidOperationException("Unexpected WMI readback type for " + type + ".");
-                        }
-                        configured[type].AddRange(values);
-                    }
+                    var fields = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+                    foreach (string type in types) { fields[type] = preference[type]; }
+                    records.Add(fields);
                 }
             }
         }
+        return records;
+    }
 
+    // The one place the management and COM reads turn provider records into lists. MSFT_MpPreference
+    // is a singleton: zero records means nothing was observed (provider degraded, service down) and
+    // several mean the answer is ambiguous, so both fail rather than become an empty or merged list.
+    // native and powershell enforce the same rule in their own readers. Each record maps a type name
+    // to the raw property value.
+    internal static Dictionary<string, List<string>> AssembleExclusions(
+        IList<Dictionary<string, object>> records, ICollection<string> types)
+    {
+        AsrModule.RequireSingleInstance(records.Count, "Exclusion lists cannot be read.");
+        var configured = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        foreach (string type in types)
+        {
+            object raw;
+            if (!records[0].TryGetValue(type, out raw))
+            {
+                throw new InvalidOperationException("Missing readback field: " + type);
+            }
+            configured.Add(type, DecodeStringArray(raw, type));
+        }
         return configured;
     }
 
     internal static bool VerifyExclusions(Dictionary<string, List<string>> requested,
         Dictionary<string, List<string>> configured)
     {
+        return VerifyExclusions(requested, configured, null);
+    }
+
+    // unreadable (may be null) names types whose list Defender withheld: their values cannot be
+    // confirmed, and are reported as such rather than as simply missing.
+    internal static bool VerifyExclusions(Dictionary<string, List<string>> requested,
+        Dictionary<string, List<string>> configured, ICollection<string> unreadable)
+    {
         bool allConfirmed = true;
         foreach (var exclusion in requested)
         {
             foreach (string value in exclusion.Value)
             {
+                if (unreadable != null && unreadable.Contains(exclusion.Key))
+                {
+                    ConsoleUi.Status("FAIL", "Not confirmed " + exclusion.Key + ": " + value +
+                        " (list unreadable; cannot confirm)", true);
+                    allConfirmed = false;
+                    continue;
+                }
                 bool found = ContainsExclusion(configured, exclusion.Key, value);
                 if (found)
                 {
@@ -1526,26 +2381,49 @@ internal static class DefenderModule
         {
             throw new InvalidOperationException("Missing readback field: " + type);
         }
-        return values.Exists(delegate(string actual)
-        {
-            if (actual == null) { return false; }
-            bool isPath = type == "ExclusionPath" || type == "ExclusionProcess";
-            return string.Equals(isPath ? actual.TrimEnd('\\') : actual,
-                isPath ? value.TrimEnd('\\') : value, StringComparison.OrdinalIgnoreCase);
-        });
+        return values.Exists(delegate(string actual) { return EquivalentValues(type, actual, value); });
+    }
+
+    // Defender treats a path/process entry with and without a trailing backslash as the same entry.
+    private static string NormalizeValue(string type, string value)
+    {
+        bool isPath = type == "ExclusionPath" || type == "ExclusionProcess";
+        return isPath ? value.TrimEnd('\\') : value;
+    }
+
+    private static bool EquivalentValues(string type, string actual, string value)
+    {
+        return actual != null && string.Equals(NormalizeValue(type, actual),
+            NormalizeValue(type, value), StringComparison.OrdinalIgnoreCase);
     }
 
     internal static void PrintAssessment(Options options, RunEvidence evidence, int exitCode)
     {
         ConsoleUi.Section("Result");
-        string outcome = exitCode == 0 ?
-            (options.CheckOnly ? "CHECK_ONLY" :
-                evidence.AllPresentBefore == true ? "CONFIGURATION_CONFIRMED_PREEXISTING" : "CONFIGURATION_CONFIRMED") :
-            (!evidence.AddAttempted ? "NOT_ATTEMPTED" : exitCode == 3 ? "UNCONFIRMED" : "OPERATION_ERROR");
+        string outcome = DescribeOutcome(options, evidence, exitCode);
         ConsoleUi.Status(exitCode == 0 ? "OK" : exitCode == 3 ? "WARN" : "FAIL", "Outcome: " + outcome);
         ConsoleUi.Row("Exit / stage", exitCode + " / " + evidence.Stage);
-        ConsoleUi.Text("Add attempted: " + evidence.AddAttempted +
-            "; invocation returned: " + evidence.AddReturned);
+        if (options.Mode == ExclusionMode.Remove)
+        {
+            ConsoleUi.Text("Remove attempted: " + evidence.RemoveAttempted +
+                "; requests sent: " + evidence.RemoveInvoked + "; returned: " + evidence.RemoveReturned);
+            if (evidence.RemoveItems.Count != 0)
+            {
+                ConsoleUi.Text("Per value: " + CountItems(evidence, RemoveState.Removed) + " removed (confirmed), " +
+                    CountItems(evidence, RemoveState.AlreadyAbsent) + " already absent, " +
+                    CountItems(evidence, RemoveState.NotConfirmed) + " not confirmed, " +
+                    CountItems(evidence, RemoveState.Error) + " error.");
+            }
+        }
+        else if (options.ReadOnly)
+        {
+            ConsoleUi.Text("Add attempted: " + evidence.AddAttempted + "; Remove attempted: " + evidence.RemoveAttempted);
+        }
+        else
+        {
+            ConsoleUi.Text("Add attempted: " + evidence.AddAttempted +
+                "; invocation returned: " + evidence.AddReturned);
+        }
         if (evidence.Lifecycle != null)
         {
             ConsoleUi.Row("Lifecycle", "probe=" + evidence.Lifecycle.Probe +
@@ -1554,9 +2432,39 @@ internal static class DefenderModule
                 "; observation=" + evidence.Lifecycle.Observation +
                 "; restoration=" + evidence.Lifecycle.Restoration);
         }
-        if (options.CheckOnly)
+        if (options.Mode == ExclusionMode.Remove)
         {
-            ConsoleUi.Text("No Add was invoked. This does not test prevention of configuration changes.");
+            if (!evidence.RemoveAttempted && exitCode == 0)
+            {
+                ConsoleUi.Text("Every requested value was already absent; Defender was not asked to remove anything.");
+            }
+            else if (!evidence.RemoveAttempted)
+            {
+                ConsoleUi.Text("Preflight failed before Remove; this is not proof of a tamper-protection block.");
+            }
+            else if (exitCode == 0)
+            {
+                ConsoleUi.Text("Removal confirmed by readback for every value sent. WTF did not create these entries; protection state and EDR detection require separate evidence.");
+                if (CountItems(evidence, RemoveState.AlreadyAbsent) != 0)
+                {
+                    ConsoleUi.Text("Values already absent are listed as such; no change was demonstrated for them.");
+                }
+            }
+            else
+            {
+                ConsoleUi.Text("An error or missing readback does not prove a security-control block.");
+                ConsoleUi.Text("The per-value results show which values changed; partial changes are possible and nothing was rolled back.");
+            }
+        }
+        else if (options.ReadOnly)
+        {
+            ConsoleUi.Text(options.Mode == ExclusionMode.List ?
+                "No Add or Remove was invoked. A list is a point-in-time read, not proof of effective policy." :
+                "No Add was invoked. This does not test prevention of configuration changes.");
+            if (evidence.ListUnreadable)
+            {
+                ConsoleUi.Text("At least one list was unreadable: it is not reported as empty, and no value is reported absent because of it.");
+            }
         }
         else if (!evidence.AddAttempted)
         {
@@ -1569,6 +2477,10 @@ internal static class DefenderModule
             {
                 ConsoleUi.Text("All values already existed; no new configuration transition was demonstrated.");
             }
+            else if (evidence.AllPresentBefore == null)
+            {
+                ConsoleUi.Text("The baseline was unreadable, so whether the values already existed is unknown.");
+            }
             else
             {
                 ConsoleUi.Text("At least one value is newly observed; visibility or concurrent policy changes may affect attribution.");
@@ -1580,7 +2492,9 @@ internal static class DefenderModule
             ConsoleUi.Text("Inspect the error and effective policy; partial changes are possible.");
         }
         ConsoleUi.Text("Compliance: NOT_ASSESSED | Detection/response: NOT_MEASURED");
-        ConsoleUi.Text("No automatic cleanup; preserve pre-existing entries when restoring test changes.");
+        ConsoleUi.Text(options.Mode == ExclusionMode.Remove ?
+            "No automatic rollback; re-add a removed value only if the removal was unintended." :
+            "No automatic cleanup; preserve pre-existing entries when restoring test changes.");
         if (!options.Verbose)
         {
             ConsoleUi.Text("Use --verbose for diagnostic detail and Detection & Response guidance.");
@@ -1598,7 +2512,7 @@ internal static class DefenderModule
         ConsoleUi.Row("Telemetry mode", options.CollectEtw ? "etw (raw ETL capture; TDH evidence follows)" :
             options.CollectEventLog ? "eventlog (evidence follows; not raw ETW tracing)" : "none (no event logs read)");
 
-        ConsoleUi.Section("Exclusion scope");
+        ConsoleUi.Section(options.Mode == ExclusionMode.Remove ? "Removal scope" : "Exclusion scope");
         if (options.Exclusions.ContainsKey("ExclusionPath"))
         {
             ConsoleUi.Row("Path", "Can reduce file/directory antivirus scanning; review breadth and writable locations.");
@@ -1623,16 +2537,48 @@ internal static class DefenderModule
         ConsoleUi.Row("3. Process", "Security 4688 (audit policy required), Sysmon 1, or EDR: correlate parent process, command line, identity, hash and signer.");
         ConsoleUi.Row("4. WMI", "WMI-Activity is not a complete successful-method audit trail. Only the powershell transport launches an actual PowerShell process (script-block logging, AMSI); the other three never do, so missing script logs on their own do not establish a detection gap.");
         ConsoleUi.Row("5. Validate", "Check collection, ingestion delay, sensor coverage, alert rules and triage latency separately.");
-        ConsoleUi.Row("6. Restore", "Remove only test-created entries via the approved channel; preserve pre-existing entries. No automatic cleanup. Verify policy and protection afterward.");
+        ConsoleUi.Row("6. Restore", options.Mode == ExclusionMode.Remove ?
+            "Removed entries were not created by WTF. Re-add only an unintended removal, via the approved channel; there is no automatic rollback. Verify policy and protection afterward." :
+            "Remove only test-created entries via the approved channel; preserve pre-existing entries. No automatic cleanup. Verify policy and protection afterward.");
         ConsoleUi.Row("7. Respond", "For unauthorized changes, preserve evidence, follow the incident playbook and investigate the account/process and exposure. T1562.001 requires unauthorized impairment context.");
         ConsoleUi.Row("8. Govern", "Review least privilege, exclusion ownership/expiry, central policy and applicable tamper-protection coverage. Administrator access alone does not prove noncompliance.");
         ConsoleUi.Text("Reference: https://learn.microsoft.com/en-us/defender-endpoint/troubleshoot-microsoft-defender-antivirus");
     }
 
+    private static int CountItems(RunEvidence evidence, RemoveState state)
+    {
+        return evidence.RemoveItems.FindAll(delegate(RemoveItem item) { return item.State == state; }).Count;
+    }
+
+    private static string DescribeOutcome(Options options, RunEvidence evidence, int exitCode)
+    {
+        if (options.Mode == ExclusionMode.Remove)
+        {
+            if (exitCode == 0) { return evidence.RemoveAttempted ? "REMOVAL_CONFIRMED" : "ALREADY_ABSENT"; }
+            if (!evidence.RemoveAttempted) { return "NOT_ATTEMPTED"; }
+            if (exitCode == 3)
+            {
+                return CountItems(evidence, RemoveState.Removed) != 0 ? "PARTIAL_REMOVAL_UNCONFIRMED" : "REMOVAL_UNCONFIRMED";
+            }
+            return CountItems(evidence, RemoveState.Removed) != 0 && CountItems(evidence, RemoveState.Error) != 0 ?
+                "PARTIAL_REMOVAL" : "OPERATION_ERROR";
+        }
+        if (options.ReadOnly)
+        {
+            string name = options.Mode == ExclusionMode.List ? "LIST" : "CHECK";
+            // Exit 4 means ETW setup stopped the run before the read; any other failure is a failed read.
+            return exitCode == 0 ? name + "_ONLY" : exitCode == 3 ? name + "_INCOMPLETE" :
+                exitCode == 4 ? "NOT_ATTEMPTED" : name + "_FAILED";
+        }
+        return exitCode == 0 ?
+            (evidence.AllPresentBefore == true ? "CONFIGURATION_CONFIRMED_PREEXISTING" : "CONFIGURATION_CONFIRMED") :
+            (!evidence.AddAttempted ? "NOT_ATTEMPTED" : exitCode == 3 ? "UNCONFIRMED" : "OPERATION_ERROR");
+    }
+
     private static int ReportError(string message)
     {
         ConsoleUi.Status("FAIL", message, true);
-        ConsoleUi.Text("Check permissions/policy. If Add was attempted, inspect settings for partial changes.");
+        ConsoleUi.Text("Check permissions/policy. If a write was attempted, inspect settings for partial changes.");
         ConsoleUi.Detail("Organizational policy and tamper protection can restrict the requested change.");
         return 1;
     }

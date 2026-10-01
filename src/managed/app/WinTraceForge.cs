@@ -70,7 +70,7 @@ internal static class WinTraceForge
         ConsoleUi.Text("Windows security telemetry differential testing harness / lab.");
         ConsoleUi.Text("Study path-dependent visibility for the same operation or equivalent outcome.");
         ConsoleUi.Section("Control modules");
-        ConsoleUi.Row("defender exclusion", "Add/check Defender antivirus exclusions.");
+        ConsoleUi.Row("defender exclusion", "add|check|list|remove Defender antivirus exclusions.");
         ConsoleUi.Row("defender asr status", "Read ASR rule state, policy source and exclusion exposure.");
         ConsoleUi.Row("defender asr exclusion", "Add/check ASR-only (global) exclusions.");
         ConsoleUi.Row("defender asr rule", "Read or set a single ASR rule's action.");
@@ -96,7 +96,7 @@ internal static class WinTraceForge
         ConsoleUi.Text("Firewall uses COM rule management or the WMI Firewall provider, not WFP filters or callouts.");
         ConsoleUi.Text("No Firewall Off, no profile mutation, no automatic deletion of business rules.");
         ConsoleUi.Text("Configuration readback is not proof of packet blocking/allowing or EDR detection.");
-        ConsoleUi.Text("Legacy exclusion arguments now belong after 'defender exclusion'.");
+        ConsoleUi.Text("Exclusions use an explicit command: defender exclusion add|check|list|remove.");
         if (ConsoleUi.Verbose)
         {
             ConsoleUi.Section("Operational notes");

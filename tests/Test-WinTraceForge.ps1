@@ -49,12 +49,12 @@ Test-Command '' 0 @('CONTROL MODULES') | Out-Null
 $defenderHelp = Test-Command 'defender exclusion --help --no-color' 0 @('ExclusionPath', 'transport')
 $firewallHelp = Test-Command 'firewall rule --help --no-color' 0 @('add', 'check', 'remove', '--id')
 foreach ($entry in @(
-    @{ Command = 'defender exclusion'; Output = $defenderHelp; Specific = 'EXCLUSION TYPES'; Limit = 45 },
-    @{ Command = 'firewall'; Output = $firewallHelp; Specific = 'COMMANDS'; Limit = 60 }
+    @{ Command = 'defender exclusion'; Output = $defenderHelp; Specific = @('COMMANDS', 'EXCLUSION TYPES'); Limit = 45 },
+    @{ Command = 'firewall'; Output = $firewallHelp; Specific = @('COMMANDS'); Limit = 60 }
 )) {
     $sections = @([regex]::Matches($entry.Output, '(?m)^  ([A-Z][A-Z /&]+) -+') |
         ForEach-Object { $_.Groups[1].Value })
-    $expected = @('USAGE', 'OPTIONS', $entry.Specific, 'ROUTES', 'QUICK START', 'BEFORE YOU RUN')
+    $expected = @('USAGE', 'OPTIONS') + $entry.Specific + @('ROUTES', 'QUICK START', 'BEFORE YOU RUN')
     if (($sections -join '|') -ne ($expected -join '|')) { throw "Help section order mismatch: $($entry.Command)" }
     $lines = $entry.Output -split '\r?\n'
     if ($lines.Count -gt $entry.Limit) { throw "Default help exceeds $($entry.Limit) lines: $($entry.Command)" }

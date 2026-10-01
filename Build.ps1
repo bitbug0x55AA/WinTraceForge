@@ -151,6 +151,7 @@ try {
     if ($Integration) {
         Write-Host 'Windows integration: read-only policy checks, detached rule preparation and bounded private ETW only.'
         Invoke-TestBinary 'Control.RegressionTests.exe' @('--asr-read-only')
+        Invoke-TestBinary 'Control.RegressionTests.exe' @('--exclusion-read-only')
         Invoke-ManagedBuild 'FirewallNativeRegressionTests' 'Firewall.Native.RegressionTests.exe' 'Firewall.Native.RegressionTests.cs'
         Invoke-TestBinary 'Firewall.Native.RegressionTests.exe'
         Invoke-TestBinary 'Firewall.Native.CppTests.exe'

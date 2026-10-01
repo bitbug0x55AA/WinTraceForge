@@ -722,10 +722,15 @@ internal static partial class AsrModule
     // state, not "nothing configured" -- so it must fail, never be read as an empty snapshot.
     internal static void RequireSingleInstance(int count)
     {
+        RequireSingleInstance(count, "ASR posture cannot be trusted.");
+    }
+
+    internal static void RequireSingleInstance(int count, string consequence)
+    {
         if (count != 1)
         {
             throw new InvalidOperationException("MSFT_MpPreference returned " + count +
-                " instance(s); expected exactly one. ASR posture cannot be trusted.");
+                " instance(s); expected exactly one. " + consequence);
         }
     }
 

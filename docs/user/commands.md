@@ -10,8 +10,10 @@ The commands below are the currently implemented security-control / configuratio
 
 | Command | Purpose | Changes host state? |
 | --- | --- | --- |
-| `defender exclusion --check` | Read capabilities and requested AV exclusion values. | No |
-| `defender exclusion` | Add requested AV exclusions. | Persistent policy change |
+| `defender exclusion check` | Read capabilities, or whether the named AV exclusion values are present. | No |
+| `defender exclusion list` | List every readable AV exclusion per type; unreadable lists are flagged, never shown empty. | No |
+| `defender exclusion add` | Add the named AV exclusions. | Persistent policy change |
+| `defender exclusion remove` | Remove the named AV exclusions (type and value required; no remove-all). | Persistent policy change |
 | `defender asr status` | Read rule actions, policy sources, and exclusion exposure. | No |
 | `defender asr exclusion [--check]` | Check or add ASR-only global exclusions. | Persistent unless `--check` |
 | `defender asr rule [--check]` | Read or set one rule's action. | Persistent unless `--check` |
@@ -24,7 +26,7 @@ The commands below are the currently implemented security-control / configuratio
 
 ## Shared options
 
-Place module flags after the module and command, for example `wtf.exe defender exclusion --transport native --check`.
+Place module flags after the module and command, for example `wtf.exe defender exclusion check --transport native`.
 
 | Option | Values / default | Meaning |
 | --- | --- | --- |

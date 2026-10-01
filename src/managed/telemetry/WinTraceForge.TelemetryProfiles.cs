@@ -172,7 +172,7 @@ internal static class DefenderTelemetry
     private static string Interpret(TelemetryEvidence.ParsedEvent parsed)
     {
         if (parsed.Provider == "Microsoft-Windows-WMI-Activity")
-        { return "WMI activity may be a query; it does not by itself prove Add was invoked."; }
+        { return "WMI activity may be a query; it does not by itself prove Add or Remove was invoked."; }
         if (parsed.Provider == "Microsoft-Windows-Windows Defender")
         { return parsed.Id == 5007 ? "Configuration change: verify setting and authorization." :
             "Blocked setting change: verify the setting and attribution to this run."; }

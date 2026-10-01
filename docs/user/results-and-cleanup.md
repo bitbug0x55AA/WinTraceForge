@@ -14,10 +14,10 @@ Preserve the command, selected transport, run/test ID, UTC window, host, user, P
 
 | Code | Meaning |
 | --- | --- |
-| `0` | Confirmed state, read-only success, help, or documented idempotent absence. |
+| `0` | Confirmed state, read-only success, help, or documented idempotent absence (for example a Defender exclusion `remove` whose values are all already absent). |
 | `1` | Operation error, safety refusal, or failed/unconfirmed automatic restoration. |
 | `2` | Invalid command or arguments. |
-| `3` | Unconfirmed state or missing expected configuration. |
+| `3` | Unconfirmed state or missing expected configuration. Also a Defender exclusion `check`/`list` that could not read a list (`CHECK_INCOMPLETE` / `LIST_INCOMPLETE`). |
 | `4` | Mandatory ETW setup failed before the control operation. |
 
 Consult the command's output and help for absence behavior. A missing firewall rule on `check` exits 3; removing an already-absent rule is idempotent. ASR `verify` never confirms enforcement from process observation, and `CLEANUP_UNVERIFIABLE` exits 1. Later telemetry failures do not replace the control operation's exit code. Always inspect the separate cleanup status.
@@ -26,7 +26,8 @@ Consult the command's output and help for absence behavior. A missing firewall r
 
 | Operation | Cleanup |
 | --- | --- |
-| Defender AV exclusion add | Manual: remove only test-created values through an approved administration channel, preserving the baseline. |
+| Defender AV exclusion add | Manual: remove only test-created values (`defender exclusion remove` or an approved administration channel), preserving the baseline. |
+| Defender AV exclusion remove | Manual and optional: re-add (`defender exclusion add`, printed) only a value removed in error. There is no rollback, and exclusions carry no WTF ownership marker. |
 | ASR exclusion add | Manual: use the printed command, which includes only newly introduced paths. |
 | ASR rule change | Manual: use the printed command to restore the captured prior action. |
 | ASR behavioral verify | Automatic cleanup attempted for owned test artifacts and launcher/direct children; inspect the reported restoration status. |

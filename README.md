@@ -12,7 +12,7 @@ Currently implemented modules:
 
 | Current control experiment | What you can do |
 | --- | --- |
-| Defender Antivirus | Check or add exclusions. |
+| Defender Antivirus | Check, list, add, or remove exclusions. |
 | Attack Surface Reduction | Inspect posture, check or change exclusions and rule actions, and run an experimental behavioral test. |
 | Windows Firewall | Inspect profiles, list the rules in a policy store, and add, check, or remove uniquely marked test rules. |
 
@@ -34,7 +34,8 @@ Open PowerShell in the extracted directory and start with read-only checks:
 ```powershell
 .\wtf.exe --version
 .\wtf.exe --help
-.\wtf.exe defender exclusion --check -ExclusionPath "C:\Lab Data"
+.\wtf.exe defender exclusion check -ExclusionPath "C:\Lab Data"
+.\wtf.exe defender exclusion list
 .\wtf.exe defender asr status
 .\wtf.exe firewall profiles
 ```

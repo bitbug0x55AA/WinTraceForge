@@ -6,7 +6,7 @@ These guides are for operators investigating path-dependent Windows security vis
 | --- | --- |
 | [Installation](installation.md) | Check requirements, verify a download, and prepare the binaries. |
 | [Commands](commands.md) | Learn shared options and find a command by control family. |
-| [Defender Antivirus exclusions](defender.md) | Check or add AV exclusions and preserve existing values during cleanup. |
+| [Defender Antivirus exclusions](defender.md) | Check, list, add, or remove AV exclusions and preserve existing values during cleanup. |
 | [Attack Surface Reduction](asr.md) | Inspect posture, change one rule or exclusion, and understand experimental verification. |
 | [Windows Firewall](firewall.md) | Inspect profiles, list a policy store's rules, and manage narrowly scoped, marked test rules. |
 | [Telemetry](telemetry.md) | Collect Event Log / ETW evidence and understand correlation and capture limits. |

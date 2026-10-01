@@ -24,7 +24,22 @@ internal static class RegressionTests
             RunAsrReadOnlyIntegrationCheck();
             return 0;
         }
+        if (args.Length == 1 && args[0] == "--exclusion-read-only")
+        {
+            RunExclusionReadOnlyIntegrationCheck();
+            return 0;
+        }
         CheckArguments();
+        CheckExclusionCommandParsing();
+        CheckExclusionList();
+        CheckExclusionCheck();
+        CheckExclusionIndependentOfAdd();
+        CheckPowerShellReadbackCompleteness();
+        CheckExclusionRemove();
+        CheckPowerShellRemoveScript();
+        CheckPowerShellConnectScript();
+        CheckExclusionExecute();
+        CheckExclusionHelp();
         CheckReadback();
         CheckTransportsAndAssessment();
         CheckTelemetry();
@@ -485,13 +500,124 @@ internal static class RegressionTests
             }
         }
         public void Connect() { Record("Connect"); }
+        public void PrepareRead() { Record("PrepareRead"); }
         public void Prepare(Dictionary<string, List<string>> exclusions) { Record("Prepare"); }
         public bool Supports(string name) { Record("Supports"); return true; }
+        public bool SupportsRead(string name) { Record("SupportsRead"); return true; }
+        public bool SupportsRemove(string name) { Record("SupportsRemove"); return true; }
         public object Add() { Record("Add"); return Status; }
+        public object Remove(string type, IList<string> values) { Record("Remove"); return Status; }
         public Dictionary<string, List<string>> Read(ICollection<string> types)
         {
             Record("Read");
             return readCount++ == 0 ? Before : After;
+        }
+        public void Dispose() { }
+    }
+
+    // A stateful in-memory stand-in for Defender's exclusion lists, used by the explicit-command
+    // (add/check/list/remove) tests. Read() returns a copy of the live state, so a Remove that is
+    // really applied is visible to the post-removal readback, while the knobs below let a test make
+    // individual values fail, be rejected, be silently ignored, or make a whole list unreadable.
+    private sealed class FakeStatefulBackend : DefenderModule.IPreferenceBackend
+    {
+        internal const string UnreadableText = "N/A: Must be an administrator to view exclusions";
+        internal readonly List<string> Calls = new List<string>();
+        internal readonly List<string> RemoveRequests = new List<string>();
+        internal readonly Dictionary<string, List<string>> State =
+            new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase)
+            {
+                { "ExclusionPath", new List<string>() }, { "ExclusionExtension", new List<string>() },
+                { "ExclusionProcess", new List<string>() }, { "ExclusionIpAddress", new List<string>() }
+            };
+        internal readonly HashSet<string> UnreadableTypes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // Unreadable only from the second read on (the list becomes hidden after the baseline).
+        internal readonly HashSet<string> UnreadableAfterFirstRead = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // Types the write surface (Add/Remove metadata) does not expose.
+        internal readonly HashSet<string> UnsupportedTypes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // Types the Remove method's parameter set does not accept.
+        internal readonly HashSet<string> RemoveUnsupportedTypes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // Types that are not readable fields of the preference object at all.
+        internal readonly HashSet<string> NotReadableTypes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // A value that disappears from the list even though its Remove request throws.
+        internal readonly HashSet<string> VanishOnThrow = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // How many MSFT_MpPreference instances a management/COM-style read would see.
+        internal int InstanceCount = 1;
+        internal bool SupportsRemoveThrows;
+        // The provider's Add interface is unavailable: preparing Add metadata fails, reading and removing do not.
+        internal bool AddUnavailable;
+        internal readonly HashSet<string> ThrowOnValue = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        internal readonly HashSet<string> RejectValue = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        internal readonly HashSet<string> IgnoreValue = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        internal bool ThrowOnSecondRead;
+        internal object SuccessStatus = (uint)0;
+        private int reads;
+
+        public void Connect() { Calls.Add("Connect"); }
+        public void PrepareRead() { Calls.Add("PrepareRead"); }
+        public void Prepare(Dictionary<string, List<string>> exclusions)
+        {
+            Calls.Add("Prepare");
+            if (AddUnavailable) { throw new InvalidOperationException("Defender WMI Add parameter metadata is unavailable."); }
+        }
+        public bool Supports(string name) { return !UnsupportedTypes.Contains(name); }
+        public bool SupportsRead(string name) { return !NotReadableTypes.Contains(name); }
+        public bool SupportsRemove(string name)
+        {
+            if (SupportsRemoveThrows) { throw new ManagementException("Not found"); }
+            return !RemoveUnsupportedTypes.Contains(name);
+        }
+        public object Add()
+        {
+            Calls.Add("Add");
+            return SuccessStatus;
+        }
+        public object Remove(string type, IList<string> values)
+        {
+            Calls.Add("Remove");
+            string request = type + "=" + string.Join("|", new List<string>(values).ToArray());
+            RemoveRequests.Add(request);
+            foreach (string value in values)
+            {
+                if (ThrowOnValue.Contains(value))
+                {
+                    if (VanishOnThrow.Contains(value)) { State[type].RemoveAll(delegate(string actual) { return actual == value; }); }
+                    throw new InvalidOperationException("Simulated failure for " + value);
+                }
+            }
+            foreach (string value in values)
+            {
+                if (RejectValue.Contains(value)) { return (uint)5; }
+            }
+            foreach (string value in values)
+            {
+                if (IgnoreValue.Contains(value)) { return SuccessStatus; }
+            }
+            State[type].RemoveAll(delegate(string actual)
+            {
+                foreach (string value in values) { if (string.Equals(actual, value, StringComparison.Ordinal)) { return true; } }
+                return false;
+            });
+            return SuccessStatus;
+        }
+        public Dictionary<string, List<string>> Read(ICollection<string> types)
+        {
+            Calls.Add("Read");
+            reads++;
+            if (ThrowOnSecondRead && reads > 1) { throw new InvalidOperationException("Simulated readback failure"); }
+            // Same assembly step the management and COM transports use, so the singleton gate is exercised.
+            var records = new List<Dictionary<string, object>>();
+            for (int i = 0; i < InstanceCount; i++)
+            {
+                var fields = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+                foreach (string type in types)
+                {
+                    bool hidden = UnreadableTypes.Contains(type) || (reads > 1 && UnreadableAfterFirstRead.Contains(type));
+                    fields[type] = hidden ? new[] { UnreadableText } : State[type].ToArray();
+                }
+                records.Add(fields);
+            }
+            return DefenderModule.AssembleExclusions(records, types);
         }
         public void Dispose() { }
     }
@@ -539,6 +665,77 @@ internal static class RegressionTests
                 { "ExclusionPath", new List<string>() }, { "ExclusionExtension", new List<string>() },
                 { "ExclusionProcess", new List<string>() }, { "ExclusionIpAddress", new List<string>() }
             });
+    }
+
+    // -Integration only: every real exclusion backend against the live provider, read-only. Proves each
+    // transport's Remove metadata accepts the four exclusion types (so a later remove would be sent), and
+    // that all four classify the same lists as readable/unreadable and, when readable, agree on their
+    // values. Neither Add nor Remove is ever called, so no Defender setting is touched.
+    private static void RunExclusionReadOnlyIntegrationCheck()
+    {
+        string[] types = { "ExclusionPath", "ExclusionExtension", "ExclusionProcess", "ExclusionIpAddress" };
+        string[] transports = { "management", "com", "native", "powershell" };
+        var snapshots = new DefenderModule.ExclusionSnapshot[transports.Length];
+        // The read and Remove surfaces must work with only PrepareRead (no Add metadata loaded).
+        foreach (string transport in transports)
+        {
+            using (DefenderModule.IPreferenceBackend backend = DefenderModule.CreateBackend(transport))
+            {
+                backend.Connect();
+                backend.PrepareRead();
+                foreach (string type in types)
+                {
+                    Assert(backend.SupportsRead(type), "real " + transport + " read surface (PrepareRead only) exposes " + type);
+                    Assert(backend.SupportsRemove(type), "real " + transport + " Remove surface (PrepareRead only) accepts " + type);
+                }
+                Assert(backend.Read(types).Count == types.Length, "real " + transport + " reads after PrepareRead only");
+            }
+        }
+        for (int i = 0; i < transports.Length; i++)
+        {
+            using (DefenderModule.IPreferenceBackend backend = DefenderModule.CreateBackend(transports[i]))
+            {
+                backend.Connect();
+                backend.Prepare(new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase));
+                foreach (string type in types)
+                {
+                    Assert(backend.Supports(type), "real " + transports[i] + " backend supports " + type);
+                    Assert(backend.SupportsRead(type), "real " + transports[i] + " read surface exposes " + type);
+                    Assert(backend.SupportsRemove(type), "real " + transports[i] + " Remove metadata accepts " + type);
+                }
+                snapshots[i] = DefenderModule.ExclusionSnapshot.From(backend.Read(types));
+                Console.WriteLine("PASS: real " + transports[i] + " backend: Remove metadata accepts all four types and the " +
+                    "lists were read (" + snapshots[i].Unreadable.Count + " unreadable); Add/Remove were not called.");
+            }
+        }
+        int compared = 0;
+        for (int i = 1; i < transports.Length; i++)
+        {
+            foreach (string type in types)
+            {
+                bool hidden = snapshots[0].Unreadable.Contains(type);
+                Assert(hidden == snapshots[i].Unreadable.Contains(type),
+                    "Readability of " + type + " agrees: management vs " + transports[i]);
+                if (hidden) { continue; }
+                var left = new List<string>(snapshots[0].Values[type]);
+                var right = new List<string>(snapshots[i].Values[type]);
+                left.Sort(StringComparer.OrdinalIgnoreCase);
+                right.Sort(StringComparer.OrdinalIgnoreCase);
+                Assert(string.Join("\n", left.ToArray()) == string.Join("\n", right.ToArray()),
+                    "Readable " + type + " values agree: management vs " + transports[i]);
+                compared++;
+            }
+        }
+        if (compared == 0)
+        {
+            Console.WriteLine("SKIP: every list was unreadable for this identity, so no value comparison across transports " +
+                "ran (only metadata and readability classification were checked). Run elevated for the full check.");
+        }
+        else
+        {
+            Console.WriteLine("PASS: real management/com/native/powershell exclusion readbacks agree on " + compared +
+                " readable list comparison(s).");
+        }
     }
 
     // -Integration only: exercises every real ASR backend against live WMI (or, for powershell,
@@ -591,6 +788,14 @@ internal static class RegressionTests
     [DllImport("WinTraceForge.Native.dll", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true, CharSet = CharSet.Unicode)]
     private static extern int NativeSetByteValues(IntPtr handle, string name,
         [In, MarshalAs(UnmanagedType.LPArray, ArraySubType = UnmanagedType.U1, SizeParamIndex = 3)] byte[] values, int count);
+
+    [DllImport("WinTraceForge.Native.dll", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true, CharSet = CharSet.Unicode)]
+    private static extern int NativeRemove(IntPtr handle, string name,
+        [In, MarshalAs(UnmanagedType.LPArray, ArraySubType = UnmanagedType.LPWStr, SizeParamIndex = 3)] string[] values, int count,
+        [MarshalAs(UnmanagedType.Struct)] out object returnValue);
+
+    [DllImport("WinTraceForge.Native.dll", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true, CharSet = CharSet.Unicode)]
+    private static extern int NativeSupportsRemove(IntPtr handle, string name, [MarshalAs(UnmanagedType.Bool)] out bool supported);
 
     [DllImport("WinTraceForge.Native.dll", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
     private static extern void NativeClose(IntPtr handle);
@@ -1121,6 +1326,29 @@ internal static class RegressionTests
             "Native string setter accepts the Ids property type and then checks the session");
         Assert(NativeSetByteValues(IntPtr.Zero, "AttackSurfaceReductionRules_Actions", new byte[] { 1 }, 1) == invalidArgument,
             "Native byte setter accepts the Actions property type and then checks the session");
+        // NativeRemove / NativeSupportsRemove only ever act on the four exclusion properties. The name
+        // gate returns WBEM_E_INVALID_PROPERTY ahead of every session check, so (like the setters' type
+        // gate) deleting it turns these into E_INVALIDARG and the test goes red without a live provider.
+        const int invalidProperty = unchecked((int)0x80041031);
+        object ignored;
+        bool flag;
+        foreach (string name in new[] { "AttackSurfaceReductionRules_Ids", "AttackSurfaceReductionRules_Actions",
+            "AttackSurfaceReductionOnlyExclusions", "DisableRealtimeMonitoring", "", null })
+        {
+            Assert(NativeRemove(IntPtr.Zero, name, new[] { "x" }, 1, out ignored) == invalidProperty,
+                "NativeRemove refuses a non-exclusion property before session validation: " + (name ?? "(null)"));
+            Assert(NativeSupportsRemove(IntPtr.Zero, name, out flag) == invalidProperty && !flag,
+                "NativeSupportsRemove refuses a non-exclusion property before session validation: " + (name ?? "(null)"));
+        }
+        foreach (string name in new[] { "ExclusionPath", "ExclusionExtension", "ExclusionProcess", "ExclusionIpAddress" })
+        {
+            Assert(NativeRemove(IntPtr.Zero, name, new[] { "x" }, 1, out ignored) == invalidArgument,
+                "NativeRemove accepts the exclusion property " + name + " and then checks the session");
+            Assert(NativeSupportsRemove(IntPtr.Zero, name, out flag) == invalidArgument && !flag,
+                "NativeSupportsRemove accepts the exclusion property " + name + " and then checks the session");
+        }
+        Assert(NativeRemove(IntPtr.Zero, "ExclusionPath", new string[0], 0, out ignored) == invalidArgument,
+            "NativeRemove refuses an empty value list");
     }
 
     private static bool ThrowsInvalidOperation(Action action)
@@ -1465,10 +1693,50 @@ internal static class RegressionTests
 
     private static void CheckArchitecture()
     {
+        // The management and COM transports return raw records only; the shared base class's single,
+        // non-virtual Read applies the singleton gate. Reimplementing Read in either would bypass it.
+        Type recordBase = typeof(DefenderModule).GetNestedType("RecordReadBackend", BindingFlags.NonPublic);
+        Assert(recordBase != null && recordBase.IsAbstract, "Shared record-reading base exists");
+        MethodInfo sharedRead = recordBase.GetMethod("Read", BindingFlags.Instance | BindingFlags.Public | BindingFlags.DeclaredOnly);
+        // The compiler marks a base method that implements an interface for a derived class "virtual final".
+        Assert(sharedRead != null && (!sharedRead.IsVirtual || sharedRead.IsFinal), "The shared Read is not overridable");
+        // Completeness: every IPreferenceBackend implementation is accounted for. A new transport turns
+        // this red, forcing its author to decide how it enforces the singleton gate: derive from
+        // RecordReadBackend (and be added to the list below) or enforce it in its own reader (and be
+        // added to the self-enforcing list, with the same 0/several-instance tests as native/powershell).
+        var recordBacked = new List<string> { "ManagementBackend", "ComBackend" };
+        var selfEnforcing = new List<string> { "NativeBackend", "PowerShellBackend" };
+        var found = new List<string>();
+        foreach (Type nested in typeof(DefenderModule).GetNestedTypes(BindingFlags.NonPublic | BindingFlags.Public))
+        {
+            if (!nested.IsAbstract && typeof(DefenderModule.IPreferenceBackend).IsAssignableFrom(nested)) { found.Add(nested.Name); }
+        }
+        found.Sort(StringComparer.Ordinal);
+        var expectedBackends = new List<string>(recordBacked);
+        expectedBackends.AddRange(selfEnforcing);
+        expectedBackends.Sort(StringComparer.Ordinal);
+        Assert(string.Join(",", found.ToArray()) == string.Join(",", expectedBackends.ToArray()),
+            "IPreferenceBackend implementations are exactly the known transports (found: " + string.Join(",", found.ToArray()) + ")");
+        foreach (string name in selfEnforcing)
+        {
+            Type selfType = typeof(DefenderModule).GetNestedType(name, BindingFlags.NonPublic);
+            Assert(selfType.BaseType != recordBase, name + " enforces the singleton gate in its own reader, not via the shared base");
+        }
+        foreach (string name in recordBacked)
+        {
+            Type backendType = typeof(DefenderModule).GetNestedType(name, BindingFlags.NonPublic);
+            Assert(backendType != null && backendType.BaseType == recordBase, name + " reads through the shared base");
+            Assert(backendType.GetMethod("Read", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic |
+                BindingFlags.DeclaredOnly) == null, name + " does not implement its own Read");
+            Assert(backendType.GetMethod("ReadRecords", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.DeclaredOnly) != null,
+                name + " supplies records only");
+        }
         Type read = typeof(DefenderModule.IPreferenceReader);
         Type write = typeof(DefenderModule.IPreferenceWriter);
         Assert(read.GetMethod("Add") == null && write.GetMethod("Add") != null,
             "Defender read capability cannot Add");
+        Assert(read.GetMethod("Remove") == null && write.GetMethod("Remove") != null,
+            "Defender read capability cannot Remove");
         Assert(typeof(IFirewallReader).GetMethod("Add") == null &&
             typeof(IFirewallReader).GetMethod("Remove") == null &&
             typeof(IFirewallWriter).GetMethod("Add") != null &&
@@ -2096,6 +2364,908 @@ internal static class RegressionTests
         try { AsrModule.Parse(new[] { "exclusion", "-Path", "C:\\Lab\uD800Bad" }); }
         catch (ArgumentException) { rejected = true; }
         Assert(rejected, "ASR -Path rejects a value with an unpaired surrogate");
+    }
+
+    // ---- Explicit commands: defender exclusion add|check|list|remove ----
+
+    private static readonly string[] ExclusionTransportNames = { "management", "com", "native", "powershell" };
+    private static readonly string[] ExclusionTypeSwitches =
+        { "-ExclusionPath", "-ExclusionExtension", "-ExclusionProcess", "-ExclusionIpAddress" };
+    private static readonly string[] ExclusionSampleValues = { @"C:\Lab Data", ".lablog", "LabWorker.exe", "192.0.2.10" };
+
+    private static void CheckExclusionCommandParsing()
+    {
+        var expectedModes = new Dictionary<string, DefenderModule.ExclusionMode>(StringComparer.OrdinalIgnoreCase)
+        {
+            { "add", DefenderModule.ExclusionMode.Add }, { "check", DefenderModule.ExclusionMode.Check },
+            { "remove", DefenderModule.ExclusionMode.Remove }
+        };
+        // Every command, over every exclusion type, over every transport.
+        foreach (var command in expectedModes)
+        {
+            foreach (string transport in ExclusionTransportNames)
+            {
+                for (int i = 0; i < ExclusionTypeSwitches.Length; i++)
+                {
+                    DefenderModule.Options options = DefenderModule.ParseArguments(new[]
+                    {
+                        command.Key, "--transport", transport, ExclusionTypeSwitches[i], ExclusionSampleValues[i]
+                    });
+                    Assert(options.Mode == command.Value && !options.LegacySyntax && options.Transport == transport &&
+                        options.Exclusions.Count == 1 && options.Exclusions[ExclusionTypeSwitches[i].Substring(1)][0] == ExclusionSampleValues[i],
+                        "Explicit " + command.Key + " " + transport + " " + ExclusionTypeSwitches[i]);
+                }
+            }
+        }
+        Assert(DefenderModule.ParseArguments(new[] { "REMOVE", "-exclusionpath", "C:\\Lab" }).Mode ==
+            DefenderModule.ExclusionMode.Remove, "Command word is case-insensitive");
+        foreach (string transport in ExclusionTransportNames)
+        {
+            DefenderModule.Options list = DefenderModule.ParseArguments(new[] { "list", "--transport", transport });
+            Assert(list.Mode == DefenderModule.ExclusionMode.List && list.ReadOnly && !list.LegacySyntax &&
+                list.Exclusions.Count == 0 && list.Transport == transport, "list parses bare on " + transport);
+        }
+        DefenderModule.Options bareCheck = DefenderModule.ParseArguments(new[] { "check" });
+        Assert(bareCheck.Mode == DefenderModule.ExclusionMode.Check && bareCheck.Exclusions.Count == 0 &&
+            !bareCheck.LegacySyntax && bareCheck.CheckOnly, "Bare check keeps the capability check");
+        Assert(DefenderModule.ParseArguments(new[] { "remove", "-ExclusionPath", @"C:\A", @"C:\B",
+            "-ExclusionExtension", ".x", "--telemetry", "eventlog", "--telemetry-wait", "0" }).Exclusions["ExclusionPath"].Count == 2,
+            "remove accepts several explicit values and shared options");
+        Assert(DefenderModule.ParseArguments(new[] { "list", "--telemetry", "eventlog", "--telemetry-wait", "0", "--verbose" }).CollectEventLog,
+            "list accepts telemetry options");
+        Assert(DefenderModule.ParseArguments(new[] { "add", "-ExclusionProcess=remove" }).Exclusions["ExclusionProcess"][0] == "remove",
+            "A value that is a command word is accepted in the -TYPE=VALUE form");
+        Assert(DefenderModule.ParseArguments(new[] { "-ExclusionProcess=remove" }).Exclusions["ExclusionProcess"][0] == "remove",
+            "Legacy syntax accepts a command word as a value in the -TYPE=VALUE form");
+        Assert(DefenderModule.ParseArguments(new[] { "remove", "-ExclusionPath=-dash" }).Exclusions["ExclusionPath"][0] == "-dash",
+            "remove accepts a value beginning with a dash inline");
+        foreach (string command in new[] { "add", "check", "list", "remove" })
+        {
+            Assert(DefenderModule.ParseArguments(new[] { command, "--help" }).Help, command + " --help shows help");
+        }
+
+        // Legacy spellings keep working during the migration period and say so.
+        DefenderModule.Options legacyAdd = DefenderModule.ParseArguments(new[] { "-ExclusionPath", @"C:\Lab" });
+        Assert(legacyAdd.LegacySyntax && legacyAdd.Mode == DefenderModule.ExclusionMode.Add, "Implicit add is flagged legacy");
+        DefenderModule.Options legacyCheck = DefenderModule.ParseArguments(new[] { "--check", "-ExclusionPath", @"C:\Lab" });
+        Assert(legacyCheck.LegacySyntax && legacyCheck.Mode == DefenderModule.ExclusionMode.Check, "--check is flagged legacy");
+        Assert(DefenderModule.ParseArguments(new[] { "--check" }).LegacySyntax, "Bare --check is flagged legacy");
+        TextWriter originalError = Console.Error;
+        TextWriter originalOut = Console.Out;
+        using (var captured = new StringWriter())
+        {
+            try
+            {
+                Console.SetError(captured);
+                Console.SetOut(captured);
+                ConsoleUi.Configure(false, true);
+                DefenderModule.PrintLegacyHint(legacyAdd);
+                string hint = Normalize(captured.ToString());
+                Assert(hint.Contains("Implicit add is deprecated") && hint.Contains("defender exclusion add"),
+                    "Implicit add names the replacement command");
+                captured.GetStringBuilder().Clear();
+                DefenderModule.PrintLegacyHint(legacyCheck);
+                hint = Normalize(captured.ToString());
+                Assert(hint.Contains("--check") && hint.Contains("deprecated") && hint.Contains("defender exclusion check"),
+                    "--check names the replacement command");
+                captured.GetStringBuilder().Clear();
+                DefenderModule.PrintLegacyHint(DefenderModule.ParseArguments(new[] { "check" }));
+                DefenderModule.PrintLegacyHint(DefenderModule.ParseArguments(new[] { "remove", "-ExclusionPath", "C:\\Lab" }));
+                Assert(captured.ToString().Length == 0, "Explicit commands print no deprecation hint");
+            }
+            finally
+            {
+                Console.SetError(originalError);
+                Console.SetOut(originalOut);
+            }
+        }
+
+        string[][] invalid =
+        {
+            new[] { "add" },
+            new[] { "remove" },
+            new[] { "add", "--transport", "com" },
+            new[] { "remove", "--check" },
+            new[] { "remove", "-ExclusionPath" },
+            new[] { "remove", "-ExclusionPath=" },
+            new[] { "remove", "-ExclusionPath", "   " },
+            new[] { "list", "-ExclusionPath", @"C:\Lab" },
+            new[] { "list", "-ExclusionExtension=.x" },
+            new[] { "check", "--check" },
+            new[] { "add", "--check", "-ExclusionPath", @"C:\Lab" },
+            new[] { "list", "--check" },
+            new[] { "delete", "-ExclusionPath", @"C:\Lab" },
+            new[] { "removeall" },
+            new[] { "-ExclusionPath", @"C:\Lab", "--transport", "com", "--invalid" },
+            new[] { "--transport", "com", "remove", "-ExclusionPath", @"C:\Lab" },
+            new[] { "-ExclusionPath", @"C:\Lab", "--help" },
+            new[] { "remove", "--help", "-ExclusionPath", @"C:\Lab" },
+            new[] { "add", "--help", "--transport", "com" },
+            new[] { "list", "--transport", "cmd" },
+            new[] { "list", "--transport", "com", "--transport", "native" },
+            new[] { "check", "--telemetry-wait", "0" },
+            new[] { "remove", "-ExclusionPath", "C:\\Lab\uD800Bad" },
+            new[] { "list", "extra" },
+            new[] { "check", "extra" },
+            new[] { "remove", "-ExclusionPath", @"C:\Lab", "--invalid" },
+            new[] { "add", "-ExclusionPath", @"C:\Lab", "remove" },
+            new[] { "check", "-ExclusionPath", @"C:\Lab", "list" },
+            new[] { "remove", "-ExclusionExtension", ".x", "ADD" },
+            // Legacy implicit add: the likeliest misplacement is a command word at the end of the line.
+            new[] { "-ExclusionPath", @"C:\Lab", "remove" },
+            new[] { "-ExclusionPath", @"C:\Lab", "check" },
+            new[] { "--check", "-ExclusionPath", @"C:\Lab", "list" }
+        };
+        foreach (string[] arguments in invalid)
+        {
+            bool rejected = false;
+            try { DefenderModule.ParseArguments(arguments); }
+            catch (ArgumentException) { rejected = true; }
+            Assert(rejected, "Reject invalid explicit-command arguments: " + string.Join(" ", arguments));
+        }
+
+        // There is no remove-all spelling: remove without a type and value is a usage error with its own message.
+        try
+        {
+            DefenderModule.ParseArguments(new[] { "remove" });
+            Assert(false, "remove without values must be rejected");
+        }
+        catch (ArgumentException ex)
+        {
+            Assert(ex.Message.Contains("no remove-all"), "remove usage error states there is no remove-all");
+        }
+        try
+        {
+            DefenderModule.ParseArguments(new[] { "--transport", "com", "remove", "-ExclusionPath", @"C:\Lab" });
+            Assert(false, "A command after options must be rejected");
+        }
+        catch (ArgumentException ex)
+        {
+            Assert(ex.Message.Contains("command must come first"), "Misplaced command word gets a targeted message");
+        }
+    }
+
+    private static string RunExclusion(FakeStatefulBackend backend, out int exitCode,
+        out DefenderModule.RunEvidence evidence, params string[] args)
+    {
+        TextWriter originalOut = Console.Out;
+        TextWriter originalError = Console.Error;
+        using (var output = new StringWriter())
+        {
+            try
+            {
+                Console.SetOut(output);
+                Console.SetError(output);
+                ConsoleUi.Configure(false, true);
+                ConsoleUi.Width = 100;
+                DefenderModule.Options options = DefenderModule.ParseArguments(args);
+                evidence = new DefenderModule.RunEvidence();
+                exitCode = DefenderModule.RunWithBackend(options, evidence, backend);
+                DefenderModule.PrintAssessment(options, evidence, exitCode);
+            }
+            finally
+            {
+                Console.SetOut(originalOut);
+                Console.SetError(originalError);
+                ConsoleUi.Configure(false, true);
+            }
+            return output.ToString();
+        }
+    }
+
+    private static int CountCalls(FakeStatefulBackend backend, string name)
+    {
+        return backend.Calls.FindAll(delegate(string call) { return call == name; }).Count;
+    }
+
+    private static void CheckExclusionList()
+    {
+        int exitCode;
+        DefenderModule.RunEvidence evidence;
+
+        // Readable entries, an empty readable list, an unsupported type and an unreadable list are four different answers.
+        var backend = new FakeStatefulBackend();
+        backend.State["ExclusionPath"].AddRange(new[] { @"C:\Beta", @"c:\alpha" });
+        backend.NotReadableTypes.Add("ExclusionProcess");
+        backend.UnreadableTypes.Add("ExclusionIpAddress");
+        string raw = RunExclusion(backend, out exitCode, out evidence, "list");
+        string text = Normalize(raw);
+        Assert(exitCode == 3 && evidence.ListUnreadable, "list with an unreadable type is incomplete (exit 3)");
+        Assert(text.Contains("ExclusionPath 2 entries"), "list reports entry count");
+        Assert(raw.IndexOf(@"c:\alpha", StringComparison.Ordinal) > 0 &&
+            raw.IndexOf(@"c:\alpha", StringComparison.Ordinal) < raw.IndexOf(@"C:\Beta", StringComparison.Ordinal),
+            "list prints entries in a stable sorted order");
+        Assert(text.Contains("ExclusionExtension EMPTY - readable, no entries"), "list reports a readable empty list");
+        Assert(text.Contains("ExclusionProcess UNSUPPORTED"), "list reports an unsupported type");
+        Assert(text.Contains("ExclusionIpAddress UNREADABLE"), "list reports an unreadable list");
+        Assert(!text.Contains("N/A:") && !text.Contains("administrator to view"), "The provider's placeholder is never shown as an entry");
+        Assert(!text.Contains("ExclusionIpAddress EMPTY") && !text.Contains("ExclusionIpAddress 0"),
+            "An unreadable list is never reported as empty");
+        Assert(text.Contains("Outcome: LIST_INCOMPLETE"), "list outcome names the incomplete state");
+        Assert(text.Contains("Add attempted: False; Remove attempted: False"), "list invoked no write");
+        Assert(CountCalls(backend, "Add") == 0 && CountCalls(backend, "Remove") == 0, "list never writes");
+        Assert(CountCalls(backend, "Read") == 1, "list reads once, with every readable type in one query");
+
+        backend = new FakeStatefulBackend();
+        backend.State["ExclusionExtension"].Add(".lab");
+        raw = RunExclusion(backend, out exitCode, out evidence, "list", "--transport", "native");
+        text = Normalize(raw);
+        Assert(exitCode == 0 && text.Contains("Outcome: LIST_ONLY") && !text.Contains("UNREADABLE") && !text.Contains("UNSUPPORTED"),
+            "A fully readable list exits 0");
+        Assert(text.Contains("ExclusionPath EMPTY - readable, no entries") && text.Contains("ExclusionExtension 1 entry"),
+            "A fully readable list distinguishes empty from populated");
+
+        // Nothing readable at all: nothing is read, nothing is reported empty, and the list is not "complete".
+        backend = new FakeStatefulBackend();
+        foreach (string type in new[] { "ExclusionPath", "ExclusionExtension", "ExclusionProcess", "ExclusionIpAddress" })
+        {
+            backend.NotReadableTypes.Add(type);
+        }
+        raw = RunExclusion(backend, out exitCode, out evidence, "list");
+        text = Normalize(raw);
+        Assert(exitCode == 3 && CountCalls(backend, "Read") == 0 && !text.Contains("EMPTY") &&
+            text.Contains("Outcome: LIST_INCOMPLETE") && !text.Contains("Read-only list complete"),
+            "A list that read nothing is incomplete, not complete");
+
+        // The write surface (Add/Remove metadata) omits a type that the preference object still returns:
+        // an inventory command must list it, not call it unsupported.
+        backend = new FakeStatefulBackend();
+        backend.UnsupportedTypes.Add("ExclusionIpAddress");
+        backend.State["ExclusionIpAddress"].Add("192.0.2.44");
+        raw = RunExclusion(backend, out exitCode, out evidence, "list");
+        text = Normalize(raw);
+        Assert(exitCode == 0 && text.Contains("ExclusionIpAddress 1 entry") && raw.Contains("192.0.2.44") &&
+            !text.Contains("UNSUPPORTED"), "list follows the read surface, not Add's metadata");
+
+        // Zero or several provider instances are unobserved/ambiguous state, never an empty or merged list.
+        foreach (int instances in new[] { 0, 2 })
+        {
+            backend = new FakeStatefulBackend { InstanceCount = instances };
+            backend.State["ExclusionPath"].Add(@"C:\Lab");
+            raw = RunExclusion(backend, out exitCode, out evidence, "list");
+            text = Normalize(raw);
+            Assert(exitCode == 1 && !text.Contains("EMPTY") && !text.Contains("Outcome: LIST_ONLY") &&
+                text.Contains("returned " + instances + " instance(s)") && text.Contains("Outcome: LIST_FAILED"),
+                "list with " + instances + " provider instance(s) fails instead of reading as empty/merged");
+            backend = new FakeStatefulBackend { InstanceCount = instances };
+            text = Normalize(RunExclusion(backend, out exitCode, out evidence, "remove", "-ExclusionPath", @"C:\Gone"));
+            Assert(exitCode == 1 && backend.RemoveRequests.Count == 0 && !text.Contains("ALREADY_ABSENT") &&
+                text.Contains("returned " + instances + " instance(s)"),
+                "remove with " + instances + " provider instance(s) is refused, never 'already absent'");
+            backend = new FakeStatefulBackend { InstanceCount = instances };
+            text = Normalize(RunExclusion(backend, out exitCode, out evidence, "check", "-ExclusionPath", @"C:\Gone"));
+            Assert(exitCode == 1 && !text.Contains("not observed") && text.Contains("Outcome: CHECK_FAILED"),
+                "check with " + instances + " provider instance(s) fails instead of reporting 'not observed'");
+        }
+
+        // The shared assembly step itself: 0 and 2 records throw, 1 returns the lists.
+        var oneType = new[] { "ExclusionPath", "ExclusionExtension" };
+        var record = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase)
+        {
+            { "ExclusionPath", new[] { @"C:\A" } }, { "ExclusionExtension", null }
+        };
+        Assert(ThrowsInvalidOperation(delegate { DefenderModule.AssembleExclusions(new List<Dictionary<string, object>>(), oneType); }),
+            "Zero instances throw instead of producing empty lists");
+        Assert(ThrowsInvalidOperation(delegate { DefenderModule.AssembleExclusions(
+            new List<Dictionary<string, object>> { record, record }, oneType); }),
+            "Several instances throw instead of being concatenated");
+        Dictionary<string, List<string>> assembled = DefenderModule.AssembleExclusions(
+            new List<Dictionary<string, object>> { record }, oneType);
+        Assert(assembled["ExclusionPath"].Count == 1 && assembled["ExclusionPath"][0] == @"C:\A" &&
+            assembled["ExclusionExtension"].Count == 0, "One instance is assembled; a null array is an empty list");
+        Assert(ThrowsInvalidOperation(delegate { DefenderModule.AssembleExclusions(
+            new List<Dictionary<string, object>> { new Dictionary<string, object>() }, oneType); }),
+            "A missing field throws");
+
+        // A control character in a stored value cannot reach the terminal.
+        backend = new FakeStatefulBackend();
+        backend.State["ExclusionPath"].Add("C:\\Lab\u001b[31mRed");
+        raw = RunExclusion(backend, out exitCode, out evidence, "list");
+        Assert(raw.IndexOf('\u001b') < 0, "list sanitizes terminal escapes in values");
+
+        // A failing read is an error, never an empty list.
+        var failing = new FakeBackend { Before = null, After = null, ThrowAt = "Read" };
+        TextWriter originalOut = Console.Out;
+        TextWriter originalError = Console.Error;
+        using (var output = new StringWriter())
+        {
+            try
+            {
+                Console.SetOut(output);
+                Console.SetError(output);
+                ConsoleUi.Configure(false, true);
+                DefenderModule.Options options = DefenderModule.ParseArguments(new[] { "list" });
+                evidence = new DefenderModule.RunEvidence();
+                exitCode = DefenderModule.RunWithBackend(options, evidence, failing);
+                DefenderModule.PrintAssessment(options, evidence, exitCode);
+                Assert(exitCode == 1 && evidence.Lifecycle.Errors.Count == 1 && !Normalize(output.ToString()).Contains("EMPTY") &&
+                    Normalize(output.ToString()).Contains("Outcome: LIST_FAILED"),
+                    "A failed list read is an error and prints no empty list");
+            }
+            finally
+            {
+                Console.SetOut(originalOut);
+                Console.SetError(originalError);
+            }
+        }
+    }
+
+    // list and remove need the read and Remove surfaces only; a provider whose Add interface is
+    // unavailable (Prepare throws) must not stop them. add and check still prepare Add, so they fail.
+    private static void CheckExclusionIndependentOfAdd()
+    {
+        int exitCode;
+        DefenderModule.RunEvidence evidence;
+
+        var backend = new FakeStatefulBackend { AddUnavailable = true };
+        backend.State["ExclusionPath"].Add(@"C:\Lab");
+        string text = Normalize(RunExclusion(backend, out exitCode, out evidence, "list"));
+        Assert(exitCode == 0 && text.Contains("ExclusionPath 1 entry") && !backend.Calls.Contains("Prepare") &&
+            backend.Calls.Contains("PrepareRead"), "list does not prepare or depend on Add's metadata");
+
+        backend = new FakeStatefulBackend { AddUnavailable = true };
+        backend.State["ExclusionPath"].Add(@"C:\Lab");
+        text = Normalize(RunExclusion(backend, out exitCode, out evidence, "remove", "-ExclusionPath", @"C:\Lab"));
+        Assert(exitCode == 0 && backend.RemoveRequests.Count == 1 && backend.State["ExclusionPath"].Count == 0 &&
+            !backend.Calls.Contains("Prepare") && text.Contains("REMOVED_CONFIRMED ExclusionPath: C:\\Lab".Replace("\\\\", "\\")),
+            "remove does not prepare or depend on Add's metadata");
+
+        backend = new FakeStatefulBackend { AddUnavailable = true };
+        RunExclusion(backend, out exitCode, out evidence, "add", "-ExclusionPath", @"C:\Lab");
+        Assert(exitCode == 1 && !backend.Calls.Contains("Add"), "add still needs Add's metadata and fails before Add");
+    }
+
+    // A PowerShell readback is only trustworthy if every requested field arrived as exactly one complete
+    // block: a missing block is an unobserved field, never an empty list.
+    private static void CheckPowerShellReadbackCompleteness()
+    {
+        string marker = "m1";
+        string[] fields = { "ExclusionPath", "ExclusionExtension" };
+        string good = "WTF_BEGIN_m1:ExclusionPath\r\n" + DefenderModule.PowerShellRunner.EncodeValue(@"C:\A") + "\r\n" +
+            "WTF_END_m1:ExclusionPath\r\nWTF_BEGIN_m1:ExclusionExtension\r\nWTF_END_m1:ExclusionExtension\r\nWTF_READ_OK\r\n";
+        Dictionary<string, List<string>> parsed = DefenderModule.PowerShellRunner.ParseFields(good, marker, fields);
+        Assert(parsed["ExclusionPath"].Count == 1 && parsed["ExclusionExtension"].Count == 0,
+            "A complete readback parses; an empty block is an empty list");
+        string[] bad =
+        {
+            "WTF_READ_OK\r\n",
+            "WTF_BEGIN_m1:ExclusionPath\r\nWTF_END_m1:ExclusionPath\r\nWTF_READ_OK\r\n",
+            "WTF_BEGIN_m1:ExclusionPath\r\nWTF_END_m1:ExclusionPath\r\nWTF_BEGIN_m1:ExclusionPath\r\nWTF_END_m1:ExclusionPath\r\n" +
+                "WTF_BEGIN_m1:ExclusionExtension\r\nWTF_END_m1:ExclusionExtension\r\n",
+            "WTF_BEGIN_m1:ExclusionPath\r\nWTF_BEGIN_m1:ExclusionExtension\r\nWTF_END_m1:ExclusionExtension\r\n",
+            "WTF_BEGIN_m1:ExclusionPath\r\nWTF_END_m1:ExclusionPath\r\nWTF_BEGIN_m1:ExclusionExtension\r\n"
+        };
+        foreach (string stdout in bad)
+        {
+            Assert(ThrowsInvalidOperation(delegate { DefenderModule.PowerShellRunner.ParseFields(stdout, marker, fields); }),
+                "An incomplete, duplicated or unclosed readback throws: " + stdout.Replace("\r\n", "|"));
+        }
+    }
+
+    private static void CheckExclusionCheck()
+    {
+        int exitCode;
+        DefenderModule.RunEvidence evidence;
+
+        var backend = new FakeStatefulBackend();
+        backend.State["ExclusionPath"].Add(@"C:\Lab Data");
+        string text = Normalize(RunExclusion(backend, out exitCode, out evidence, "check",
+            "-ExclusionPath", @"c:\lab data\", @"C:\Missing", "-ExclusionExtension", ".lab"));
+        Assert(exitCode == 0 && text.Contains(@"[SEEN] ExclusionPath: c:\lab data\ [present]") &&
+            text.Contains(@"[INFO] ExclusionPath: C:\Missing [not observed]") &&
+            text.Contains("[INFO] ExclusionExtension: .lab [not observed]") && text.Contains("Outcome: CHECK_ONLY"),
+            "check reports present and absent values from a readable list");
+        Assert(CountCalls(backend, "Add") == 0 && CountCalls(backend, "Remove") == 0, "check never writes");
+
+        // An unreadable list says nothing about presence: no value may be reported absent because of it.
+        backend = new FakeStatefulBackend();
+        backend.UnreadableTypes.Add("ExclusionPath");
+        text = Normalize(RunExclusion(backend, out exitCode, out evidence, "check",
+            "-ExclusionPath", @"C:\Lab Data", "-ExclusionExtension", ".lab"));
+        Assert(exitCode == 3 && evidence.ListUnreadable && evidence.AllPresentBefore == null,
+            "check over an unreadable list is incomplete (exit 3) with presence unknown");
+        Assert(text.Contains(@"[WARN] ExclusionPath: C:\Lab Data [unknown - list unreadable]"),
+            "check reports the value as unknown");
+        Assert(!text.Contains(@"ExclusionPath: C:\Lab Data [not observed]"), "check never calls a value absent from an unreadable list");
+        Assert(text.Contains("[INFO] ExclusionExtension: .lab [not observed]"), "A readable type in the same request is still answered");
+        Assert(text.Contains("Outcome: CHECK_INCOMPLETE") && text.Contains("UNREADABLE"), "check outcome names the incomplete state");
+        Assert(!text.Contains("N/A:"), "check never shows the provider's placeholder as a value");
+
+        // Without values the capability check is unchanged: no baseline read.
+        backend = new FakeStatefulBackend();
+        text = Normalize(RunExclusion(backend, out exitCode, out evidence, "check"));
+        Assert(exitCode == 0 && CountCalls(backend, "Read") == 0 && text.Contains("Outcome: CHECK_ONLY"),
+            "check without values keeps the capability check");
+
+        // An explicit add whose baseline is hidden can only report unconfirmed, never confirmed.
+        backend = new FakeStatefulBackend();
+        backend.UnreadableTypes.Add("ExclusionPath");
+        text = Normalize(RunExclusion(backend, out exitCode, out evidence, "add", "-ExclusionPath", @"C:\Lab Data"));
+        Assert(exitCode == 3 && evidence.AddAttempted && evidence.AllPresentBefore == null &&
+            text.Contains("list unreadable; cannot confirm") && text.Contains("Outcome: UNCONFIRMED"),
+            "add over an unreadable list is unconfirmed, not confirmed");
+        Assert(CountCalls(backend, "Remove") == 0, "add never removes");
+
+        // Explicit add reaches the same lifecycle as the legacy spelling.
+        var fake = new FakeBackend
+        {
+            Before = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase) { { "ExclusionPath", new List<string>() } },
+            After = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase) { { "ExclusionPath", new List<string> { @"C:\Lab" } } },
+            Status = (uint)0
+        };
+        TextWriter originalOut = Console.Out;
+        TextWriter originalError = Console.Error;
+        using (var output = new StringWriter())
+        {
+            try
+            {
+                Console.SetOut(output);
+                Console.SetError(output);
+                evidence = new DefenderModule.RunEvidence();
+                exitCode = DefenderModule.RunWithBackend(DefenderModule.ParseArguments(new[] { "add", "-ExclusionPath", @"C:\Lab" }),
+                    evidence, fake);
+            }
+            finally
+            {
+                Console.SetOut(originalOut);
+                Console.SetError(originalError);
+            }
+        }
+        Assert(exitCode == 0 && string.Join(",", fake.Calls) == "Connect,Prepare,Read,Add,Read",
+            "Explicit add: baseline, exactly one Add, post-read");
+    }
+
+    private static void CheckExclusionRemove()
+    {
+        int exitCode;
+        DefenderModule.RunEvidence evidence;
+        string text;
+
+        // 1. Every value present and removed: confirmed one by one, pre-existing neighbours untouched.
+        var backend = new FakeStatefulBackend();
+        backend.State["ExclusionPath"].AddRange(new[] { @"C:\Lab Data", @"C:\Keep" });
+        backend.State["ExclusionExtension"].Add(".lab");
+        text = Normalize(RunExclusion(backend, out exitCode, out evidence, "remove",
+            "-ExclusionPath", @"C:\Lab Data", "-ExclusionExtension", ".lab"));
+        Assert(exitCode == 0, "remove of present values confirmed by readback exits 0");
+        Assert(backend.RemoveRequests.Count == 2 && backend.State["ExclusionPath"].Count == 1 &&
+            backend.State["ExclusionPath"][0] == @"C:\Keep" && backend.State["ExclusionExtension"].Count == 0,
+            "remove touches only the named values");
+        Assert(text.Contains(@"REMOVED_CONFIRMED ExclusionPath: C:\Lab Data") &&
+            text.Contains("REMOVED_CONFIRMED ExclusionExtension: .lab"), "Each value gets its own confirmed result");
+        Assert(text.Contains("Outcome: REMOVAL_CONFIRMED") && text.Contains("Remove attempted: True; requests sent: 2; returned: 2"),
+            "Outcome and request counts are reported");
+        Assert(text.Contains("WTF did not create these entries"), "remove never claims WTF created the removed values");
+        Assert(!text.Contains("test-created"), "remove does not describe values as test-created");
+        Assert(CountCalls(backend, "Read") == 2 && CountCalls(backend, "Add") == 0, "baseline read, removals, one readback; never an Add");
+        int firstRemove = backend.Calls.IndexOf("Remove");
+        Assert(backend.Calls.IndexOf("Read") < firstRemove && backend.Calls.LastIndexOf("Read") > backend.Calls.LastIndexOf("Remove"),
+            "Baseline read precedes every Remove and readback follows the last one");
+        Assert(evidence.Lifecycle.Restoration == RestorationStatus.ManualRequired &&
+            text.Contains("No automatic rollback") && text.Contains("defender exclusion add"),
+            "remove leaves manual re-add guidance, no automatic rollback");
+        Assert(text.Contains(@"-ExclusionPath ""C:\Lab Data"""), "Re-add guidance names the removed value");
+
+        // 2. Every value already absent: reported as such, Remove is never called.
+        backend = new FakeStatefulBackend();
+        text = Normalize(RunExclusion(backend, out exitCode, out evidence, "remove",
+            "-ExclusionPath", @"C:\Gone", "-ExclusionIpAddress", "192.0.2.1"));
+        Assert(exitCode == 0 && backend.RemoveRequests.Count == 0 && CountCalls(backend, "Read") == 1,
+            "Absent values: exit 0, no Remove, no second read");
+        Assert(text.Contains(@"ALREADY_ABSENT ExclusionPath: C:\Gone") && text.Contains("ALREADY_ABSENT ExclusionIpAddress: 192.0.2.1") &&
+            text.Contains("Outcome: ALREADY_ABSENT") && text.Contains("Remove attempted: False"),
+            "Absent values are reported already absent");
+        Assert(evidence.Lifecycle.Restoration == RestorationStatus.NotRequired, "Nothing changed, nothing to restore");
+
+        // 3. Present and absent values in one request: only the present one is sent.
+        backend = new FakeStatefulBackend();
+        backend.State["ExclusionPath"].Add(@"C:\Here");
+        text = Normalize(RunExclusion(backend, out exitCode, out evidence, "remove",
+            "-ExclusionPath", @"C:\Here", @"C:\Gone"));
+        Assert(exitCode == 0 && backend.RemoveRequests.Count == 1 && backend.RemoveRequests[0] == @"ExclusionPath=C:\Here",
+            "Only values present in the baseline are sent to Remove");
+        Assert(text.Contains(@"REMOVED_CONFIRMED ExclusionPath: C:\Here") && text.Contains(@"ALREADY_ABSENT ExclusionPath: C:\Gone"),
+            "A mixed request lists both outcomes");
+        Assert(text.Contains("Values already absent are listed as such"), "No change is claimed for an already-absent value");
+
+        // 4. An unreadable list refuses the whole command, even for the readable types.
+        backend = new FakeStatefulBackend();
+        backend.State["ExclusionPath"].Add(@"C:\Lab");
+        backend.State["ExclusionExtension"].Add(".lab");
+        backend.UnreadableTypes.Add("ExclusionExtension");
+        text = Normalize(RunExclusion(backend, out exitCode, out evidence, "remove",
+            "-ExclusionPath", @"C:\Lab", "-ExclusionExtension", ".lab"));
+        Assert(exitCode == 1 && backend.RemoveRequests.Count == 0 && !evidence.RemoveAttempted,
+            "An unreadable list refuses the command before any Remove");
+        Assert(text.Contains("Refusing to remove") && text.Contains("ExclusionExtension") && text.Contains("Outcome: NOT_ATTEMPTED"),
+            "The refusal names the unreadable type");
+        Assert(backend.State["ExclusionPath"].Count == 1, "Nothing was removed, not even from the readable list");
+        Assert(!text.Contains("ALREADY_ABSENT") && !text.Contains("not observed"), "An unreadable list is never read as absence");
+
+        // 5. Batch with partial failure: every value is attempted and reported; nothing is rolled back.
+        backend = new FakeStatefulBackend();
+        backend.State["ExclusionPath"].AddRange(new[] { @"C:\A", @"C:\B", @"C:\C", @"C:\D", @"C:\E" });
+        backend.ThrowOnValue.Add(@"C:\B");
+        backend.RejectValue.Add(@"C:\C");
+        backend.IgnoreValue.Add(@"C:\D");
+        text = Normalize(RunExclusion(backend, out exitCode, out evidence, "remove",
+            "-ExclusionPath", @"C:\A", @"C:\B", @"C:\C", @"C:\D", @"C:\E"));
+        Assert(exitCode == 1, "A batch with a failed value exits 1");
+        Assert(backend.RemoveRequests.Count == 5, "A failure does not stop the remaining values");
+        Assert(text.Contains(@"REMOVED_CONFIRMED ExclusionPath: C:\A") && text.Contains(@"REMOVED_CONFIRMED ExclusionPath: C:\E"),
+            "Values that succeeded are confirmed individually");
+        Assert(text.Contains(@"ERROR ExclusionPath: C:\B - Simulated failure for C:\B"), "A thrown error is attributed to its value");
+        Assert(text.Contains(@"ERROR ExclusionPath: C:\C - Defender rejected the request. WMI return code: 5"),
+            "A rejected request is attributed to its value");
+        Assert(text.Contains(@"NOT_CONFIRMED ExclusionPath: C:\D") && text.Contains("still present in readback"),
+            "An accepted but unobserved removal is not confirmed");
+        Assert(text.Contains("Outcome: PARTIAL_REMOVAL") && text.Contains("Per value: 2 removed (confirmed), 0 already absent, 1 not confirmed, 2 error."),
+            "The summary names the partial result");
+        Assert(backend.State["ExclusionPath"].Count == 3 && !backend.State["ExclusionPath"].Contains(@"C:\A") &&
+            !backend.State["ExclusionPath"].Contains(@"C:\E"), "Removed values stay removed: no automatic rollback");
+        Assert(CountCalls(backend, "Add") == 0, "No rollback Add was attempted");
+        Assert(evidence.Lifecycle.Mutation == MutationStatus.ApiFailed && evidence.Lifecycle.Verification != VerificationStatus.NotRun,
+            "A failed value still gets a readback of the whole batch");
+
+        // 6. Only accepted-but-unobserved results: unconfirmed (exit 3), not an error.
+        backend = new FakeStatefulBackend();
+        backend.State["ExclusionPath"].Add(@"C:\Stuck");
+        backend.IgnoreValue.Add(@"C:\Stuck");
+        text = Normalize(RunExclusion(backend, out exitCode, out evidence, "remove", "-ExclusionPath", @"C:\Stuck"));
+        Assert(exitCode == 3 && text.Contains("Outcome: REMOVAL_UNCONFIRMED") && text.Contains("NOT_CONFIRMED"),
+            "Accepted but still present is unconfirmed");
+
+        // 7. The readback itself fails or the list disappears afterwards: nothing is confirmed.
+        backend = new FakeStatefulBackend();
+        backend.State["ExclusionPath"].Add(@"C:\Lab");
+        backend.ThrowOnSecondRead = true;
+        text = Normalize(RunExclusion(backend, out exitCode, out evidence, "remove", "-ExclusionPath", @"C:\Lab"));
+        Assert(exitCode == 3 && text.Contains("NOT_CONFIRMED ExclusionPath: C:\\Lab") && text.Contains("post-removal readback failed") &&
+            text.Contains("Outcome: REMOVAL_UNCONFIRMED") && !text.Contains("REMOVED_CONFIRMED"),
+            "A failed readback never confirms a removal");
+        backend = new FakeStatefulBackend();
+        backend.State["ExclusionPath"].Add(@"C:\Lab");
+        backend.UnreadableAfterFirstRead.Add("ExclusionPath");
+        text = Normalize(RunExclusion(backend, out exitCode, out evidence, "remove", "-ExclusionPath", @"C:\Lab"));
+        Assert(exitCode == 3 && text.Contains("NOT_CONFIRMED") && text.Contains("unreadable after the request") &&
+            !text.Contains("REMOVED_CONFIRMED"), "An unreadable post-removal list never confirms a removal");
+
+        // 8. A request spelled differently from the stored value (case, trailing backslash) sends the stored spelling.
+        backend = new FakeStatefulBackend();
+        backend.State["ExclusionPath"].Add(@"C:\Lab Data");
+        text = Normalize(RunExclusion(backend, out exitCode, out evidence, "remove", "-ExclusionPath", @"c:\lab data\"));
+        Assert(exitCode == 0 && backend.RemoveRequests.Count == 1 && backend.RemoveRequests[0] == @"ExclusionPath=C:\Lab Data",
+            "Remove sends the spelling Defender stored");
+        Assert(text.Contains(@"(stored as C:\Lab Data)"), "The stored spelling is shown when it differs from the request");
+
+        // 9. Two spellings of one value are one request.
+        backend = new FakeStatefulBackend();
+        backend.State["ExclusionPath"].Add(@"C:\Lab");
+        RunExclusion(backend, out exitCode, out evidence, "remove", "-ExclusionPath", @"C:\Lab", @"C:\Lab\");
+        Assert(exitCode == 0 && backend.RemoveRequests.Count == 1 && evidence.RemoveItems.Count == 1,
+            "Equivalent spellings of one value are removed once");
+
+        // 10. A type the provider does not support refuses before reading or removing anything.
+        backend = new FakeStatefulBackend();
+        backend.RemoveUnsupportedTypes.Add("ExclusionIpAddress");
+        backend.State["ExclusionPath"].Add(@"C:\Lab");
+        text = Normalize(RunExclusion(backend, out exitCode, out evidence, "remove",
+            "-ExclusionPath", @"C:\Lab", "-ExclusionIpAddress", "192.0.2.1"));
+        Assert(exitCode == 1 && backend.RemoveRequests.Count == 0 && CountCalls(backend, "Read") == 0 &&
+            text.Contains("Unsupported exclusion type for remove: ExclusionIpAddress"), "An unsupported type refuses the command");
+
+        // 10a. remove depends on the read surface and the Remove surface, never on Add's metadata.
+        backend = new FakeStatefulBackend();
+        backend.NotReadableTypes.Add("ExclusionPath");
+        backend.State["ExclusionPath"].Add(@"C:\Lab");
+        text = Normalize(RunExclusion(backend, out exitCode, out evidence, "remove", "-ExclusionPath", @"C:\Lab"));
+        Assert(exitCode == 1 && backend.RemoveRequests.Count == 0 && CountCalls(backend, "Read") == 0 &&
+            text.Contains("Unsupported exclusion type for remove: ExclusionPath"),
+            "A type that is not a readable field is refused with the unified message and never read");
+        backend = new FakeStatefulBackend();
+        backend.UnsupportedTypes.Add("ExclusionPath");
+        backend.State["ExclusionPath"].Add(@"C:\Lab");
+        text = Normalize(RunExclusion(backend, out exitCode, out evidence, "remove", "-ExclusionPath", @"C:\Lab"));
+        Assert(exitCode == 0 && backend.RemoveRequests.Count == 1 && text.Contains("REMOVED_CONFIRMED ExclusionPath: C:\\Lab"),
+            "A type Add's metadata omits is still removable when the read and Remove surfaces expose it");
+
+        // 10b. A provider whose Remove method is missing fails the metadata lookup: same clean refusal.
+        backend = new FakeStatefulBackend { SupportsRemoveThrows = true };
+        backend.State["ExclusionPath"].Add(@"C:\Lab");
+        text = Normalize(RunExclusion(backend, out exitCode, out evidence, "remove", "-ExclusionPath", @"C:\Lab"));
+        Assert(exitCode == 1 && backend.RemoveRequests.Count == 0 && CountCalls(backend, "Read") == 0 &&
+            text.Contains("Unsupported exclusion type for remove: ExclusionPath"), "A failed Remove metadata lookup is a clean refusal");
+
+        // 10c. A failed request is not credited with a change even when the value is gone afterwards.
+        backend = new FakeStatefulBackend();
+        backend.State["ExclusionPath"].Add(@"C:\Vanish");
+        backend.ThrowOnValue.Add(@"C:\Vanish");
+        backend.VanishOnThrow.Add(@"C:\Vanish");
+        text = Normalize(RunExclusion(backend, out exitCode, out evidence, "remove", "-ExclusionPath", @"C:\Vanish"));
+        Assert(exitCode == 1 && text.Contains(@"ERROR ExclusionPath: C:\Vanish") && !text.Contains("REMOVED_CONFIRMED") &&
+            text.Contains("not attributed to it"), "A value that vanished after a failed request is not reported as removed");
+
+        // 10d. Partial change with no error is distinguishable from no change at all (exit 3 either way).
+        backend = new FakeStatefulBackend();
+        backend.State["ExclusionPath"].AddRange(new[] { @"C:\Done", @"C:\Stuck" });
+        backend.IgnoreValue.Add(@"C:\Stuck");
+        text = Normalize(RunExclusion(backend, out exitCode, out evidence, "remove", "-ExclusionPath", @"C:\Done", @"C:\Stuck"));
+        Assert(exitCode == 3 && text.Contains("Outcome: PARTIAL_REMOVAL_UNCONFIRMED"),
+            "Exit 3 with one confirmed removal names the partial change");
+
+        // 11. No usable return code (the powershell transport's normal case) is confirmed through readback only.
+        backend = new FakeStatefulBackend { SuccessStatus = null };
+        backend.State["ExclusionProcess"].Add("Worker.exe");
+        text = Normalize(RunExclusion(backend, out exitCode, out evidence, "remove", "-ExclusionProcess", "Worker.exe"));
+        Assert(exitCode == 0 && evidence.Lifecycle.Mutation == MutationStatus.ApiUnknown &&
+            text.Contains("No usable WMI return code") && text.Contains("REMOVED_CONFIRMED ExclusionProcess: Worker.exe"),
+            "A missing return code is confirmed by readback, not assumed");
+
+        // 12. One request per value, across all four types.
+        backend = new FakeStatefulBackend();
+        backend.State["ExclusionPath"].AddRange(new[] { @"C:\A", @"C:\B" });
+        backend.State["ExclusionExtension"].Add(".x");
+        backend.State["ExclusionProcess"].Add("p.exe");
+        backend.State["ExclusionIpAddress"].Add("192.0.2.9");
+        RunExclusion(backend, out exitCode, out evidence, "remove", "-ExclusionPath", @"C:\A", @"C:\B",
+            "-ExclusionExtension", ".x", "-ExclusionProcess", "p.exe", "-ExclusionIpAddress", "192.0.2.9");
+        Assert(exitCode == 0 && backend.RemoveRequests.Count == 5 && backend.RemoveRequests[0] == @"ExclusionPath=C:\A" &&
+            backend.RemoveRequests[1] == @"ExclusionPath=C:\B" && backend.RemoveRequests[2] == "ExclusionExtension=.x" &&
+            backend.RemoveRequests[3] == "ExclusionProcess=p.exe" && backend.RemoveRequests[4] == "ExclusionIpAddress=192.0.2.9",
+            "Each value of all four types is its own request");
+
+        // 13. A value that looks like terminal markup is sanitized in results.
+        backend = new FakeStatefulBackend();
+        backend.State["ExclusionPath"].Add("C:\\Lab\u001b[31mRed");
+        string raw = RunExclusion(backend, out exitCode, out evidence, "remove", "-ExclusionPath", "C:\\Lab\u001b[31mRed");
+        Assert(raw.IndexOf('\u001b') < 0 && exitCode == 0, "remove sanitizes terminal escapes in values");
+    }
+
+    // The connect script is the one place the powershell transport learns Add's, Remove's and the read
+    // surface's capabilities. Script text is checked deterministically; the parser is fed synthetic output.
+    private static void CheckPowerShellConnectScript()
+    {
+        Type powershell = typeof(DefenderModule).GetNestedType("PowerShellBackend", BindingFlags.NonPublic);
+        MethodInfo build = powershell.GetMethod("BuildConnectScript", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+        string script = (string)build.Invoke(null, null);
+        Assert(script.StartsWith("$ErrorActionPreference = 'Stop'") && script.Contains("WTF_CONNECT_OK") &&
+            script.Contains("WTF_CONNECT_ERROR:"), "Connect script keeps its explicit markers");
+        Assert(script.Contains("ConfigDefender\\Add-MpPreference") && script.Contains("ConfigDefender\\Remove-MpPreference") &&
+            script.Contains("ConfigDefender\\Get-MpPreference"), "Connect script module-qualifies every cmdlet");
+        Assert(script.Contains("$instances.Count -ne 1") && script.Contains("PSObject.Properties[$n]") &&
+            script.Contains("'Read.' + $n") && script.Contains("Read.ERROR="),
+            "Read-surface discovery asserts one instance, probes each field and reports its own failure");
+        foreach (string field in new[] { "ExclusionPath", "ExclusionExtension", "ExclusionProcess", "ExclusionIpAddress" })
+        {
+            Assert(script.Contains("'" + field + "'"), "Connect script names " + field);
+        }
+        int parseErrors = ParsePowerShell(script);
+        Assert(parseErrors == 0, "Connect script is syntactically valid PowerShell");
+
+        MethodInfo apply = powershell.GetMethod("ApplyConnectOutput", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        Assert(script.Contains("Add-MpPreference -ErrorAction SilentlyContinue") && script.Contains("'AddCmdlet=' + [bool]$cmd"),
+            "Add-MpPreference is discovered, not required, by the connect script");
+        Assert(script.Contains("Get-Command ConfigDefender\\Get-MpPreference | Out-Null"), "Get-MpPreference stays mandatory");
+        string[] fields = { "ExclusionPath", "ExclusionExtension", "ExclusionProcess", "ExclusionIpAddress" };
+
+        // Builds synthetic connect output; omit drops one row, readError replaces the Read group.
+        Func<bool, string, string, string> connectOutput = delegate(bool addCmdlet, string omit, string readError)
+        {
+            var lines = new List<string> { "AddCmdlet=" + (addCmdlet ? "True" : "False") };
+            foreach (string field in fields) { lines.Add(field + "=" + (addCmdlet ? "True" : "False")); }
+            foreach (string field in fields) { lines.Add("Remove." + field + "=" + (field == "ExclusionProcess" ? "False" : "True")); }
+            if (readError == null)
+            {
+                foreach (string field in fields) { lines.Add("Read." + field + "=" + (field == "ExclusionIpAddress" ? "False" : "True")); }
+            }
+            else { lines.Add("Read.ERROR=" + DefenderModule.PowerShellRunner.EncodeValue(readError)); }
+            lines.RemoveAll(delegate(string line) { return omit != null && line.StartsWith(omit + "=", StringComparison.Ordinal); });
+            lines.Add("WTF_CONNECT_OK");
+            return string.Join("\r\n", lines.ToArray()) + "\r\n";
+        };
+
+        var backend = (DefenderModule.IPreferenceBackend)Activator.CreateInstance(powershell, true);
+        apply.Invoke(backend, new object[] { connectOutput(true, null, null) });
+        Assert(backend.Supports("ExclusionPath") && backend.SupportsRead("ExclusionPath") && backend.SupportsRemove("ExclusionPath"),
+            "Parsed capabilities: all surfaces available");
+        Assert(!backend.SupportsRead("ExclusionIpAddress") && backend.Supports("ExclusionIpAddress"),
+            "The read surface is independent of Add's: ExclusionIpAddress=False on Read only");
+        Assert(!backend.SupportsRemove("ExclusionProcess") && backend.SupportsRead("ExclusionProcess"),
+            "The Remove surface is independent of the read surface");
+        Assert(!backend.SupportsRead("ExclusionBogus"), "An unknown type is not readable");
+
+        // Add-MpPreference absent: the read and Remove surfaces still work; only add is refused.
+        apply.Invoke(backend, new object[] { connectOutput(false, null, null) });
+        Assert(backend.SupportsRead("ExclusionPath") && backend.SupportsRemove("ExclusionPath") && !backend.Supports("ExclusionPath"),
+            "Without Add-MpPreference the read and Remove surfaces remain available");
+        backend.PrepareRead();
+        bool addRefused = false;
+        try { backend.Prepare(new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase)); }
+        catch (NotSupportedException) { addRefused = true; }
+        Assert(addRefused, "add is refused when Add-MpPreference is unavailable");
+
+        // A capability row that never arrived is unobserved, not "unsupported": connect output must be complete.
+        foreach (string omitted in new[] { "AddCmdlet", "ExclusionPath", "ExclusionIpAddress", "Remove.ExclusionPath",
+            "Remove.ExclusionIpAddress", "Read.ExclusionPath", "Read.ExclusionProcess" })
+        {
+            bool rejected = false;
+            try { apply.Invoke(backend, new object[] { connectOutput(true, omitted, null) }); }
+            catch (TargetInvocationException ex) { rejected = ex.InnerException is InvalidOperationException; }
+            Assert(rejected, "Connect output missing " + omitted + " is rejected, not read as unsupported");
+        }
+        bool onlyMarker = false;
+        try { apply.Invoke(backend, new object[] { "WTF_CONNECT_OK\r\n" }); }
+        catch (TargetInvocationException ex) { onlyMarker = ex.InnerException is InvalidOperationException; }
+        Assert(onlyMarker, "Connect output with only the success marker is rejected");
+
+        // A failed read-surface discovery is reported as an error when asked, never as "unsupported",
+        // and its other rows must still all be present.
+        apply.Invoke(backend, new object[] { connectOutput(true, null, "Expected exactly one instance, got 0.") });
+        bool threw = false;
+        try { backend.SupportsRead("ExclusionPath"); }
+        catch (InvalidOperationException ex) { threw = ex.Message.Contains("got 0"); }
+        Assert(threw, "A failed read-surface discovery is surfaced, not read as unsupported");
+        Assert(backend.Supports("ExclusionPath"), "A failed read-surface discovery leaves Add's capabilities intact");
+        bool incompleteWithError = false;
+        try { apply.Invoke(backend, new object[] { connectOutput(true, "Remove.ExclusionPath", "boom") }); }
+        catch (TargetInvocationException ex) { incompleteWithError = ex.InnerException is InvalidOperationException; }
+        Assert(incompleteWithError, "Read.ERROR does not excuse missing Add or Remove rows");
+    }
+
+    // Asks a real powershell.exe to parse (never run) a script, and returns its syntax error count.
+    private static int ParsePowerShell(string script)
+    {
+        var probe = new StringBuilder();
+        probe.Append("$errs = $null; $tok = $null\r\n");
+        probe.Append("[void][System.Management.Automation.Language.Parser]::ParseInput(" +
+            DefenderModule.PowerShellRunner.EncodeValueExpression(script) + ", [ref]$tok, [ref]$errs)\r\n");
+        probe.Append("Write-Output ('ERRS=' + @($errs).Count)\r\n");
+        DefenderModule.PowerShellRunner.Result result = DefenderModule.PowerShellRunner.RunScript(probe.ToString());
+        foreach (string line in DefenderModule.PowerShellRunner.SplitLines(result.Stdout))
+        {
+            if (line.StartsWith("ERRS=", StringComparison.Ordinal)) { return int.Parse(line.Substring(5)); }
+        }
+        throw new InvalidOperationException("PowerShell syntax probe did not report: " +
+            DefenderModule.PowerShellRunner.DescribeFailure(result));
+    }
+
+    private static void CheckPowerShellRemoveScript()
+    {
+        Type powershell = typeof(DefenderModule).GetNestedType("PowerShellBackend", BindingFlags.NonPublic);
+        Assert(powershell != null, "PowerShell Defender backend exists");
+        MethodInfo build = powershell.GetMethod("BuildRemoveScript",
+            BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+        Assert(build != null, "PowerShell backend exposes its remove script builder for inspection");
+        var values = new List<string> { @"C:\Lab Data", "C:\\\u6d4b\u8bd5", "it's" };
+        string script = (string)build.Invoke(null, new object[] { "ExclusionPath", values });
+        Assert(script.StartsWith("$ErrorActionPreference = 'Stop'") &&
+            script.Contains("ConfigDefender\\Remove-MpPreference -ExclusionPath") &&
+            script.Contains("WTF_REMOVE_OK") && script.Contains("WTF_REMOVE_ERROR:"),
+            "Remove script is module-qualified and reports explicit markers");
+        Assert(!script.Contains("Lab Data") && !script.Contains("it's") && script.Contains(DefenderModule.PowerShellRunner.EncodeValue("it's")),
+            "Remove values cross only as Base64, never as script text");
+        Assert(!script.Contains("Add-MpPreference"), "The remove script cannot call Add");
+        bool rejected = false;
+        try { build.Invoke(null, new object[] { "ExclusionPath", new List<string> { new string('x', 9000) } }); }
+        catch (TargetInvocationException ex) { rejected = ex.InnerException is InvalidOperationException; }
+        Assert(rejected, "An oversized remove request is rejected before powershell.exe starts");
+    }
+
+    // The elevation gate and the run header, through DefenderModule.Execute with an injected backend
+    // factory and elevation test (the same seam FirewallModule.Execute has). The gate must refuse a write
+    // before any backend is created, and must not touch the read-only commands.
+    private static string ExecuteExclusion(bool elevated, FakeStatefulBackend backend, out int factories,
+        out int exitCode, out DefenderModule.RunEvidence evidence, params string[] args)
+    {
+        TextWriter originalOut = Console.Out;
+        TextWriter originalError = Console.Error;
+        int created = 0;
+        using (var output = new StringWriter())
+        {
+            try
+            {
+                Console.SetOut(output);
+                Console.SetError(output);
+                DefenderModule.Options options = DefenderModule.ParseArguments(args);
+                ConsoleUi.Configure(options.Verbose, true);
+                ConsoleUi.Width = 100;
+                evidence = new DefenderModule.RunEvidence();
+                exitCode = DefenderModule.Execute(options, evidence,
+                    delegate { created++; return backend; }, delegate { return elevated; });
+            }
+            finally
+            {
+                Console.SetOut(originalOut);
+                Console.SetError(originalError);
+                ConsoleUi.Configure(false, true);
+            }
+            factories = created;
+            return output.ToString();
+        }
+    }
+
+    private static void CheckExclusionExecute()
+    {
+        int factories;
+        int exitCode;
+        DefenderModule.RunEvidence evidence;
+
+        foreach (string mode in new[] { "add", "remove" })
+        {
+            var backend = new FakeStatefulBackend();
+            backend.State["ExclusionPath"].Add(@"C:\Lab");
+            string text = Normalize(ExecuteExclusion(false, backend, out factories, out exitCode, out evidence,
+                mode, "-ExclusionPath", @"C:\Lab"));
+            Assert(exitCode == 1 && factories == 0 && !evidence.AddAttempted && !evidence.RemoveAttempted &&
+                backend.Calls.Count == 0, mode + ": the admin gate refuses before the backend is created");
+            Assert(text.Contains("Administrator No") && text.Contains("Run as administrator") &&
+                text.Contains(mode == "add" ? "Mode ADD exclusions" : "Mode REMOVE exclusions"),
+                mode + ": the header prints before the gate refuses");
+            Assert(text.Contains("REQUESTED EXCLUSIONS") && text.Contains(@"ExclusionPath C:\Lab"),
+                mode + ": the refused request is shown");
+        }
+
+        // Read-only commands are not gated on elevation.
+        foreach (string[] args in new[] { new[] { "list" }, new[] { "check", "-ExclusionPath", @"C:\Lab" } })
+        {
+            var backend = new FakeStatefulBackend();
+            string text = Normalize(ExecuteExclusion(false, backend, out factories, out exitCode, out evidence, args));
+            Assert(exitCode == 0 && factories == 1 && text.Contains("Administrator No"),
+                args[0] + " is not gated on elevation");
+        }
+
+        // An elevated write is let through and runs the lifecycle (add and remove are not ReadOnly).
+        var elevatedBackend = new FakeStatefulBackend();
+        elevatedBackend.State["ExclusionPath"].Add(@"C:\Lab");
+        string elevatedText = Normalize(ExecuteExclusion(true, elevatedBackend, out factories, out exitCode, out evidence,
+            "remove", "-ExclusionPath", @"C:\Lab"));
+        Assert(exitCode == 0 && factories == 1 && evidence.RemoveAttempted && elevatedBackend.State["ExclusionPath"].Count == 0 &&
+            elevatedText.Contains("Administrator Yes"), "An elevated remove passes the gate and runs");
+
+        // The mode decides the gate: pin which modes are read-only.
+        Assert(DefenderModule.ParseArguments(new[] { "list" }).ReadOnly &&
+            DefenderModule.ParseArguments(new[] { "check" }).ReadOnly &&
+            !DefenderModule.ParseArguments(new[] { "add", "-ExclusionPath", "C:\\Lab" }).ReadOnly &&
+            !DefenderModule.ParseArguments(new[] { "remove", "-ExclusionPath", "C:\\Lab" }).ReadOnly &&
+            !DefenderModule.ParseArguments(new[] { "-ExclusionPath", "C:\\Lab" }).ReadOnly,
+            "Only check and list are read-only");
+
+        // Header content the other tests could not see: mode, route detail and requested values.
+        var headerBackend = new FakeStatefulBackend();
+        string header = Normalize(ExecuteExclusion(true, headerBackend, out factories, out exitCode, out evidence,
+            "list", "--verbose", "--transport", "native"));
+        Assert(header.Contains("Transport native") && header.Contains("Mode LIST - read-only, no changes") &&
+            header.Contains("Route: P/Invoke -> native C++") && header.Contains("MSFT_MpPreference query (read-only)"),
+            "The header reports the transport, mode and route");
+    }
+
+    private static void CheckExclusionHelp()
+    {
+        TextWriter originalOut = Console.Out;
+        using (var output = new StringWriter())
+        {
+            try
+            {
+                Console.SetOut(output);
+                ConsoleUi.Configure(false, true);
+                MethodInfo help = typeof(DefenderModule).GetMethod("PrintHelp", BindingFlags.Static | BindingFlags.NonPublic);
+                help.Invoke(null, null);
+                string text = Normalize(output.ToString());
+                foreach (string command in new[] { "add", "check", "list", "remove" })
+                {
+                    Assert(text.Contains(command + " "), "Help documents the " + command + " command");
+                }
+                Assert(text.Contains("defender exclusion <command>") && text.Contains("No remove-all") &&
+                    text.Contains("never shown as empty"), "Help states the command shape and the unreadable-list rule");
+                Assert(!text.Contains("--check  Read-only"), "Help no longer documents --check as an option");
+                Assert(output.ToString().Split('\n').Length <= 46, "Default help stays compact");
+            }
+            finally
+            {
+                Console.SetOut(originalOut);
+                ConsoleUi.Configure(false, true);
+            }
+        }
     }
 
     private static void Assert(bool condition, string message)
