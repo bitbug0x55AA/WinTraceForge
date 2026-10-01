@@ -13,6 +13,7 @@ internal enum ControlKind
     DefenderExclusion,
     FirewallRule,
     FirewallProfiles,
+    FirewallRuleList,
     DefenderAsrStatus,
     DefenderAsrExclusion,
     DefenderAsrRule,

@@ -59,7 +59,7 @@ internal static class FirewallGroupPolicy
 // pre-validate the handful of properties that live directly on MSFT_NetFirewallRule (name/group/
 // description/enabled/direction/action/profiles); full attribute verification -- including address/
 // port/program -- relies on the shared post-Add Verify() readback every transport already goes through.
-internal sealed class ManagementFirewallBackend : IFirewallBackend
+internal sealed class ManagementFirewallBackend : IFirewallBackend, IFirewallRuleEnumerator
 {
     // AnySentinel and the raw-value codecs/normalizers below are internal (not private): reused by
     // PowerShellFirewallBackend and CmdFirewallBackend, which read the same root\StandardCimv2
@@ -179,6 +179,133 @@ internal sealed class ManagementFirewallBackend : IFirewallBackend
             foreach (ManagementObject rule in matches) { using (rule) { result.Add(ReadRule(rule)); } }
         }
         return result;
+    }
+
+    // Read-only inventory of every MSFT_NetFirewallRule in the chosen policy store. Reads only the rule
+    // object's own direct properties -- none of the per-rule MSFT_Net*Filter associations ReadRule needs --
+    // so a rule shape ReadRule would refuse (an interface, IPsec or multi-value restriction) is still
+    // listed. PolicyStore is always set explicitly to a literal store name (BuildListOptions), never left
+    // to the provider's default. The localized connection is made before any enumeration starts, so a
+    // failure there is an ordinary error, not an incomplete list; any failure once rules are being read
+    // is an incomplete list (ReadAll), never a shorter one.
+    public IList<FirewallRuleSummary> ListRules(FirewallPolicyStore store)
+    {
+        ManagementScope listScope = ListScope();
+        EnumerationOptions options = BuildListOptions(store);
+        using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(listScope,
+            new ObjectQuery("SELECT * FROM MSFT_NetFirewallRule"), options))
+        using (ManagementObjectCollection rules = searcher.Get())
+        {
+            return ReadAll(ReadEachRule(rules), FirewallRuleListCodec.StoreProviderName(store));
+        }
+    }
+
+    internal static EnumerationOptions BuildListOptions(FirewallPolicyStore store)
+    {
+        EnumerationOptions options = new EnumerationOptions();
+        options.Context.Add("PolicyStore", FirewallRuleListCodec.StoreProviderName(store));
+        return options;
+    }
+
+    private static IEnumerable<IDictionary<string, object>> ReadEachRule(ManagementObjectCollection rules)
+    {
+        foreach (ManagementObject rule in rules)
+        {
+            using (rule) { yield return ReadDirectValues(rule); }
+        }
+    }
+
+    // Test seam: the iteration is where a provider/RPC failure surfaces. Any exception while pulling rows
+    // becomes FirewallListIncompleteException (carrying how many were read); the rows read so far are
+    // discarded, never returned.
+    internal static IList<FirewallRuleSummary> ReadAll(IEnumerable<IDictionary<string, object>> rows, string storeName)
+    {
+        List<FirewallRuleSummary> result = new List<FirewallRuleSummary>();
+        try
+        {
+            foreach (IDictionary<string, object> row in rows) { result.Add(SummarizeRule(row)); }
+        }
+        catch (Exception error)
+        {
+            throw new FirewallListIncompleteException("MSFT_NetFirewallRule enumeration (" + storeName + ") failed after " +
+                result.Count.ToString(CultureInfo.InvariantCulture) + " rule(s): " + error.Message, result.Count, error);
+        }
+        return result;
+    }
+
+    // MSFT_NetFirewallRule.DisplayName is the provider's own resolved text for a rule whose ElementName is a
+    // resource reference, produced for the request's WMI locale. System.Management defaults that locale to
+    // the thread's culture (formats), which need not be a UI language at all; confirmed live on a host whose
+    // culture and user UI language were zh-CN but whose system UI language was en-US: this transport read
+    // the same rules as Chinese text while the powershell transport's child process (NetSecurity cmdlets)
+    // read them as English. The system UI language is requested explicitly so both transports show the same
+    // text there; on a host with a single UI language the two settings coincide. Display text is localized
+    // either way -- the rule id is the stable key.
+    private ManagementScope ListScope()
+    {
+        ConnectionOptions connection = BuildListConnection();
+        if (connection == null) { return scope; }
+        ManagementScope localized = new ManagementScope(@"\\.\root\StandardCimv2", connection);
+        localized.Connect();
+        return localized;
+    }
+
+    // The connection options of the listing scope (no connect): the system UI language as the WMI locale, or
+    // null when that culture has no usable LCID. Kept separate so a test can pin where the locale comes from.
+    internal static ConnectionOptions BuildListConnection()
+    {
+        string locale = ListLocale(CultureInfo.InstalledUICulture);
+        if (locale == null) { return null; }
+        ConnectionOptions connection = new ConnectionOptions();
+        connection.Locale = locale;
+        return connection;
+    }
+
+    // WMI locale name ("MS_<hex LCID>") for a culture, or null when the culture has no usable LCID
+    // (neutral, invariant 0x7F, or a custom culture 0x1000) and the default locale must be kept.
+    internal static string ListLocale(CultureInfo culture)
+    {
+        if (culture.IsNeutralCulture || culture.LCID == 0x1000 || culture.LCID == 0x7F) { return null; }
+        return "MS_" + culture.LCID.ToString("x", CultureInfo.InvariantCulture);
+    }
+
+    // Snapshot of the rule's property values by name. A property the provider does not expose on this
+    // Windows build is simply absent from the map (reported as a per-rule read limit), not an error.
+    private static Dictionary<string, object> ReadDirectValues(ManagementObject rule)
+    {
+        Dictionary<string, object> values = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+        foreach (PropertyData property in rule.Properties) { values[property.Name] = property.Value; }
+        return values;
+    }
+
+    internal static FirewallRuleSummary SummarizeRule(IDictionary<string, object> values)
+    {
+        string displayName = TextValue(values, "DisplayName");
+        bool fallback = false;
+        if (displayName == null) { displayName = TextValue(values, "ElementName"); fallback = displayName != null; }
+        FirewallRuleSummary summary = FirewallRuleListCodec.Build(TextValue(values, "InstanceID"), displayName,
+            IntValue(values, "Enabled"), IntValue(values, "Direction"), IntValue(values, "Action"),
+            IntValue(values, "Profiles"), IntValue(values, "PolicyStoreSourceType"), TextValue(values, "PolicyStoreSource"));
+        if (fallback) { summary.Limits.Add("DisplayName property unavailable; raw ElementName shown"); }
+        return summary;
+    }
+
+    private static string TextValue(IDictionary<string, object> values, string name)
+    {
+        object value;
+        if (!values.TryGetValue(name, out value) || value == null || value == DBNull.Value) { return null; }
+        string text = value as string;
+        return text != null ? text : null;
+    }
+
+    private static int? IntValue(IDictionary<string, object> values, string name)
+    {
+        object value;
+        if (!values.TryGetValue(name, out value) || value == null || value == DBNull.Value) { return null; }
+        try { return Convert.ToInt32(value, CultureInfo.InvariantCulture); }
+        catch (FormatException) { return null; }
+        catch (InvalidCastException) { return null; }
+        catch (OverflowException) { return null; }
     }
 
     private static FirewallRuleData ReadRule(ManagementObject rule)

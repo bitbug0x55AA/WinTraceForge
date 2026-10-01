@@ -9,6 +9,7 @@ using System.Management;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 
 // Compile with /main:FirewallRegressionTests alongside the firewall, Core and ConsoleUi sources.
 // Define FIREWALL_TEST_STUBS to replace only telemetry dependencies when testing in isolation.
@@ -92,6 +93,7 @@ internal static class FirewallRegressionTests
         if (args.Length == 1 && args[0] == "--management-read-only") { return RunGatedMode(ManagementReadOnly); }
         if (args.Length == 1 && args[0] == "--powershell-read-only") { return RunGatedMode(PowerShellReadOnly); }
         if (args.Length == 1 && args[0] == "--cmd-read-only") { return RunGatedMode(CmdReadOnly); }
+        if (args.Length == 1 && args[0] == "--rule-list-read-only") { return RunGatedMode(RuleListReadOnly); }
 
         TextWriter original = Console.Out;
         using (StringWriter output = new StringWriter())
@@ -125,6 +127,12 @@ internal static class FirewallRegressionTests
                 PowerShellParseRulesFixtures();
                 PowerShellStrictModeCatchesMissingProperty();
                 PowerShellScriptProloguesAreApplied();
+                RuleListParsing();
+                RuleListCodec();
+                PowerShellRuleListParsing();
+                ManagementListRequest();
+                PowerShellListResultClassification();
+                RuleListExecution();
                 MutationClassification();
 #if FIREWALL_TEST_STUBS
                 EtwFailure();
@@ -1463,6 +1471,587 @@ internal static class FirewallRegressionTests
             "powershell Add script starts with the shared prologue (Set-StrictMode included)");
         Assert(PowerShellFirewallBackend.BuildRemoveScript("WinTraceForge.Firewall.test").StartsWith(prologue, StringComparison.Ordinal),
             "powershell Remove script starts with the shared prologue (Set-StrictMode included)");
+    }
+
+    // ---- firewall rule list ------------------------------------------------------------------------------
+
+    private sealed class FakeEnumerator : IFirewallRuleEnumerator
+    {
+        internal readonly List<FirewallRuleSummary> Rules = new List<FirewallRuleSummary>();
+        internal Exception Failure;
+        internal FirewallPolicyStore RequestedStore = (FirewallPolicyStore)(-1);
+        internal int Lists;
+        internal bool Disposed;
+        public IList<FirewallRuleSummary> ListRules(FirewallPolicyStore store)
+        {
+            Lists++;
+            RequestedStore = store;
+            if (Failure != null) { throw Failure; }
+            return new List<FirewallRuleSummary>(Rules);
+        }
+        public void Dispose() { Disposed = true; }
+    }
+
+    private static FirewallRuleSummary Summary(string id, string name, bool enabled)
+    {
+        return FirewallRuleListCodec.Build(id, name, enabled ? 1 : 2, 2, 4, 7, 1, "PersistentStore");
+    }
+
+    // Runs action with Console output captured (the suite's own capture wraps Console.Out, so this
+    // swaps in a private writer and restores the previous one).
+    // Width is widened so a long row never wraps in the middle of text an assertion looks for.
+    private static string Capture(Action action)
+    {
+        TextWriter previous = Console.Out;
+        int width = ConsoleUi.Width;
+        StringWriter local = new StringWriter();
+        Console.SetOut(local);
+        ConsoleUi.Width = 1000;
+        try { action(); }
+        finally { Console.SetOut(previous); ConsoleUi.Width = width; }
+        return local.ToString();
+    }
+
+    private static void RuleListParsing()
+    {
+        FirewallOptions list = FirewallModule.Parse(new[] { "rule", "list" });
+        Assert(list.Kind == ControlKind.FirewallRuleList && list.Operation == "list" &&
+            list.Store == FirewallPolicyStore.Active && list.Transport == "management", "rule list defaults: active store, management transport");
+        list = FirewallModule.Parse(new[] { "rule", "list", "--STORE", "Persistent", "--transport", "POWERSHELL", "--no-color" });
+        Assert(list.Store == FirewallPolicyStore.Persistent && list.Transport == "powershell" && list.NoColor, "rule list store/transport selection");
+        Assert(FirewallModule.Parse(new[] { "rule", "list", "--transport", "management" }).Transport == "management", "rule list explicit management");
+        Assert(FirewallModule.Parse(new[] { "rule", "list", "--help" }).Help, "rule list help");
+        Assert(FirewallModule.Parse(new[] { "rule", "list", "--telemetry", "eventlog", "--verbose" }).CollectEventLog, "rule list accepts common options");
+        Assert(AddOptions().Transport == "com" && Options("check").Transport == "com" &&
+            FirewallModule.Parse(new[] { "profiles" }).Transport == "com", "other firewall commands keep the com default");
+        foreach (string transport in new[] { "com", "native", "cmd" })
+        {
+            Bad("rule", "list", "--transport", transport);
+        }
+        Bad("rule", "list", "--transport", "cim");
+        Bad("rule", "list", "--store", "effective");
+        Bad("rule", "list", "--store");
+        Bad("rule", "list", "--store", "active", "--store", "persistent");
+        Bad("rule", "list", "--id", Id);
+        Bad("rule", "list", "--remote-address", "192.0.2.1");
+        Bad("rule", "list", "--direction", "in");
+        Bad("rule", "list", "--transport", "management", "--transport", "powershell");
+        Bad("rule", "check", "--id", Id, "--store", "active");
+        Bad("rule", "remove", "--id", Id, "--store", "active");
+        Bad("rule", "add", "--remote-address", "192.0.2.1", "--remote-port", "443", "--store", "active");
+        Bad("profiles", "--store", "active");
+        foreach (string transport in new[] { "com", "native", "cmd", "bogus" })
+        {
+            bool refused = false;
+            try { FirewallModule.CreateEnumerator(transport); }
+            catch (FirewallRefusalException) { refused = true; }
+            Assert(refused, "enumerator factory refuses " + transport + " without falling back");
+        }
+        Assert(typeof(IFirewallRuleEnumerator).GetMethods().Length == 1 &&
+            typeof(IFirewallRuleEnumerator).GetMethods()[0].Name == "ListRules" &&
+            !typeof(IFirewallBackend).IsAssignableFrom(typeof(IFirewallRuleEnumerator)),
+            "the enumeration contract exposes no write method and is not the ownership backend");
+    }
+
+    private static void RuleListCodec()
+    {
+        FirewallRuleSummary rule = FirewallRuleListCodec.Build("id-1", "Rule One", 1, 1, 2, 0, 2, "Contoso GPO");
+        Assert(rule.Id == "id-1" && rule.DisplayName == "Rule One" && rule.Enabled == "True" && rule.Direction == "Inbound" &&
+            rule.Action == "Allow" && rule.Profiles == "Any" && rule.Source == "GroupPolicy (Contoso GPO)" && rule.Limits.Count == 0,
+            "rule summary decodes raw provider values");
+        rule = FirewallRuleListCodec.Build("id-2", "Rule Two", 2, 2, 4, 7, 1, "");
+        Assert(rule.Enabled == "False" && rule.Direction == "Outbound" && rule.Action == "Block" &&
+            rule.Profiles == "Domain,Private,Public" && rule.Source == "Local" && rule.Limits.Count == 0,
+            "disabled block rule, all-profile mask, source without a store name");
+        Assert(FirewallRuleListCodec.Build("i", "n", 1, 1, 2, 4, 1, null).Profiles == "Public" &&
+            FirewallRuleListCodec.Build("i", "n", 1, 1, 2, 3, 1, null).Profiles == "Domain,Private",
+            "profile bitmask decodes each bit");
+        rule = FirewallRuleListCodec.Build("id-3", "Odd", 9, 5, 3, 16, 77, "x");
+        Assert(rule.Enabled == "Unknown(9)" && rule.Direction == "Unknown(5)" && rule.Action == "Unknown(3)" &&
+            rule.Profiles == "Unknown(16)" && rule.Source == "Unknown(77) (x)" && rule.Limits.Count == 5,
+            "undecodable raw values are shown raw and each named as a read limit, not dropped");
+        rule = FirewallRuleListCodec.Build(null, null, null, null, null, null, null, null);
+        Assert(rule.Id == FirewallRuleListCodec.Unreadable && rule.DisplayName == FirewallRuleListCodec.Unreadable &&
+            rule.Enabled == "Unavailable" && rule.Direction == "Unavailable" && rule.Action == "Unavailable" &&
+            rule.Profiles == "Unavailable" && rule.Source == "Unavailable" && rule.Limits.Count == 7,
+            "unreadable values are marked unavailable with a limit each, the rule itself is kept");
+        Assert(FirewallRuleListCodec.Build("i", "@FirewallAPI.dll,-1", 1, 1, 2, 7, 1, null).Limits.Count == 1 &&
+            FirewallRuleListCodec.Build("i", "", 1, 1, 2, 7, 1, null).Limits.Count == 0,
+            "an unresolved resource-reference name is flagged; an empty name is not");
+        Assert(FirewallRuleListCodec.Clean("a\u001b[2Jb\r\nc\td\u007fe") == "a?[2Jb??c?d?e", "control characters in rule text are neutralized");
+        Assert(FirewallRuleListCodec.StoreProviderName(FirewallPolicyStore.Active) == "ActiveStore" &&
+            FirewallRuleListCodec.StoreProviderName(FirewallPolicyStore.Persistent) == "PersistentStore", "store names are fixed literals");
+
+        Dictionary<string, object> values = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase)
+        {
+            { "InstanceID", "wmi-1" }, { "ElementName", "@FirewallAPI.dll,-1" }, { "DisplayName", "WMI Rule" }, { "Enabled", (ushort)1 }, { "Direction", (ushort)2 },
+            { "Action", (ushort)4 }, { "Profiles", (ushort)6 }, { "PolicyStoreSourceType", (ushort)1 },
+            { "PolicyStoreSource", "PersistentStore" }
+        };
+        rule = ManagementFirewallBackend.SummarizeRule(values);
+        Assert(rule.Id == "wmi-1" && rule.DisplayName == "WMI Rule" && rule.Enabled == "True" && rule.Direction == "Outbound" &&
+            rule.Action == "Block" && rule.Profiles == "Private,Public" && rule.Source == "Local (PersistentStore)" && rule.Limits.Count == 0,
+            "management summary decodes boxed WMI uint16 values and shows the provider-resolved DisplayName, not the raw resource reference");
+        values.Remove("PolicyStoreSourceType");
+        values.Remove("DisplayName");
+        values["Enabled"] = "not a number";
+        values["Action"] = DBNull.Value;
+        rule = ManagementFirewallBackend.SummarizeRule(values);
+        Assert(rule.Enabled == "Unavailable" && rule.Action == "Unavailable" && rule.Source == "Unavailable (PersistentStore)" &&
+            rule.Limits.Count == 5 && rule.Id == "wmi-1" && rule.DisplayName == "@FirewallAPI.dll,-1",
+            "management summary marks absent, DBNull and non-numeric values as read limits (a missing DisplayName falls back to ElementName) and keeps the rule");
+    }
+
+    private static string RuleLine(string marker, int index, string id, string name, string enabled, string direction,
+        string action, string profile, string sourceType, string source)
+    {
+        return "WTF_RULE_" + marker + ":" + index + ":" + ListField(id) + ":" + ListField(name) + ":" + enabled + ":" +
+            direction + ":" + action + ":" + profile + ":" + sourceType + ":" + ListField(source) + "\r\n";
+    }
+
+    private static string ListField(string value)
+    {
+        return value == null ? "~" : DefenderModule.PowerShellRunner.EncodeValue(value);
+    }
+
+    private static void PowerShellRuleListParsing()
+    {
+        const string marker = "listmarker";
+        string weird = "Odd:name\r\nwith\tbreaks 网络发现";
+        string stream = "WTF_COUNT_" + marker + ":4\r\n" +
+            RuleLine(marker, 0, "{guid-a}", "Same Name", "1", "2", "4", "7", "1", "PersistentStore") +
+            RuleLine(marker, 1, "{guid-b}", "Same Name", "2", "1", "2", "4", "3", "ActiveStore") +
+            RuleLine(marker, 2, "{guid-c}", weird, "1", "2", "2", "0", "2", "domain.example\\GPO") +
+            RuleLine(marker, 3, null, "Partly unreadable", "~", "2", "3", "7", "~", null) +
+            "WTF_LIST_OK\r\n";
+        IList<FirewallRuleSummary> rules = PowerShellFirewallBackend.ParseRuleList(stream, marker);
+        Assert(rules.Count == 4 && rules[0].Id == "{guid-a}" && rules[1].Id == "{guid-b}" && rules[2].Id == "{guid-c}",
+            "powershell list keeps stream order and every declared rule");
+        Assert(rules[0].DisplayName == rules[1].DisplayName && rules[0].Id != rules[1].Id && rules[0].Enabled == "True" &&
+            rules[1].Enabled == "False" && rules[0].Action == "Block" && rules[1].Action == "Allow",
+            "same-named rules stay separate; enabled and disabled rules are both listed");
+        Assert(rules[1].Direction == "Inbound" && rules[1].Profiles == "Public" && rules[1].Source == "Dynamic (ActiveStore)" &&
+            rules[2].Profiles == "Any" && rules[2].Source == "GroupPolicy (domain.example\\GPO)", "powershell list decodes profile and source");
+        Assert(rules[2].DisplayName == weird, "a name holding the delimiter, line breaks and non-ASCII text round-trips through Base64");
+        Assert(rules[3].Id == FirewallRuleListCodec.Unreadable && rules[3].Enabled == "Unavailable" && rules[3].Action == "Unknown(3)" &&
+            rules[3].Source == "Unavailable" && rules[3].Limits.Count == 4, "powershell '~' and undecoded values become read limits");
+        Assert(PowerShellFirewallBackend.ParseRuleList("WTF_COUNT_" + marker + ":0\r\nWTF_LIST_OK\r\n", marker).Count == 0,
+            "a declared-empty stream is an empty list");
+
+        string good = RuleLine(marker, 0, "a", "n", "1", "1", "2", "7", "1", "s");
+        string[] broken =
+        {
+            good + "WTF_LIST_OK\r\n",
+            "WTF_COUNT_" + marker + ":2\r\n" + good,
+            "WTF_COUNT_" + marker + ":1\r\n" + good + RuleLine(marker, 1, "b", "n", "1", "1", "2", "7", "1", "s"),
+            "WTF_COUNT_" + marker + ":2\r\n" + good + good,
+            "WTF_COUNT_" + marker + ":1\r\n" + good.Replace(":bg==:", ":"),
+            "WTF_COUNT_" + marker + ":1\r\n" + good.Replace("YQ==", "@@@@"),
+            "WTF_COUNT_" + marker + ":1\r\n" + good.Replace(":1:1:2:7:1:", ":1:x:2:7:1:"),
+            "WTF_COUNT_" + marker + ":x\r\n",
+            "WTF_COUNT_" + marker + ":1\r\nWTF_COUNT_" + marker + ":1\r\n" + good,
+            "",
+            "WTF_COUNT_" + marker + ":-1\r\n"
+        };
+        for (int i = 0; i < broken.Length; i++)
+        {
+            string stdout = broken[i];
+            AssertThrowsType(delegate { PowerShellFirewallBackend.ParseRuleList(stdout, marker); }, typeof(FirewallListIncompleteException),
+                "powershell list fixture " + i + " (missing/short/extra/duplicate/malformed) is an incomplete list, never a shorter one");
+        }
+        try { PowerShellFirewallBackend.ParseRuleList("WTF_COUNT_" + marker + ":3\r\n" + good, marker); }
+        catch (FirewallListIncompleteException error) { Assert(error.ReadCount == 1, "a short stream reports how many rules had been read"); }
+
+        foreach (FirewallPolicyStore store in new[] { FirewallPolicyStore.Active, FirewallPolicyStore.Persistent })
+        {
+            string script = PowerShellFirewallBackend.BuildListRulesScript(store, marker);
+            Assert(script.StartsWith(PowerShellFirewallBackend.ScriptPrologue, StringComparison.Ordinal),
+                "powershell list script starts with the shared prologue (Set-StrictMode included)");
+            Assert(script.Contains("NetSecurity\\Get-NetFirewallRule -PolicyStore " + FirewallRuleListCodec.StoreProviderName(store) + ")"),
+                "powershell list script names the selected store explicitly");
+            foreach (string forbidden in new[] { "New-NetFirewall", "Remove-NetFirewall", "Set-NetFirewall", "Enable-NetFirewall",
+                "Disable-NetFirewall", "Rename-NetFirewall", "Copy-NetFirewall", "Import-NetFirewall", "Update-NetFirewall", "Remove-Item", "Set-Item" })
+            {
+                Assert(script.IndexOf(forbidden, StringComparison.OrdinalIgnoreCase) < 0, "powershell list script contains no write cmdlet: " + forbidden);
+            }
+            DefenderModule.PowerShellRunner.ValidateScriptLength(script);
+        }
+    }
+
+    private sealed class ThrowingRows : IEnumerable<IDictionary<string, object>>
+    {
+        private readonly int good;
+        internal ThrowingRows(int good) { this.good = good; }
+        public IEnumerator<IDictionary<string, object>> GetEnumerator()
+        {
+            for (int i = 0; i < good; i++)
+            {
+                yield return new Dictionary<string, object> { { "InstanceID", "id" + i }, { "DisplayName", "n" + i },
+                    { "Enabled", (ushort)1 }, { "Direction", (ushort)2 }, { "Action", (ushort)4 }, { "Profiles", (ushort)0 },
+                    { "PolicyStoreSourceType", (ushort)1 }, { "PolicyStoreSource", "PersistentStore" } };
+            }
+            throw new InvalidOperationException("WBEM_E_TRANSPORT_FAILURE mid-enumeration");
+        }
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() { return GetEnumerator(); }
+    }
+
+    // The request the management path builds, without a live provider: store literal, locale derivation, and the
+    // rule that a failure while pulling rows is an incomplete list rather than a shorter result.
+    private static void ManagementListRequest()
+    {
+        Assert((string)ManagementFirewallBackend.BuildListOptions(FirewallPolicyStore.Active).Context["PolicyStore"] == "ActiveStore" &&
+            (string)ManagementFirewallBackend.BuildListOptions(FirewallPolicyStore.Persistent).Context["PolicyStore"] == "PersistentStore" &&
+            ManagementFirewallBackend.BuildListOptions(FirewallPolicyStore.Active).Context.Count == 1,
+            "management list options always name the selected policy store explicitly");
+        Assert(ManagementFirewallBackend.ListLocale(new CultureInfo("zh-CN")) == "MS_804" &&
+            ManagementFirewallBackend.ListLocale(new CultureInfo("en-US")) == "MS_409",
+            "management list locale is MS_<hex LCID> of the given (system UI) culture");
+        Assert(ManagementFirewallBackend.ListLocale(new CultureInfo("zh")) == null &&
+            ManagementFirewallBackend.ListLocale(CultureInfo.InvariantCulture) == null,
+            "neutral and invariant cultures keep the default locale");
+
+        string expectedLocale = ManagementFirewallBackend.ListLocale(CultureInfo.InstalledUICulture);
+        System.Management.ConnectionOptions connection = ManagementFirewallBackend.BuildListConnection();
+        Assert(expectedLocale == null ? connection == null : connection != null && connection.Locale == expectedLocale,
+            "the listing connection takes its WMI locale from the system UI language, not the thread culture");
+
+        IList<FirewallRuleSummary> all = ManagementFirewallBackend.ReadAll(new List<IDictionary<string, object>>(), "ActiveStore");
+        Assert(all.Count == 0, "a completed empty enumeration is an empty list");
+        try
+        {
+            ManagementFirewallBackend.ReadAll(new ThrowingRows(2), "ActiveStore");
+            Assert(false, "a failure while pulling rows must not return the rows read so far");
+        }
+        catch (FirewallListIncompleteException error)
+        {
+            Assert(error.ReadCount == 2 && error.InnerException is InvalidOperationException && error.Message.Contains("ActiveStore") &&
+                error.Message.Contains("2 rule(s)"), "a mid-enumeration failure is an incomplete list that reports how many rules were read");
+        }
+    }
+
+    private static void PowerShellListResultClassification()
+    {
+        const string marker = "classmarker";
+        string good = RuleLine(marker, 0, "a", "n", "1", "1", "2", "7", "1", "s");
+        Assert(PowerShellFirewallBackend.ParseListResult(new DefenderModule.PowerShellRunner.Result(0,
+            "WTF_COUNT_" + marker + ":1\r\n" + good + "WTF_LIST_OK\r\n", ""), marker).Count == 1, "an OK stream decodes");
+
+        try
+        {
+            PowerShellFirewallBackend.ParseListResult(new DefenderModule.PowerShellRunner.Result(0,
+                "WTF_COUNT_" + marker + ":1\r\n" + good, ""), marker);
+            Assert(false, "a stream without the OK marker must not be accepted");
+        }
+        catch (FirewallListIncompleteException error)
+        { Assert(error.InnerException == null, "a missing OK marker is an incomplete list (no permission claim)"); }
+
+        string errLine = "WTF_LIST_ERROR:" + DefenderModule.PowerShellRunner.EncodeValue("Access is denied.") + "\r\n";
+        string[] denied =
+        {
+            "WTF_LIST_ERRCLASS:System.UnauthorizedAccessException:-:-2147024891\r\n",
+            "WTF_LIST_ERRCLASS:Microsoft.Management.Infrastructure.CimException:AccessDenied:-2146233088\r\n",
+            "WTF_LIST_ERRCLASS:System.Management.Automation.RuntimeException:-:-2147217405\r\n"
+        };
+        foreach (string errClass in denied)
+        {
+            try
+            {
+                PowerShellFirewallBackend.ParseListResult(new DefenderModule.PowerShellRunner.Result(1, errClass + errLine, ""), marker);
+                Assert(false, "an ERROR marker must not be accepted");
+            }
+            catch (FirewallListIncompleteException error)
+            {
+                Assert(error.InnerException is UnauthorizedAccessException && error.Message.Contains("Access is denied."),
+                    "powershell access-denied error classes surface as an inner UnauthorizedAccessException with the real text");
+            }
+        }
+        try
+        {
+            PowerShellFirewallBackend.ParseListResult(new DefenderModule.PowerShellRunner.Result(1,
+                "WTF_LIST_ERRCLASS:System.InvalidOperationException:-:-2146233079\r\n" + errLine, ""), marker);
+            Assert(false, "an ERROR marker must not be accepted");
+        }
+        catch (FirewallListIncompleteException error)
+        { Assert(error.InnerException == null, "an ordinary error class is not reported as a permission error"); }
+        // A generic wrapper (observed live for a failed cmdlet: CimJobException, no NativeErrorCode, generic HResult)
+        // is not a permission error; the same wrapper around an inner AccessDenied CimException is.
+        string wrapper = "WTF_LIST_ERRCLASS:Microsoft.PowerShell.Cmdletization.Cim.CimJobException:-:-2146233087\r\n";
+        string failedCim = "WTF_LIST_ERRCLASS:Microsoft.Management.Infrastructure.CimException:Failed:-2146233088\r\n";
+        string deniedCim = "WTF_LIST_ERRCLASS:Microsoft.Management.Infrastructure.CimException:AccessDenied:-2146233088\r\n";
+        foreach (string chain in new[] { wrapper, wrapper + failedCim })
+        {
+            try
+            {
+                PowerShellFirewallBackend.ParseListResult(new DefenderModule.PowerShellRunner.Result(1, chain + errLine, ""), marker);
+                Assert(false, "an ERROR marker must not be accepted");
+            }
+            catch (FirewallListIncompleteException error)
+            { Assert(error.InnerException == null, "a generic wrapper or a non-denied CimException is not a permission error"); }
+        }
+        try
+        {
+            PowerShellFirewallBackend.ParseListResult(new DefenderModule.PowerShellRunner.Result(1, wrapper + deniedCim + errLine, ""), marker);
+            Assert(false, "an ERROR marker must not be accepted");
+        }
+        catch (FirewallListIncompleteException error)
+        { Assert(error.InnerException is UnauthorizedAccessException, "an access-denied cause inside a wrapper chain is recognized"); }
+        string script = PowerShellFirewallBackend.BuildListRulesScript(FirewallPolicyStore.Active, marker);
+        Assert(script.Contains("InnerException"), "the list script reports the whole exception chain");
+        Assert(script.Contains("WTF_LIST_ERRCLASS:") && script.Contains("WTF_LIST_ERROR:") && script.Contains("WTF_LIST_OK"),
+            "list script reports its error class, error text and completion marker");
+    }
+
+    private static void RuleListExecution()
+    {
+        FakeEnumerator enumerator = new FakeEnumerator();
+        enumerator.Rules.Add(Summary("{a}", "Duplicate Name", true));
+        enumerator.Rules.Add(Summary("{b}", "Duplicate Name", false));
+        enumerator.Rules.Add(FirewallRuleListCodec.Build("{c}", "@FirewallAPI.dll,-5", 1, 1, 3, 7, 1, null));
+        FirewallOptions options = FirewallModule.Parse(new[] { "rule", "list", "--store", "persistent", "--transport", "powershell" });
+        FirewallRunEvidence evidence = new FirewallRunEvidence();
+        int code = 0;
+        string text = Capture(delegate
+        {
+            code = FirewallModule.ExecuteList(options, evidence, delegate { return enumerator; });
+            FirewallModule.Assess(options, evidence, code);
+        });
+        Assert(code == 0 && enumerator.Lists == 1 && enumerator.Disposed && enumerator.RequestedStore == FirewallPolicyStore.Persistent,
+            "list runs one enumeration of the selected store and releases the enumerator");
+        Assert(text.Contains("Host") && text.Contains(Environment.MachineName) && text.Contains("powershell") &&
+            text.Contains("persistent - rules in the machine-local persistent store"), "output opens with host, transport and store");
+        Assert(text.Contains("id={a}") && text.Contains("id={b}") && text.Contains("enabled=True") && text.Contains("enabled=False"),
+            "output lists both same-named rules and both enabled states");
+        Assert(text.Contains("READ LIMIT") && text.Contains("Action value 3 not decoded"), "a rule with an undecoded value is marked with its limit");
+        Assert(Regex.IsMatch(text, @"Total rules\s+3") && Regex.IsMatch(text, @"Enabled / disabled\s+2 / 1") &&
+            Regex.IsMatch(text, @"With read limits\s+1") && Regex.IsMatch(text, @"Enumeration\s+COMPLETE"),
+            "output ends with the total and a COMPLETE enumeration status");
+        Assert(text.Contains("FIREWALL_RULES_LISTED") && !text.Contains("OWNERSHIP_CONFIRMED") && !text.Contains("FIREWALL_RULE_CONFIRMED"),
+            "list reports its own result code, not an ownership or add result");
+        Assert(!evidence.MutationAttempted && !evidence.MutationReturned && !evidence.ReadbackConfirmed && !evidence.ListIncomplete, "list evidence: read-only");
+        Assert(!text.Contains("Readback confirmed"), "a list run does not borrow the mutation 'Readback confirmed' wording");
+
+        // Zero rules is a valid answer only after a successful enumeration.
+        enumerator = new FakeEnumerator();
+        options = FirewallModule.Parse(new[] { "rule", "list" });
+        evidence = new FirewallRunEvidence();
+        text = Capture(delegate { code = FirewallModule.ExecuteList(options, evidence, delegate { return enumerator; }); });
+        Assert(code == 0 && enumerator.RequestedStore == FirewallPolicyStore.Active && Regex.IsMatch(text, @"Total rules\s+0") &&
+            Regex.IsMatch(text, @"Enumeration\s+COMPLETE"), "an empty list is reported as zero rules after a successful enumeration");
+
+        // Failure during enumeration: nonzero, INCOMPLETE, no rules printed, real error kept.
+        Exception[] failures =
+        {
+            new FirewallListIncompleteException("stream ended after 2 rule(s)", 2),
+            new FirewallListIncompleteException("provider failed mid-way", 5, new InvalidOperationException("inner")),
+            new FirewallListIncompleteException("RPC server unavailable", 0, new COMException("RPC server unavailable", unchecked((int)0x800706BA)))
+        };
+        foreach (Exception failure in failures)
+        {
+            enumerator = new FakeEnumerator();
+            enumerator.Rules.Add(Summary("{leaked}", "Must not be printed", true));
+            enumerator.Failure = failure;
+            evidence = new FirewallRunEvidence();
+            text = Capture(delegate
+            {
+                code = FirewallModule.ExecuteList(options, evidence, delegate { return enumerator; });
+                FirewallModule.Assess(options, evidence, code);
+            });
+            Assert(code == 1 && evidence.ListIncomplete && enumerator.Disposed && evidence.Outcome.Contains("INCOMPLETE") &&
+                evidence.Outcome.Contains(failure.Message), "enumeration failure is nonzero and reports the incomplete list with the real error");
+            Assert(text.Contains("FIREWALL_RULES_INCOMPLETE") && !text.Contains("FIREWALL_RULES_LISTED") && !text.Contains("{leaked}") &&
+                !Regex.IsMatch(text, @"Total rules") && !Regex.IsMatch(text, @"Enumeration\s+COMPLETE"),
+                "a failed enumeration prints no rules, no total and no COMPLETE status");
+            Assert(!evidence.MutationAttempted, "a failed enumeration attempted no mutation");
+        }
+
+        // Permission failures in the shapes the real backends produce: management and powershell both wrap the
+        // cause (a ManagementException/COMException, or the UnauthorizedAccessException ParseListResult builds
+        // from the script's reported error class) in FirewallListIncompleteException.
+        Exception[] denials =
+        {
+            new FirewallListIncompleteException("failed after 0 rule(s): Access is denied.", -1, new UnauthorizedAccessException("Access is denied.")),
+            new FirewallListIncompleteException("failed after 0 rule(s): Access is denied.", 0, new COMException("Access is denied.", unchecked((int)0x80070005)))
+        };
+        foreach (Exception denial in denials)
+        {
+            enumerator = new FakeEnumerator();
+            enumerator.Failure = denial;
+            evidence = new FirewallRunEvidence();
+            Capture(delegate { code = FirewallModule.ExecuteList(options, evidence, delegate { return enumerator; }); });
+            Assert(code == 1 && evidence.ListIncomplete && evidence.Outcome.Contains("Permission error") && evidence.Outcome.Contains("Access is denied."),
+                "a permission failure in the real wrapped shape is reported as one, with the actual error text");
+        }
+
+        // A raw exception from ListRules never came from an enumeration that started (both real backends wrap
+        // everything after that point): plain operation error, not 'incomplete'.
+        foreach (Exception raw in new Exception[] { new InvalidOperationException("provider failed"), new NotSupportedException("Could not start powershell.exe") })
+        {
+            enumerator = new FakeEnumerator();
+            enumerator.Failure = raw;
+            evidence = new FirewallRunEvidence();
+            text = Capture(delegate
+            {
+                code = FirewallModule.ExecuteList(options, evidence, delegate { return enumerator; });
+                FirewallModule.Assess(options, evidence, code);
+            });
+            Assert(code == 1 && !evidence.ListIncomplete && text.Contains("FIREWALL_OPERATION_ERROR") && !text.Contains("Total rules"),
+                "an error before any rule was read is a plain operation error and prints no list");
+        }
+
+        // WMI checks namespace access at connect/query time, i.e. before any rule is read: the label must appear
+        // whether the denial comes from the factory (constructor Connect) or from ListRules itself (localized
+        // Connect / ExecQuery), while the result code stays OPERATION_ERROR because no enumeration began. It must
+        // also be found through a wrapper chain.
+        Exception[] earlyDenials =
+        {
+            new UnauthorizedAccessException("Access is denied."),
+            new InvalidOperationException("Access is denied. (wrapped)", new UnauthorizedAccessException("inner")),
+            new COMException("Access is denied.", unchecked((int)0x80070005))
+        };
+        foreach (Exception denial in earlyDenials)
+        {
+            foreach (bool inFactory in new[] { true, false })
+            {
+                enumerator = new FakeEnumerator();
+                enumerator.Failure = denial;
+                evidence = new FirewallRunEvidence();
+                text = Capture(delegate
+                {
+                    if (inFactory) { code = FirewallModule.ExecuteList(options, evidence, delegate { throw denial; }); }
+                    else { code = FirewallModule.ExecuteList(options, evidence, delegate { return enumerator; }); }
+                    FirewallModule.Assess(options, evidence, code);
+                });
+                Assert(code == 1 && !evidence.ListIncomplete && text.Contains("FIREWALL_OPERATION_ERROR") &&
+                    evidence.Outcome.Contains("Permission error") && evidence.Outcome.Contains("Access is denied.") &&
+                    !evidence.Outcome.Contains("INCOMPLETE"),
+                    "a denied read before enumeration began is labelled a permission error with an operation-error result code");
+            }
+        }
+        Assert(!FirewallModule.IsPermissionDenied(new InvalidOperationException("x", new NotSupportedException("y"))) &&
+            !FirewallModule.IsPermissionDenied(null), "ordinary exceptions are not permission errors");
+
+        // Verbose assessment of a list carries read-only guidance, not the rule-change (add/remove) guidance.
+        options = FirewallModule.Parse(new[] { "rule", "list", "--verbose" });
+        evidence = new FirewallRunEvidence();
+        text = Capture(delegate
+        {
+            code = FirewallModule.ExecuteList(options, evidence, delegate { return new FakeEnumerator(); });
+            FirewallModule.Assess(options, evidence, code);
+        });
+        Assert(code == 0 && text.Contains("A rule list changes no rule") && !text.Contains("correlate the exact test rule name") &&
+            !text.Contains("verify exact cleanup") && !text.Contains("Do not disable Firewall"),
+            "verbose list output does not carry mutation-oriented guidance");
+        options = FirewallModule.Parse(new[] { "rule", "list" });
+
+        // Backend construction failure (module missing, WMI unavailable) is an error, but no enumeration began.
+        evidence = new FirewallRunEvidence();
+        text = Capture(delegate
+        {
+            code = FirewallModule.ExecuteList(options, evidence, delegate { throw new NotSupportedException("NetSecurity unavailable"); });
+            FirewallModule.Assess(options, evidence, code);
+        });
+        Assert(code == 1 && !evidence.ListIncomplete && text.Contains("FIREWALL_OPERATION_ERROR") &&
+            evidence.Outcome.Contains("NetSecurity unavailable") && evidence.Outcome.Contains("initialization"),
+            "an unavailable backend is a plain operation error, not an 'incomplete list'");
+
+        // A list run needs no administrator token: ExecuteList has no elevation gate to consult, and the ownership
+        // path (FindByName/PrepareAdd/Add/Remove) is not reachable from IFirewallRuleEnumerator.
+    }
+
+    // -Integration only: read-only. Lists both supported transports for both stores and cross-checks them.
+    // Differences are printed and fail the run (after one re-read, since dynamic rules can change between
+    // two reads); the run never calls any add/remove path.
+    private static int RuleListReadOnly()
+    {
+        ConsoleUi.Configure(false, true);
+        IList<FirewallRuleSummary> persistentBefore = null;
+        foreach (FirewallPolicyStore store in new[] { FirewallPolicyStore.Active, FirewallPolicyStore.Persistent })
+        {
+            IList<FirewallRuleSummary> management = null, powershell = null;
+            IList<string> differences = null;
+            for (int attempt = 0; attempt < 2; attempt++)
+            {
+                using (IFirewallRuleEnumerator backend = FirewallModule.CreateEnumerator("management")) { management = backend.ListRules(store); }
+                using (IFirewallRuleEnumerator backend = FirewallModule.CreateEnumerator("powershell")) { powershell = backend.ListRules(store); }
+                differences = CompareRuleLists(management, powershell);
+                if (differences.Count == 0) { break; }
+            }
+            foreach (string difference in differences) { Console.WriteLine("DIFF (" + FirewallRuleListCodec.StoreLabel(store) + "): " + difference); }
+            Assert(differences.Count == 0, FirewallRuleListCodec.StoreLabel(store) + " store: management and powershell agree on count and key fields");
+            int limited = 0, disabled = 0;
+            foreach (FirewallRuleSummary rule in management)
+            {
+                if (rule.Limits.Count != 0) { limited++; }
+                if (rule.Enabled == "False") { disabled++; }
+            }
+            Assert(management.Count > 0 && disabled > 0, FirewallRuleListCodec.StoreLabel(store) + " store lists rules including disabled ones");
+            Console.WriteLine(FirewallRuleListCodec.StoreLabel(store) + " store: " + management.Count + " rule(s) via management and " +
+                powershell.Count + " via powershell; " + disabled + " disabled; " + limited + " with a read limit.");
+            int dynamic = 0;
+            foreach (FirewallRuleSummary rule in management)
+            {
+                if (rule.Source.StartsWith("Dynamic", StringComparison.Ordinal)) { dynamic++; }
+            }
+            // Dynamic rules live only in the active view. If either transport ignored the requested store, this
+            // (or the cross-check above) would fail on any host that has such rules.
+            Assert(store == FirewallPolicyStore.Active || dynamic == 0, "persistent store lists no Dynamic-source rule");
+            if (store == FirewallPolicyStore.Persistent) { persistentBefore = management; }
+        }
+        foreach (string transport in new[] { "management", "powershell" })
+        {
+            int code = 0;
+            string text = Capture(delegate { code = FirewallModule.Main(new[] { "rule", "list", "--store", "persistent", "--transport", transport, "--no-color" }); });
+            Assert(code == 0 && text.Contains("FIREWALL_RULES_LISTED") && Regex.IsMatch(text, @"Enumeration\s+COMPLETE"),
+                transport + " CLI list run completes with its own result code");
+        }
+        IList<FirewallRuleSummary> persistentAfter;
+        using (IFirewallRuleEnumerator backend = FirewallModule.CreateEnumerator("management")) { persistentAfter = backend.ListRules(FirewallPolicyStore.Persistent); }
+        Assert(CompareRuleLists(persistentBefore, persistentAfter).Count == 0, "listing left the persistent store unchanged");
+        Console.WriteLine("Rule list read-only checks passed: no add/remove path was called.");
+        return 0;
+    }
+
+    // Groups by rule id (an id is unique; a display name is not) and compares every summary field. A rule
+    // present on only one side, or a different total, is a difference.
+    private static IList<string> CompareRuleLists(IList<FirewallRuleSummary> left, IList<FirewallRuleSummary> right)
+    {
+        List<string> differences = new List<string>();
+        if (left.Count != right.Count) { differences.Add("count " + left.Count + " vs " + right.Count); }
+        Dictionary<string, List<FirewallRuleSummary>> byId = GroupById(left);
+        Dictionary<string, List<FirewallRuleSummary>> other = GroupById(right);
+        foreach (KeyValuePair<string, List<FirewallRuleSummary>> entry in byId)
+        {
+            List<FirewallRuleSummary> match;
+            if (!other.TryGetValue(entry.Key, out match)) { differences.Add("only in first: " + entry.Key); continue; }
+            if (entry.Value.Count != match.Count) { differences.Add("id " + entry.Key + " occurs " + entry.Value.Count + " vs " + match.Count + " times"); continue; }
+            entry.Value.Sort(delegate(FirewallRuleSummary a, FirewallRuleSummary b) { return string.CompareOrdinal(Describe(a), Describe(b)); });
+            match.Sort(delegate(FirewallRuleSummary a, FirewallRuleSummary b) { return string.CompareOrdinal(Describe(a), Describe(b)); });
+            for (int i = 0; i < match.Count; i++)
+            {
+                if (Describe(entry.Value[i]) != Describe(match[i]))
+                { differences.Add("id " + entry.Key + ": [" + Describe(entry.Value[i]) + "] vs [" + Describe(match[i]) + "]"); }
+            }
+        }
+        foreach (string key in other.Keys) { if (!byId.ContainsKey(key)) { differences.Add("only in second: " + key); } }
+        return differences;
+    }
+
+    private static Dictionary<string, List<FirewallRuleSummary>> GroupById(IList<FirewallRuleSummary> rules)
+    {
+        Dictionary<string, List<FirewallRuleSummary>> map = new Dictionary<string, List<FirewallRuleSummary>>(StringComparer.Ordinal);
+        foreach (FirewallRuleSummary rule in rules)
+        {
+            List<FirewallRuleSummary> list;
+            if (!map.TryGetValue(rule.Id, out list)) { list = new List<FirewallRuleSummary>(); map[rule.Id] = list; }
+            list.Add(rule);
+        }
+        return map;
+    }
+
+    private static string Describe(FirewallRuleSummary rule)
+    {
+        return rule.DisplayName + " | " + rule.Enabled + " | " + rule.Direction + " | " + rule.Action + " | " + rule.Profiles +
+            " | " + rule.Source + " | limits=" + rule.Limits.Count;
     }
 
     private static string BuildValidPowerShellRuleFixture(string marker)

@@ -19,6 +19,8 @@ internal sealed class FirewallOptions : ControlOptions
 {
     internal string Operation;
     internal string Transport = "com";
+    internal bool TransportSpecified;
+    internal FirewallPolicyStore Store = FirewallPolicyStore.Active;
     internal Guid Id;
     internal bool GeneratedId;
     internal string RemoteAddress;
@@ -54,6 +56,7 @@ internal sealed class FirewallRunEvidence : ControlRunEvidence
     internal bool AlreadyAbsent;
     internal int FrozenProfiles;
     internal int? PolicyModifyState;
+    internal bool ListIncomplete;
     internal string Outcome = "Not started; no mutation attempted.";
 }
 
@@ -158,7 +161,12 @@ internal static partial class FirewallModule
         if (options.Help) { Help(); return 0; }
         FirewallRunEvidence evidence = new FirewallRunEvidence();
         return ControlRuntime.Execute(options, evidence,
-            delegate { return Execute(options, evidence, delegate { return CreateBackend(options.Transport); }, IsAdministrator); },
+            delegate
+            {
+                return options.Kind == ControlKind.FirewallRuleList ?
+                    ExecuteList(options, evidence, delegate { return CreateEnumerator(options.Transport); }) :
+                    Execute(options, evidence, delegate { return CreateBackend(options.Transport); }, IsAdministrator);
+            },
             delegate(int exitCode) { Assess(options, evidence, exitCode); });
     }
 
@@ -172,6 +180,19 @@ internal static partial class FirewallModule
             case "powershell": return new PowerShellFirewallBackend();
             case "cmd": return new CmdFirewallBackend();
             default: throw new FirewallRefusalException("Unknown Firewall transport; no fallback.");
+        }
+    }
+
+    // Only transports that can name the policy store explicitly and enumerate every rule: management (WMI
+    // PolicyStore context) and powershell (Get-NetFirewallRule -PolicyStore). com/native/cmd are refused
+    // here as well as in Parse, so no caller can reach an unvetted enumeration path.
+    internal static IFirewallRuleEnumerator CreateEnumerator(string transport)
+    {
+        switch (transport)
+        {
+            case "management": return new ManagementFirewallBackend();
+            case "powershell": return new PowerShellFirewallBackend();
+            default: throw new FirewallRefusalException("Rule list supports only the management and powershell transports; no fallback.");
         }
     }
 
@@ -202,13 +223,15 @@ internal static partial class FirewallModule
         else if (args.Length >= 2 && string.Equals(args[0], "rule", StringComparison.OrdinalIgnoreCase))
         {
             options.Operation = args[1].ToLowerInvariant();
-            if (options.Operation != "add" && options.Operation != "check" && options.Operation != "remove")
+            if (options.Operation != "add" && options.Operation != "check" && options.Operation != "remove" &&
+                options.Operation != "list")
             {
-                throw new ArgumentException("Expected rule add, rule check, or rule remove.");
+                throw new ArgumentException("Expected rule add, rule check, rule remove, or rule list.");
             }
+            if (options.Operation == "list") { options.Kind = ControlKind.FirewallRuleList; }
             start = 2;
         }
-        else { throw new ArgumentException("Expected firewall rule add|check|remove or firewall profiles."); }
+        else { throw new ArgumentException("Expected firewall rule add|check|remove|list or firewall profiles."); }
 
         HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         HashSet<string> allSeen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -222,6 +245,7 @@ internal static partial class FirewallModule
             {
                 if (i + 1 >= args.Length) { throw new ArgumentException("--transport requires com, native, management, powershell, or cmd."); }
                 options.Transport = args[++i].ToLowerInvariant();
+                options.TransportSpecified = true;
                 if (options.Transport != "com" && options.Transport != "native" && options.Transport != "management" &&
                     options.Transport != "powershell" && options.Transport != "cmd")
                 {
@@ -230,6 +254,17 @@ internal static partial class FirewallModule
                 continue;
             }
             if (options.Kind == ControlKind.FirewallProfiles) { throw new ArgumentException("Unknown profiles option: " + key); }
+            if (key == "--store")
+            {
+                if (options.Operation != "list") { throw new ArgumentException("--store is valid only for rule list."); }
+                if (i + 1 >= args.Length) { throw new ArgumentException("--store requires active or persistent."); }
+                options.Store = ParseStore(args[++i]);
+                continue;
+            }
+            if (options.Operation == "list")
+            {
+                throw new ArgumentException("Rule list accepts only --store, --transport and common options.");
+            }
             if (key != "--id" && options.Operation != "add")
             {
                 throw new ArgumentException("Check/remove accept only --id, --transport and common options; check does not compare an add request.");
@@ -263,6 +298,18 @@ internal static partial class FirewallModule
         CommonArguments.Validate(options, seen);
         if (options.Help) { return options; }
         if (options.Kind == ControlKind.FirewallProfiles) { return options; }
+        if (options.Operation == "list")
+        {
+            // Listing has its own default (management) instead of the module-wide com default, and only
+            // transports that can select the policy store and enumerate every rule are accepted.
+            if (!options.TransportSpecified) { options.Transport = "management"; }
+            else if (options.Transport != "management" && options.Transport != "powershell")
+            {
+                throw new ArgumentException("Rule list supports --transport management or powershell; " +
+                    options.Transport + " cannot enumerate a selected policy store. No fallback.");
+            }
+            return options;
+        }
         if (options.Operation == "add")
         {
             if (options.RemoteAddress == null || (options.Direction == 2 ? options.RemotePort == 0 : options.LocalPort == 0))
@@ -274,6 +321,13 @@ internal static partial class FirewallModule
         }
         else if (options.Id == Guid.Empty) { throw new ArgumentException("Check/remove require --id GUID."); }
         return options;
+    }
+
+    private static FirewallPolicyStore ParseStore(string value)
+    {
+        if (string.Equals(value, "active", StringComparison.OrdinalIgnoreCase)) { return FirewallPolicyStore.Active; }
+        if (string.Equals(value, "persistent", StringComparison.OrdinalIgnoreCase)) { return FirewallPolicyStore.Persistent; }
+        throw new ArgumentException("--store requires active or persistent.");
     }
 
     private static bool IsHelp(string value)
@@ -390,15 +444,7 @@ internal static partial class FirewallModule
     {
         try
         {
-            ConsoleUi.Section("Run");
-            ConsoleUi.Row("Control", options.Kind == ControlKind.FirewallProfiles ? "Windows Firewall / Profiles" : "Windows Firewall / Rules");
-            ConsoleUi.Row("Operation", options.Operation);
-            ConsoleUi.Row("Transport", options.Transport);
-            ConsoleUi.Row("Route", RouteDescription(options));
-            ConsoleUi.Row("Run ID", evidence.RunId);
-            ConsoleUi.Row("Start UTC", evidence.StartUtc.ToString("O", CultureInfo.InvariantCulture));
-            ConsoleUi.Row("Host / PID", Environment.MachineName + " / " + evidence.ProcessId);
-            using (WindowsIdentity identity = WindowsIdentity.GetCurrent()) { ConsoleUi.Row("Identity", identity.Name); }
+            ShowRun(options, evidence);
             bool mutation = options.Operation == "add" || options.Operation == "remove";
             evidence.Stage = "Firewall preflight";
             if (mutation && !isAdministrator())
@@ -435,6 +481,124 @@ internal static partial class FirewallModule
         catch (EntryPointNotFoundException error) { return NativeLoadFailure(evidence, error); }
     }
 
+    private static void ShowRun(FirewallOptions options, FirewallRunEvidence evidence)
+    {
+        ConsoleUi.Section("Run");
+        ConsoleUi.Row("Control", options.Kind == ControlKind.FirewallProfiles ? "Windows Firewall / Profiles" : "Windows Firewall / Rules");
+        ConsoleUi.Row("Operation", options.Operation);
+        ConsoleUi.Row("Transport", options.Transport);
+        ConsoleUi.Row("Route", RouteDescription(options));
+        ConsoleUi.Row("Run ID", evidence.RunId);
+        ConsoleUi.Row("Start UTC", evidence.StartUtc.ToString("O", CultureInfo.InvariantCulture));
+        ConsoleUi.Row("Host / PID", Environment.MachineName + " / " + evidence.ProcessId);
+        using (WindowsIdentity identity = WindowsIdentity.GetCurrent()) { ConsoleUi.Row("Identity", identity.Name); }
+    }
+
+    // "firewall rule list": strictly read-only inventory of one policy store through an enumeration-only
+    // backend. It never takes the administrator gate (a read that the current identity cannot complete
+    // reports the real permission error instead), never touches the add/remove/ownership path, and never
+    // prints a partial list: any failure once enumeration has begun is reported as INCOMPLETE with a
+    // nonzero exit, and an empty list is only ever reported after enumeration finished successfully.
+    internal static int ExecuteList(FirewallOptions options, FirewallRunEvidence evidence,
+        Func<IFirewallRuleEnumerator> createEnumerator)
+    {
+        try
+        {
+            ShowRun(options, evidence);
+            string store = FirewallRuleListCodec.StoreLabel(options.Store);
+            ConsoleUi.Section("Firewall rule list (read-only)");
+            ConsoleUi.Row("Host", Environment.MachineName);
+            ConsoleUi.Row("Transport", options.Transport);
+            ConsoleUi.Row("Store", store + " - " + FirewallRuleListCodec.StoreMeaning(options.Store));
+            evidence.Stage = "Firewall " + options.Transport + " enumerator initialization";
+            using (IFirewallRuleEnumerator enumerator = createEnumerator())
+            {
+                evidence.Stage = "Firewall rule enumeration (" + store + " store, " + options.Transport + ")";
+                IList<FirewallRuleSummary> rules;
+                try { rules = enumerator.ListRules(options.Store); }
+                catch (Exception error)
+                {
+                    // Both real backends wrap every failure after enumeration has started in
+                    // FirewallListIncompleteException; anything else (the powershell child could not be
+                    // started, the localized WMI connection failed) happened before any rule was read and
+                    // is an ordinary operation error, not an incomplete list.
+                    if (!(error is FirewallListIncompleteException)) { return ListFailure(evidence, error, false); }
+                    evidence.ListIncomplete = true;
+                    ConsoleUi.Row("Enumeration", "INCOMPLETE - no rules are listed; do not treat this as an inventory");
+                    return ListFailure(evidence, error, true);
+                }
+                if (rules == null)
+                {
+                    evidence.ListIncomplete = true;
+                    ConsoleUi.Row("Enumeration", "INCOMPLETE - no rules are listed; do not treat this as an inventory");
+                    return ListFailure(evidence, new InvalidOperationException("The enumerator returned no result."), true);
+                }
+                ShowRuleList(rules);
+                evidence.Outcome = "Rule list complete: " + rules.Count.ToString(CultureInfo.InvariantCulture) +
+                    " rule(s) read from the " + store + " store via " + options.Transport + "; nothing was modified.";
+                return 0;
+            }
+        }
+        catch (Exception error) { return ListFailure(evidence, error, false); }
+    }
+
+    // Every failure path of a list run ends here. The result code depends only on whether enumeration had
+    // begun (incomplete: true -> FIREWALL_RULES_INCOMPLETE; false -> FIREWALL_OPERATION_ERROR); the permission
+    // label is independent of that, because WMI checks namespace access at connect/query time, i.e. usually
+    // before the first rule is read. The real error text is always kept.
+    private static int ListFailure(FirewallRunEvidence evidence, Exception error, bool incomplete)
+    {
+        int result = Failure(evidence, error);
+        evidence.Outcome = (IsPermissionDenied(error) ? "Permission error: the current identity could not read this store. " : "") +
+            (incomplete ? "Rule list INCOMPLETE. " : "") + evidence.Outcome;
+        return result;
+    }
+
+    // True when the exception or any exception in its InnerException chain is an access-denied failure.
+    internal static bool IsPermissionDenied(Exception error)
+    {
+        for (int depth = 0; error != null && depth < 8; depth++, error = error.InnerException)
+        {
+            if (error is UnauthorizedAccessException) { return true; }
+            ManagementException management = error as ManagementException;
+            if (management != null && management.ErrorCode == ManagementStatus.AccessDenied) { return true; }
+            COMException com = error as COMException;
+            if (com != null && (com.HResult == unchecked((int)0x80070005) || com.HResult == unchecked((int)0x80041003))) { return true; }
+        }
+        return false;
+    }
+
+    private static void ShowRuleList(IList<FirewallRuleSummary> rules)
+    {
+        int enabled = 0, disabled = 0, limited = 0;
+        ConsoleUi.Section("Rules");
+        for (int i = 0; i < rules.Count; i++)
+        {
+            FirewallRuleSummary rule = rules[i];
+            if (rule.Enabled == "True") { enabled++; }
+            else if (rule.Enabled == "False") { disabled++; }
+            ConsoleUi.Row("#" + (i + 1).ToString(CultureInfo.InvariantCulture),
+                FirewallRuleListCodec.Clean(rule.DisplayName) + " | id=" + FirewallRuleListCodec.Clean(rule.Id) +
+                " | enabled=" + rule.Enabled + " | " + rule.Direction + " | " + rule.Action +
+                " | profiles=" + rule.Profiles + " | source=" + FirewallRuleListCodec.Clean(rule.Source));
+            if (rule.Limits.Count != 0)
+            {
+                limited++;
+                ConsoleUi.Row("", "READ LIMIT: " + string.Join("; ", rule.Limits.ToArray()));
+            }
+        }
+        ConsoleUi.Section("Summary");
+        ConsoleUi.Row("Total rules", rules.Count.ToString(CultureInfo.InvariantCulture));
+        ConsoleUi.Row("Enabled / disabled", enabled.ToString(CultureInfo.InvariantCulture) + " / " + disabled.ToString(CultureInfo.InvariantCulture));
+        ConsoleUi.Row("With read limits", limited.ToString(CultureInfo.InvariantCulture));
+        ConsoleUi.Row("Enumeration", "COMPLETE");
+        if (limited != 0)
+        {
+            ConsoleUi.Status("WARN", limited.ToString(CultureInfo.InvariantCulture) +
+                " rule(s) carry a READ LIMIT: a value could not be read or decoded and is shown as Unavailable/Unknown.");
+        }
+    }
+
     // management touches different WMI classes for profiles (MSFT_NetFirewallProfile /
     // MSFT_NetConnectionProfile) than for rule add/check/remove (MSFT_NetFirewallRule and its
     // MSFT_Net*Filter associations); naming MSFT_NetFirewallRule unconditionally would overclaim
@@ -442,6 +606,13 @@ internal static partial class FirewallModule
     private static string RouteDescription(FirewallOptions options)
     {
         if (options.Transport == "native") { return "P/Invoke -> C++ INetFwPolicy2 / INetFwRule3 -> Windows Firewall"; }
+        if (options.Kind == ControlKind.FirewallRuleList)
+        {
+            string providerStore = FirewallRuleListCodec.StoreProviderName(options.Store);
+            return options.Transport == "management" ?
+                "System.Management -> WMI root\\StandardCimv2 MSFT_NetFirewallRule (PolicyStore=" + providerStore + ") -> Windows Firewall" :
+                "Process -> powershell.exe -> Get-NetFirewallRule -PolicyStore " + providerStore + " (NetSecurity module) -> WMI";
+        }
         if (options.Transport == "management")
         {
             return options.Kind == ControlKind.FirewallProfiles ?
@@ -491,8 +662,9 @@ internal static partial class FirewallModule
         if (exitCode == 4) { evidence.Outcome = "ETW setup failed; firewall operation was not run."; }
         string code = exitCode == 4 ? "FIREWALL_NOT_ATTEMPTED" :
             exitCode == 3 ? "FIREWALL_RULE_UNCONFIRMED" :
-            exitCode != 0 ? "FIREWALL_OPERATION_ERROR" :
+            exitCode != 0 ? (evidence.ListIncomplete ? "FIREWALL_RULES_INCOMPLETE" : "FIREWALL_OPERATION_ERROR") :
             options.Kind == ControlKind.FirewallProfiles ? "FIREWALL_PROFILES_READ" :
+            options.Kind == ControlKind.FirewallRuleList ? "FIREWALL_RULES_LISTED" :
             options.Operation == "add" ? "FIREWALL_RULE_CONFIRMED" :
             options.Operation == "check" ? "FIREWALL_RULE_OWNERSHIP_CONFIRMED" :
             evidence.AlreadyAbsent ? "FIREWALL_RULE_ALREADY_ABSENT" : "FIREWALL_RULE_REMOVED";
@@ -502,7 +674,10 @@ internal static partial class FirewallModule
         ConsoleUi.Status(exitCode == 0 ? "OK" : exitCode == 3 ? "WARN" : "FAIL", evidence.Outcome, exitCode != 0);
         ConsoleUi.Row("Mutation attempted", evidence.MutationAttempted.ToString());
         ConsoleUi.Row("Mutation returned", evidence.MutationReturned.ToString());
-        ConsoleUi.Row("Readback confirmed", evidence.ReadbackConfirmed.ToString());
+        // "Readback confirmed" means a post-mutation readback matched; a list run mutates nothing and
+        // reports its own "Enumeration" status above instead.
+        if (options.Kind != ControlKind.FirewallRuleList)
+        { ConsoleUi.Row("Readback confirmed", evidence.ReadbackConfirmed.ToString()); }
         if (evidence.Lifecycle != null)
         {
             ConsoleUi.Row("Lifecycle", "probe=" + evidence.Lifecycle.Probe +
@@ -513,6 +688,11 @@ internal static partial class FirewallModule
         }
         ConsoleUi.Text("Configuration evidence only: no claim of traffic enforcement, effective GPO/MDM precedence, " +
             "or local-rule merge acceptance. Firewall enablement is never changed; WFP filters are never manipulated.");
+        if (options.Kind == ControlKind.FirewallRuleList)
+        {
+            ConsoleUi.Text("Rule list is an inventory summary of one policy store: not profile settings, IPsec rules or WFP filters, " +
+                "and not every address/port/program/security condition of each rule. It does not show which traffic is allowed or blocked.");
+        }
         ConsoleUi.Text("Compliance: NOT_ASSESSED | Detection/response: NOT_MEASURED");
         if (options.Kind == ControlKind.FirewallRule && options.Id != Guid.Empty && evidence.MutationAttempted)
         {
@@ -525,6 +705,16 @@ internal static partial class FirewallModule
         }
         ConsoleUi.Section("Firewall Detection & Response");
         ConsoleUi.Row("End UTC", evidence.OperationEndUtc.ToString("O", CultureInfo.InvariantCulture));
+        if (options.Kind == ControlKind.FirewallRuleList)
+        {
+            // A read-only list changes no rule, so the rule-change guidance below (add/modify/delete events,
+            // retained test ID, cleanup) does not apply to it.
+            ConsoleUi.Text("A rule list changes no rule: WFAS 2004/2005/2006 and Security 4946/4947/4948 rule-change events are not expected from it.");
+            ConsoleUi.Text("The read itself is visible only as process, WMI or PowerShell activity: Security 4688, Sysmon 1 or EDR process telemetry for wtf.exe" +
+                " (and powershell.exe for --transport powershell) and PowerShell logging. WMI-Activity/Operational mostly records failures and provider loads, so a successful read may leave nothing there. Missing events do not prove no detection.");
+            ConsoleUi.Text("An inventory is configuration evidence for one store at one moment. It is not proof of traffic handling or of the GPO/MDM-merged result.");
+            return;
+        }
         ConsoleUi.Text("WFAS/Firewall events 2004/2005/2006 describe rule add/modify/delete; correlate the exact test rule name.");
         ConsoleUi.Text("Security 4946/4947/4948 require applicable firewall policy-change auditing. Missing events do not prove no detection.");
         ConsoleUi.Text("Use Security 4688, Sysmon 1 or EDR process telemetry to investigate the initiating user, image and parent.");
@@ -701,7 +891,7 @@ internal static partial class FirewallModule
         ConsoleUi.Text("wtf.exe firewall <command> [options]");
         ConsoleUi.Section("Options");
         ConsoleUi.Row("--transport", "com|native|management|powershell|cmd  (default: com; no automatic fallback)");
-        ConsoleUi.Row("--id", "Test GUID: generated for add; required for check/remove.");
+        ConsoleUi.Row("--store", "active|persistent  (rule list only; default: active)");        ConsoleUi.Row("--id", "Test GUID: generated for add; required for check/remove.");
         ConsoleUi.Row("--remote-address", "One literal IPv4/IPv6 address  (required for add)");
         ConsoleUi.Row("--remote-port", "1..65535  (required outbound; optional inbound, default: all)");
         ConsoleUi.Row("--direction", "in|out  (add only; default: out)");
@@ -715,6 +905,7 @@ internal static partial class FirewallModule
         ConsoleUi.Row("rule add", "Create a marked test rule; never overwrite an existing name.");
         ConsoleUi.Row("rule check", "Read-only: verify ownership and display current properties.");
         ConsoleUi.Row("rule remove", "Remove only a uniquely owned rule; already absent is OK.");
+        ConsoleUi.Row("rule list", "Read-only: list all rules of one store (management|powershell).");
         ConsoleUi.Row("profiles", "Read-only: inspect profile settings; never change them.");
         ConsoleUi.Section("Routes");
         ConsoleUi.Row("com", "C# COM interop -> INetFwPolicy2 / INetFwRule3");
@@ -734,6 +925,7 @@ internal static partial class FirewallModule
         ConsoleUi.Text("Add a test rule (administrator required; retain the printed ID):");
         ConsoleUi.Text("  .\\wtf.exe firewall rule add --remote-address 192.0.2.10 --remote-port 44443");
         ConsoleUi.Text("Inbound: use --direction in --remote-address IP --local-port 443 (source port optional).");
+        ConsoleUi.Text("List rules (read-only): .\\wtf.exe firewall rule list --store persistent");
         ConsoleUi.Text("Check / cleanup (replace <GUID> with the test ID):");
         ConsoleUi.Text("  .\\wtf.exe firewall rule check --id <GUID>");
         ConsoleUi.Text("  .\\wtf.exe firewall rule remove --id <GUID>");
@@ -748,7 +940,15 @@ internal static partial class FirewallModule
         ConsoleUi.Status("WARN", "Authorized testing only; no Firewall Off, profile mutation or automatic cleanup.");
         if (!ConsoleUi.Verbose) { return; }
         ConsoleUi.Section("Extended notes");
-        ConsoleUi.Text("--transport applies to add/check/remove/profiles. Native rule operations execute in C++, not C# COM.");
+        ConsoleUi.Text("--transport applies to add/check/remove/list/profiles. Native rule operations execute in C++, not C# COM.");
+        ConsoleUi.Text("rule list supports only --transport management (default) and powershell: both can name the policy store " +
+            "explicitly. com, native and cmd are refused, not substituted. --store active is the provider's ActiveStore view (the " +
+            "GPO/MDM merge outcome is not established); --store persistent is the machine-local persistent store. The list is a summary (id, name, enabled, direction, " +
+            "action, profiles, policy source): it does not decode addresses, ports, programs or security conditions, and it does not " +
+            "show effective traffic behavior. A rule with an undecodable value is listed with a READ LIMIT note. Any failure during " +
+            "enumeration reports INCOMPLETE and exits 1; the list is never printed partially, and zero rules is only reported after a " +
+            "successful enumeration. management resolves built-in rules' MUI resource names (as powershell does); one that cannot " +
+            "be resolved is flagged. It never calls the add/remove path and does not require administrator rights.");
         ConsoleUi.Text("com/native/management/powershell share the same ownership schema; any of the four can inspect/clean " +
             "up a rule created by another. cmd cannot stamp Grouping (see Routes above), so use --transport cmd " +
             "consistently for a rule it created; the other four will refuse it as a Grouping mismatch.");

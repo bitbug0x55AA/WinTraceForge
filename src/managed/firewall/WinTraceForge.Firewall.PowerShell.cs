@@ -23,7 +23,7 @@ using System.Text;
 // See DefenderModule.PowerShellRunner's own remarks for the full set of process-execution hardening
 // measures (absolute executable path, restricted module path, -EncodedCommand, Base64-encoded values)
 // this backend reuses wholesale rather than duplicating.
-internal sealed class PowerShellFirewallBackend : IFirewallBackend
+internal sealed class PowerShellFirewallBackend : IFirewallBackend, IFirewallRuleEnumerator
 {
     // Shared by every script this backend builds -- see BuildXScript() and PowerShellScriptProloguesAreApplied
     // in Firewall.RegressionTests.cs, which asserts each builder's output actually starts with this exact
@@ -373,6 +373,160 @@ internal sealed class PowerShellFirewallBackend : IFirewallBackend
         List<FirewallRuleData> rules = new List<FirewallRuleData>();
         foreach (Dictionary<string, List<string>> fields in byIndex) { rules.Add(DecodeRule(fields)); }
         return rules;
+    }
+
+    // Read-only inventory: NetSecurity\Get-NetFirewallRule -PolicyStore <store> and nothing else. One
+    // stdout line per rule, every text value Base64 (a rule name may hold any character, including the
+    // ':' delimiter or a line break), every enum value cast to [int] first so it is the raw provider
+    // value ManagementFirewallBackend reads directly. "~" marks a value the script could not read; that
+    // becomes a per-rule read limit, never a dropped field. A failed cmdlet, a missing completion marker
+    // or a stream that disagrees with its own declared count is an incomplete list, not a short one.
+    public IList<FirewallRuleSummary> ListRules(FirewallPolicyStore store)
+    {
+        string marker = Guid.NewGuid().ToString("N");
+        string scriptText = BuildListRulesScript(store, marker);
+        DefenderModule.PowerShellRunner.ValidateScriptLength(scriptText);
+
+        return ParseListResult(DefenderModule.PowerShellRunner.RunScript(scriptText), marker);
+    }
+
+    // Pure (no process I/O), unit-tested against constructed Results: an ERROR marker or a missing OK marker
+    // is an incomplete list. The script also reports the failing exception's type and HResult so a denied
+    // read can be recognized without matching localized message text; it is surfaced as an inner
+    // UnauthorizedAccessException, the same shape the management path produces.
+    internal static IList<FirewallRuleSummary> ParseListResult(DefenderModule.PowerShellRunner.Result result, string marker)
+    {
+        string errorMessage = DefenderModule.PowerShellRunner.FindMarkerMessage(result.Stdout, "WTF_LIST_ERROR:");
+        if (errorMessage != null)
+        {
+            Exception inner = AnyAccessDeniedClass(FindErrorClasses(result.Stdout)) ? new UnauthorizedAccessException(errorMessage) : null;
+            throw new FirewallListIncompleteException("Get-NetFirewallRule (PowerShell) enumeration failed: " + errorMessage, -1, inner);
+        }
+        if (!DefenderModule.PowerShellRunner.ContainsMarker(result.Stdout, "WTF_LIST_OK"))
+        {
+            throw new FirewallListIncompleteException("Get-NetFirewallRule (PowerShell) enumeration did not complete (exit " +
+                result.ExitCode + "): " + DefenderModule.PowerShellRunner.DescribeFailure(result), -1);
+        }
+        return ParseRuleList(result.Stdout, marker);
+    }
+
+    // One "WTF_LIST_ERRCLASS:<exception type>:<native error name or ->:<HResult>" line per exception in the
+    // failure's InnerException chain, outermost first (a cmdlet failure usually arrives wrapped, e.g. a
+    // CimJobException around the CimException that carries the real status).
+    private static IList<string[]> FindErrorClasses(string stdout)
+    {
+        List<string[]> classes = new List<string[]>();
+        foreach (string line in DefenderModule.PowerShellRunner.SplitLines(stdout))
+        {
+            if (line.StartsWith("WTF_LIST_ERRCLASS:", StringComparison.Ordinal))
+            { classes.Add(line.Substring("WTF_LIST_ERRCLASS:".Length).Split(':')); }
+        }
+        return classes;
+    }
+
+    private static bool AnyAccessDeniedClass(IList<string[]> classes)
+    {
+        foreach (string[] parts in classes) { if (IsAccessDeniedClass(parts)) { return true; } }
+        return false;
+    }
+
+    private static bool IsAccessDeniedClass(string[] parts)
+    {
+        if (parts == null || parts.Length != 3) { return false; }
+        int hresult;
+        bool parsed = int.TryParse(parts[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out hresult);
+        return parts[0] == "System.UnauthorizedAccessException" || parts[1] == "AccessDenied" ||
+            (parsed && (hresult == unchecked((int)0x80070005) || hresult == unchecked((int)0x80041003)));
+    }
+
+    internal static string BuildListRulesScript(FirewallPolicyStore store, string marker)
+    {
+        StringBuilder script = new StringBuilder();
+        script.Append(ScriptPrologue);
+        script.Append("try {\r\n");
+        script.Append("    function F($v) { if ($null -eq $v) { return '~' }; " +
+            "return [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([string]$v)) }\r\n");
+        script.Append("    function N($v) { if ($null -eq $v) { return '~' }; try { return [string][int]$v } catch { return '~' } }\r\n");
+        script.Append("    function G($o, $n) { $p = $o.PSObject.Properties[$n]; if ($null -eq $p) { return $null }; " +
+            "try { return $p.Value } catch { return $null } }\r\n");
+        script.Append("    $rules = @(NetSecurity\\Get-NetFirewallRule -PolicyStore " + FirewallRuleListCodec.StoreProviderName(store) + ")\r\n");
+        script.Append("    Write-Output ('WTF_COUNT_" + marker + ":' + $rules.Count)\r\n");
+        script.Append("    for ($i = 0; $i -lt $rules.Count; $i++) {\r\n");
+        script.Append("        $r = $rules[$i]\r\n");
+        script.Append("        Write-Output ('WTF_RULE_" + marker + ":' + $i + ':' + (F (G $r 'Name')) + ':' + (F (G $r 'DisplayName')) + ':' + " +
+            "(N (G $r 'Enabled')) + ':' + (N (G $r 'Direction')) + ':' + (N (G $r 'Action')) + ':' + (N (G $r 'Profile')) + ':' + " +
+            "(N (G $r 'PolicyStoreSourceType')) + ':' + (F (G $r 'PolicyStoreSource')))\r\n");
+        script.Append("    }\r\n");
+        script.Append("    Write-Output 'WTF_LIST_OK'\r\n");
+        script.Append("} catch {\r\n");
+        script.Append("    $c = $_.Exception\r\n");
+        script.Append("    for ($d = 0; $d -lt 8 -and $null -ne $c; $d++) {\r\n");
+        script.Append("        $n = '-'; if ($c.PSObject.Properties['NativeErrorCode']) { $n = [string]$c.NativeErrorCode }\r\n");
+        script.Append("        Write-Output ('WTF_LIST_ERRCLASS:' + $c.GetType().FullName + ':' + $n + ':' + [string]$c.HResult)\r\n");
+        script.Append("        $c = $c.InnerException\r\n");
+        script.Append("    }\r\n");
+        script.Append(DefenderModule.PowerShellRunner.EmitErrorMarkerStatement("WTF_LIST_ERROR:"));
+        script.Append("    exit 1\r\n");
+        script.Append("}\r\n");
+        return script.ToString();
+    }
+
+    // Internal (not private): unit-tested directly against constructed fixtures. Rules are returned in
+    // stream order, one per declared index, so two rules sharing a name or even an id stay separate.
+    internal static IList<FirewallRuleSummary> ParseRuleList(string stdout, string marker)
+    {
+        string countPrefix = "WTF_COUNT_" + marker + ":";
+        string rulePrefix = "WTF_RULE_" + marker + ":";
+        int? count = null;
+        FirewallRuleSummary[] byIndex = null;
+        int seen = 0;
+        foreach (string line in DefenderModule.PowerShellRunner.SplitLines(stdout))
+        {
+            if (line.StartsWith(countPrefix, StringComparison.Ordinal))
+            {
+                int parsed;
+                if (count != null || !int.TryParse(line.Substring(countPrefix.Length), NumberStyles.None, CultureInfo.InvariantCulture, out parsed))
+                { throw new FirewallListIncompleteException("Malformed or repeated PowerShell rule count line.", seen); }
+                count = parsed;
+                byIndex = new FirewallRuleSummary[parsed];
+                continue;
+            }
+            if (!line.StartsWith(rulePrefix, StringComparison.Ordinal)) { continue; }
+            if (count == null) { throw new FirewallListIncompleteException("PowerShell rule line arrived before the rule count.", seen); }
+            string[] parts = line.Substring(rulePrefix.Length).Split(':');
+            if (parts.Length != 9) { throw new FirewallListIncompleteException("Malformed PowerShell rule line (expected 9 fields).", seen); }
+            int index;
+            if (!int.TryParse(parts[0], NumberStyles.None, CultureInfo.InvariantCulture, out index) || index >= byIndex.Length)
+            { throw new FirewallListIncompleteException("PowerShell rule index out of range.", seen); }
+            if (byIndex[index] != null) { throw new FirewallListIncompleteException("Duplicate PowerShell rule index " + index + ".", seen); }
+            byIndex[index] = FirewallRuleListCodec.Build(ListText(parts[1]), ListText(parts[2]), ListInt(parts[3]), ListInt(parts[4]),
+                ListInt(parts[5]), ListInt(parts[6]), ListInt(parts[7]), ListText(parts[8]));
+            seen++;
+        }
+        if (count == null) { throw new FirewallListIncompleteException("PowerShell rule enumeration never reported a count.", seen); }
+        if (seen != count.Value)
+        {
+            throw new FirewallListIncompleteException("PowerShell rule enumeration declared " +
+                count.Value.ToString(CultureInfo.InvariantCulture) + " rule(s) but delivered " +
+                seen.ToString(CultureInfo.InvariantCulture) + ".", seen);
+        }
+        return new List<FirewallRuleSummary>(byIndex);
+    }
+
+    private static string ListText(string field)
+    {
+        if (field == "~") { return null; }
+        try { return DefenderModule.PowerShellRunner.DecodeValue(field); }
+        catch (FormatException error) { throw new FirewallListIncompleteException("Malformed Base64 in a PowerShell rule line.", -1, error); }
+    }
+
+    private static int? ListInt(string field)
+    {
+        if (field == "~") { return null; }
+        int value;
+        if (!int.TryParse(field, NumberStyles.Integer, CultureInfo.InvariantCulture, out value))
+        { throw new FirewallListIncompleteException("Malformed integer in a PowerShell rule line: " + field, -1); }
+        return value;
     }
 
     private static FirewallRuleData DecodeRule(Dictionary<string, List<string>> fields)

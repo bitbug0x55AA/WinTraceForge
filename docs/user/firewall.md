@@ -14,6 +14,53 @@
 
 This command reads profile state and exposed policy settings. It does not turn the firewall off, toggle profiles, or change default actions. The output is not a complete GPO/MDM resultant-policy report.
 
+## List rules
+
+```powershell
+.\wtf.exe firewall rule list
+.\wtf.exe firewall rule list --store persistent
+.\wtf.exe firewall rule list --store persistent --transport powershell
+```
+
+`rule list` is a strictly read-only inventory of the Windows Firewall rules in one policy store. It is meant for understanding rule state before and after a test; it does not add, change or remove anything, and it does not need an elevated token (if the current identity cannot complete the read, the actual permission error is reported).
+
+| Option | Values / default | Meaning |
+| --- | --- | --- |
+| `--store` | `active` (default), `persistent` | `active` is the provider's `ActiveStore` view: the rules the firewall service reports as active, including a few dynamic rules it adds. Whether a local rule is accepted under a GPO/MDM merge restriction is not established by this list. `persistent` is the machine-local persistent store (`PersistentStore`), for checking local configuration. |
+| `--transport` | `management` (default), `powershell` | The two paths that can name the policy store explicitly. `com`, `native` and `cmd` are refused with an error, never substituted; an explicitly chosen transport that fails is never retried on another. Other firewall commands keep their own defaults. |
+
+The output starts with the host, transport and store, then shows one row per rule and ends with a total and an enumeration status:
+
+```text
+  #3   Network Discovery (UPnP-Out) | id=NETDIS-UPnPHost-Out-TCP | enabled=False | Outbound | Allow | profiles=Public | source=Local (PersistentStore)
+  ...
+  Total rules           610
+  Enabled / disabled    354 / 256
+  With read limits      11
+  Enumeration           COMPLETE
+  [ OK ] Outcome: FIREWALL_RULES_LISTED
+```
+
+Each row carries the rule identifier (`id`, unique), display name, enabled state, direction, allow/block action, profiles (`Any` when the rule is stored with no profile restriction, otherwise the profile names) and the policy source the provider reports (for example `Local (PersistentStore)`, `GroupPolicy (<GPO>)`, `Dynamic (ActiveStore)`). Disabled rules are listed. Rules that share a display name are listed separately; use the `id` to tell them apart.
+
+The list is a summary. It does not decode each rule's addresses, ports, programs, services, interfaces or security conditions, it does not cover profile settings, IPsec rules or WFP filters, and it does not say which traffic is allowed or blocked. Use `firewall rule check` (ownership) or standard Windows administration tools for a single rule's full detail.
+
+### Read limits and failure
+
+- A value that cannot be read or decoded is never dropped. The rule is still listed, the value shows as `Unavailable` or `Unknown(<raw>)`, and a `READ LIMIT` line names the field. Examples: an action value this tool does not decode, or a display name that is still a resource reference (`@...`) after the provider resolved names. The summary counts these rules.
+- If enumeration fails at any point, the run reports `Enumeration INCOMPLETE`, prints no rules and no total, exits `1` with `FIREWALL_RULES_INCOMPLETE`, and keeps the real error text. A denied read is additionally labelled `Permission error`, independently of the result code: WMI checks namespace access when connecting or starting the query, so a denial usually arrives before any rule is read and is reported as `FIREWALL_OPERATION_ERROR` with the label, while a denial after enumeration began is `FIREWALL_RULES_INCOMPLETE` with the label. For `management` the label comes from the WMI/COM access-denied status anywhere in the exception chain; for `powershell` from the type, native error name and HResult of each exception in the failing cmdlet's chain. This classification could not be triggered on the non-elevated validation host, where every readable store succeeded, so it is covered by unit tests only; the original error text is always kept either way. A partial or empty result is never presented as an inventory. `0` rules is only reported after an enumeration that completed successfully.
+- An unavailable backend (for example the `NetSecurity` module is missing) is a plain `FIREWALL_OPERATION_ERROR`, because no enumeration started; so is a failure to start `powershell.exe` or to open the localized WMI connection, which happen before any rule is read.
+- Success is `FIREWALL_RULES_LISTED`. It is a different result from the ownership results (`FIREWALL_RULE_OWNERSHIP_CONFIRMED`), which `rule list` never reports.
+
+### Comparing the two transports
+
+`management` reads `MSFT_NetFirewallRule` in `root\StandardCimv2` with an explicit `PolicyStore`; `powershell` runs `Get-NetFirewallRule -PolicyStore <store>` in a child `powershell.exe`. On the development host used to validate this command both returned the same rules for each store (613 active, 610 persistent, 256 of them disabled), matching on identifier, display name, enabled state, direction, action, profiles and source. The active store held three more rules than the persistent store, all reported as `Dynamic (ActiveStore)`.
+
+- The rule `id` is the reliable key for comparing runs; display names are not unique.
+- Display names are localized text. Built-in and app-package rules store a resource reference, and the provider resolves it for the caller's locale. `management` requests the system UI language so that it shows the same text as the `powershell` child process. On the development host the user and system UI languages differed, and System.Management's default (the user's culture) returned Chinese text where the cmdlets returned English (for example the built-in Network Discovery rules); requesting the system UI language made the two agree. On a host with one UI language the settings coincide. Compare by `id` if names differ.
+- A few built-in rules keep an unresolved `@{...}` display name even after the provider resolves names; both transports flag the same rules with a `READ LIMIT`.
+- Investigate any difference in count or in enabled/direction/action/profiles/source between the two transports on the same store. `.\Build.ps1 -Integration` runs a read-only cross-check of both transports for both stores.
+
 ## Select an execution path
 
 | Transport | Path |
@@ -23,6 +70,8 @@ This command reads profile state and exposed policy settings. It does not turn t
 | `management` | Managed WMI Firewall provider |
 | `powershell` | `powershell.exe` -> `New-`/`Get-`/`Remove-NetFirewallRule` (NetSecurity module) |
 | `cmd` | `cmd.exe` -> `netsh.exe advfirewall firewall add`/`show`/`delete rule` |
+
+`rule list` supports only `management` and `powershell` (see [List rules](#list-rules)).
 
 com, native, management and powershell all operate on the same persisted rule store and use the same ownership and readback checks; a rule created by one of these four can be checked or removed by another. No route silently falls back. `cim` and `wmi` are not aliases for `management`.
 
@@ -86,7 +135,7 @@ These markers prevent accidental cleanup of unrelated rules; they are not an aut
 
 Ownership is re-read before removal, but deletion is by name and is not atomic with that check. Avoid concurrent tests using the same ID or concurrent writers changing marked rules. Legacy rules from builds predating this schema require the matching legacy build or standard Windows administration tools.
 
-Add verifies all constrained properties, including Rule3 restrictions (Windows 8 / Server 2012 or later). Outcomes include `FIREWALL_RULE_CONFIRMED`, `FIREWALL_RULE_UNCONFIRMED`, `FIREWALL_RULE_OWNERSHIP_CONFIRMED`, `FIREWALL_RULE_REMOVED`, `FIREWALL_RULE_ALREADY_ABSENT`, and `FIREWALL_PROFILES_READ`. API errors identify Add/Remove and retain the original HRESULT. A failed add can leave a rule behind; inspect it and use the printed cleanup command. Automatic rollback is not performed.
+Add verifies all constrained properties, including Rule3 restrictions (Windows 8 / Server 2012 or later). Outcomes include `FIREWALL_RULE_CONFIRMED`, `FIREWALL_RULE_UNCONFIRMED`, `FIREWALL_RULE_OWNERSHIP_CONFIRMED`, `FIREWALL_RULE_REMOVED`, `FIREWALL_RULE_ALREADY_ABSENT`, `FIREWALL_PROFILES_READ`, `FIREWALL_RULES_LISTED`, and `FIREWALL_RULES_INCOMPLETE`. API errors identify Add/Remove and retain the original HRESULT. A failed add can leave a rule behind; inspect it and use the printed cleanup command. Automatic rollback is not performed.
 
 ## Interpret policy and enforcement
 

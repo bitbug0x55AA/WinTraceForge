@@ -12,7 +12,7 @@ WinTraceForge studies path-dependent security visibility. Its current implementa
 | `src/managed/lifecycle/` | Shared runner, phase contracts, typed results, and restoration policy. |
 | `src/managed/defender/` | Defender AV exclusion CLI, operations, and preference backends. |
 | `src/managed/asr/` | ASR CLI, snapshots, backends, and phase implementation. |
-| `src/managed/firewall/` | Firewall CLI, ownership/readback checks, managed COM/WMI/PowerShell/cmd backends, native adapter, and phase implementation. |
+| `src/managed/firewall/` | Firewall CLI, ownership/readback checks, managed COM/WMI/PowerShell/cmd backends, native adapter, phase implementation, and the read-only rule-list enumeration (`WinTraceForge.Firewall.List.cs`). |
 | `src/managed/telemetry/` | Runtime capture, module profiles/correlation, evidence presentation, and native ETW adapter. |
 | `src/native/defender/` | Native WMI preference transport. |
 | `src/native/firewall/` | Native Firewall COM transport and packet codec. |

@@ -88,7 +88,8 @@ foreach ($option in @('--telemetry', '--telemetry-wait', '--verbose', '--no-colo
 foreach ($arguments in @(
     'firewall --help --no-color', 'firewall -help --no-color', 'firewall -? --no-color',
     'firewall profiles --help --no-color', 'firewall rule add --help --no-color',
-    'firewall rule check --help --no-color', 'firewall rule remove --help --no-color'
+    'firewall rule check --help --no-color', 'firewall rule remove --help --no-color',
+    'firewall rule list --help --no-color'
 )) {
     $aliasHelp = Test-Command $arguments 0 @('USAGE', 'OPTIONS', 'QUICK START')
     if ($aliasHelp -ne $firewallHelp) { throw "Firewall help entrypoint mismatch: $arguments" }
@@ -123,9 +124,29 @@ foreach ($command in @(
     'firewall rule add --direction in --remote-address 192.0.2.10 --remote-port 443',
     'firewall rule check --id 11111111-1111-1111-1111-111111111111 --transport cim',
     'firewall profiles --transport',
-    'firewall profiles --transport native --transport com'
+    'firewall profiles --transport native --transport com',
+    'firewall rule list --transport com',
+    'firewall rule list --transport native',
+    'firewall rule list --transport cmd',
+    'firewall rule list --store bogus',
+    'firewall rule list --store',
+    'firewall rule list --id 11111111-1111-1111-1111-111111111111'
 )) {
     Test-Command $command 2 @() | Out-Null
+}
+
+# Read-only rule inventory: both supported transports, both stores; never needs elevation.
+Test-Command 'firewall rule list --no-color' 0 @(
+    'Transport management', 'Store active', 'FIREWALL_RULES_LISTED', 'Total rules', 'Enumeration COMPLETE',
+    'Mutation attempted False'
+) | Out-Null
+foreach ($listTransport in @('management', 'powershell')) {
+    foreach ($listStore in @('active', 'persistent')) {
+        Test-Command "firewall rule list --store $listStore --transport $listTransport --no-color" 0 @(
+            "Transport $listTransport", "Store $listStore", 'FIREWALL_RULES_LISTED', 'Total rules',
+            'Enumeration COMPLETE', 'Mutation attempted False'
+        ) | Out-Null
+    }
 }
 
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()

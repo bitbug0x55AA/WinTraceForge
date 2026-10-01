@@ -78,6 +78,7 @@ internal static class WinTraceForge
         ConsoleUi.Row("firewall rule add", "Create a marked, narrowly scoped test rule; refuse existing names.");
         ConsoleUi.Row("firewall rule check", "Read a marked rule by its test ID.");
         ConsoleUi.Row("firewall rule remove", "Remove only a unique, correctly marked test rule.");
+        ConsoleUi.Row("firewall rule list", "List every rule in one policy store (read-only; management|powershell).");
         ConsoleUi.Row("firewall profiles", "Read profile state and policy settings; never change them.");
         ConsoleUi.Section("Examples");
         ConsoleUi.Text("wtf.exe defender exclusion --help");

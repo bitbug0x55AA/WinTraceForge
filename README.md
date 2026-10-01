@@ -14,7 +14,7 @@ Currently implemented modules:
 | --- | --- |
 | Defender Antivirus | Check or add exclusions. |
 | Attack Surface Reduction | Inspect posture, check or change exclusions and rule actions, and run an experimental behavioral test. |
-| Windows Firewall | Inspect profiles and add, check, or remove uniquely marked test rules. |
+| Windows Firewall | Inspect profiles, list the rules in a policy store, and add, check, or remove uniquely marked test rules. |
 
 Available implementation paths include managed WMI, COM, native interfaces, and a PowerShell child process for Defender/ASR preferences, depending on the module. These are the paths supported by today's control experiments, not a definition of the project's ultimate research boundary. Collect existing Event Log records or raw ETW traces to investigate observable evidence, including on read-only checks. A missing alert is **an observation under tested conditions, not a bypass claim**; configuration readback alone does not prove enforcement or detection.
 
@@ -46,6 +46,13 @@ Collect evidence for a read-only operation through different supported paths:
 .\wtf.exe firewall profiles --transport native --telemetry eventlog
 .\wtf.exe firewall profiles --transport powershell --telemetry eventlog
 .\wtf.exe firewall profiles --transport cmd --telemetry eventlog
+```
+
+List the firewall rules in the active or the persistent store (read-only; the result is complete or explicitly incomplete, never silently partial):
+
+```powershell
+.\wtf.exe firewall rule list
+.\wtf.exe firewall rule list --store persistent --transport powershell
 ```
 
 For an authorized firewall test, add a narrowly scoped rule, retain the printed ID, and use the exact printed cleanup command afterward:

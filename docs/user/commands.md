@@ -17,6 +17,7 @@ The commands below are the currently implemented security-control / configuratio
 | `defender asr rule [--check]` | Read or set one rule's action. | Persistent unless `--check` |
 | `defender asr verify [--check]` | Run or prepare an experimental behavioral test. | Test artifacts/processes unless `--check`; automatic cleanup attempted |
 | `firewall profiles` | Read profile state and exposed policy settings. | No |
+| `firewall rule list` | List every rule in one policy store (`--store active` or `persistent`). | No |
 | `firewall rule add` | Add one marked test rule. | Persistent rule |
 | `firewall rule check` | Inspect a uniquely owned test rule. | No |
 | `firewall rule remove` | Remove one uniquely owned test rule. | Persistent rule removal |
@@ -27,7 +28,7 @@ Place module flags after the module and command, for example `wtf.exe defender e
 
 | Option | Values / default | Meaning |
 | --- | --- | --- |
-| `--transport` | `management`, `com`, `native`, `powershell`; also `cmd` for Firewall | Defender / ASR default to `management`; Firewall defaults to `com` and additionally supports `cmd`. No automatic fallback. |
+| `--transport` | `management`, `com`, `native`, `powershell`; also `cmd` for Firewall | Defender / ASR default to `management`; Firewall defaults to `com` and additionally supports `cmd`; `firewall rule list` supports only `management` (its default) and `powershell`. No automatic fallback. |
 | `--telemetry` | `none` (default), `eventlog`, `etw` | Select local evidence collection. |
 | `--telemetry-wait` | `0..30`; default `3` seconds | Allow time for events to publish after the operation. |
 | `--verbose` | Flag | Expand evidence, guidance, and help notes. |
